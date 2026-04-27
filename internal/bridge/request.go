@@ -118,6 +118,8 @@ func (bridge *Bridge) convertInput(raw json.RawMessage, context ConversionContex
 			}
 			messages = append(messages, anthropic.Message{Role: "assistant", Content: blocks})
 		default:
+			// New turn boundary: clear stale reasoning from the previous round.
+			pendingReasoningText = ""
 			role := item.Role
 			if role == "" {
 				role = "user"
@@ -399,7 +401,7 @@ func lastCacheableContentIndex(content []anthropic.ContentBlock) int {
 func (bridge *Bridge) prependThinking(modelAlias string, messages []anthropic.Message, pendingReasoningText string, toolCallID string, extData map[string]any) ([]anthropic.Message, string) {
 	if pendingReasoningText != "" {
 		prependThinkingBlock(&messages, pendingReasoningText)
-		return messages, ""
+		return messages, pendingReasoningText
 	}
 	messages = bridge.plugins.PrependThinkingToMessages(modelAlias, messages, toolCallID, extData)
 	return messages, ""
@@ -551,6 +553,12 @@ func parseStopSequences(raw json.RawMessage) []string {
 func prependThinkingBlock(messages *[]anthropic.Message, thinkingText string) {
 	if len(*messages) > 0 && (*messages)[len(*messages)-1].Role == "assistant" {
 		last := &(*messages)[len(*messages)-1]
+		// Skip if the assistant message already has a thinking block (parallel tool calls).
+		for _, block := range last.Content {
+			if block.Type == "thinking" {
+				return
+			}
+		}
 		last.Content = append([]anthropic.ContentBlock{{
 			Type:     "thinking",
 			Thinking: thinkingText,
