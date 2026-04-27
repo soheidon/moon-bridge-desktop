@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Run tests
+        run: CGO_ENABLED=0 go test ./...
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    needs: test
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            package: moonbridge_linux_amd64.tar.gz
+          - goos: linux
+            goarch: arm64
+            package: moonbridge_linux_arm64.tar.gz
+          - goos: darwin
+            goarch: amd64
+            package: moonbridge_darwin_amd64.tar.gz
+          - goos: darwin
+            goarch: arm64
+            package: moonbridge_darwin_arm64.tar.gz
+          - goos: windows
+            goarch: amd64
+            binary: moonbridge.exe
+            package: moonbridge_windows_amd64.zip
+          - goos: windows
+            goarch: arm64
+            binary: moonbridge.exe
+            package: moonbridge_windows_arm64.zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Build binary
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          BINARY: ${{ matrix.binary || 'moonbridge' }}
+        run: |
+          mkdir -p build dist
+          go build -trimpath -ldflags="-s -w" -o "build/${BINARY}" ./cmd/moonbridge
+
+      - name: Package binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          BINARY: ${{ matrix.binary || 'moonbridge' }}
+          PACKAGE: ${{ matrix.package }}
+        run: |
+          if [ "${GOOS}" = "windows" ]; then
+            (cd build && zip "../dist/${PACKAGE}" "${BINARY}")
+          else
+            tar -C build -czf "dist/${PACKAGE}" "${BINARY}"
+          fi
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.package }}
+          path: dist/${{ matrix.package }}
+          if-no-files-found: error
+          archive: false
