@@ -1,6 +1,6 @@
 # Anthropic Messages 到 OpenAI Responses 桥接器
 
-一个 OpenAI Responses 兼容转发层，对外暴露 `POST /v1/responses`。Transform 模式下，Moon Bridge 按模型别名路由请求：Anthropic 协议 Provider 会经过 OpenAI Responses ↔ Anthropic Messages 转换；OpenAI 协议 Provider 会保留 Responses 格式直通上游。桥接器负责请求/响应映射、工具调用转换、提示缓存、流式传输、usage/billing 统计和错误标准化。
+一个 OpenAI Responses 兼容转发层，对外暴露 `POST /v1/responses`。Transform 模式下，Moon Bridge 按模型别名路由请求：Anthropic 协议 Provider 会经过 OpenAI Responses ↔ Anthropic Messages 转换；`openai-response` Provider 会保留 Responses 格式直通上游。桥接器负责请求/响应映射、工具调用转换、提示缓存、流式传输、usage/billing 统计和错误标准化。
 
 支持的客户端包括 [Codex CLI](https://github.com/openai/codex)、自定义工具链，以及任何基于 OpenAI Responses API 构建、需要路由到不同上游 Provider 的应用程序。
 
@@ -11,10 +11,10 @@ flowchart TD
     A[OpenAI Responses 客户端] -->|POST /v1/responses| B[HTTP 处理器<br/>/v1/responses, /responses]
     B --> C[ProviderManager<br/>模型路由]
     C -->|protocol=anthropic| D[Bridge<br/>Responses ↔ Messages]
-    C -->|protocol=openai| E[OpenAI passthrough]
+    C -->|protocol=openai-response| E[OpenAI Responses passthrough]
     D -->|POST /v1/messages| F[(Anthropic 提供商)]
     D -->|POST /v1/messages stream| F
-    E -->|POST /v1/responses| G[(OpenAI-compatible 提供商)]
+    E -->|POST /v1/responses| G[(OpenAI Responses Provider)]
 
     subgraph BridgeDetails [桥接器能力]
         direction LR
@@ -77,7 +77,7 @@ provider:
     openai:
       base_url: "https://api.openai.com"
       api_key: "replace-with-openai-api-key"
-      protocol: "openai"
+      protocol: "openai-response"
       models:
         gpt-image-1.5: {}
 
@@ -86,7 +86,7 @@ provider:
     gpt-image: "openai/gpt-image-1.5"
 ```
 
-`protocol` 默认为 `anthropic`。设置为 `openai` 时，Transform 不进入 Anthropic 转换层，只改写请求中的 `model` 并代理到上游 Responses 端点。
+`protocol` 默认为 `anthropic`。设置为 `openai-response` 时，Transform 不进入 Anthropic 转换层，只改写请求中的 `model` 并代理到上游 Responses 端点。
 
 ### 模式
 
@@ -143,7 +143,7 @@ Web search 支持按 Provider 独立配置和判断。每个 Provider 可在 `pr
 
 | 模式 | 行为 |
 | --- | --- |
-| `auto` | Transform 启动时按 Provider 独立探测：使用该 Provider 的第一个上游模型发送轻量 `web_search_20250305` 工具声明探测，只有探测证明可用才注入。非 Anthropic 协议 Provider 自动禁用。 |
+| `auto` | Transform 启动时按 Provider 独立探测：使用该 Provider 的第一个上游模型发送轻量 `web_search_20250305` 工具声明探测，只有探测证明可用才注入。非 Anthropic Messages 协议 Provider 会跳过这项探测与工具注入；Responses 直通请求体仍保留上游自己的联网搜索字段。 |
 | `enabled` | 强制注入 Anthropic `web_search_20250305` 服务端工具。 |
 | `disabled` | 完全关闭搜索工具注入。 |
 | `injected` | 不依赖 Provider 的服务端搜索工具，改为向模型注入 `tavily_search`（function-type 工具）和可选的 `firecrawl_fetch`。模型调用这些工具时，websearch orchestrator 拦截调用、通过 Tavily / Firecrawl API 执行搜索、将结果回传给模型继续推理。需要配置 `tavily_api_key`；`firecrawl_api_key` 可选。 |
@@ -386,7 +386,7 @@ API 密钥已脱敏。追踪路径在 `.gitignore` 中。
 - 错误映射（从提供商错误生成 OpenAI 风格错误）
 - 追踪记录（按模式、按会话、按请求编号）
 - 透明代理模式（CaptureResponse、CaptureAnthropic）
-- 多 Provider 路由和 OpenAI protocol Responses 直通
+- 多 Provider 路由和 `openai-response` 直通
 - Per-provider web search 配置和独立探测
 - DeepSeek V4 thinking 状态扩展和 per-session 隔离
 - Injected web search（Tavily / Firecrawl 服务端搜索循环）

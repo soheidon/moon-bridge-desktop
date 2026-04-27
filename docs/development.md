@@ -98,7 +98,7 @@ go test ./internal/e2e/ -v -count=1
 - 流式请求：验证 `ConvertStreamEventsWithContext()` 的事件顺序、item ID 前缀、custom tool 和 web search 的特殊 delta 事件。
 - 历史转换：验证 `convertInput()` 中连续工具调用的归并逻辑，以及 `output_text` 的压缩。
 - Codex 兼容：验证空 `cached_tokens` 序列化、namespace 展平、`web_search_call` 过滤、custom grammar 保留。
-- 多 Provider：验证模型别名路由、OpenAI protocol 直通、上游模型名改写和 provider 配置校验。
+- 多 Provider：验证模型别名路由、`openai-response` 直通、上游模型名改写和 provider 配置校验。
 - Usage / Billing：验证每请求 INFO 使用上游实际模型名、`Billing` 为 session 累计值、`Input` 展示为 `input_tokens + cache_read_input_tokens`。
 - Cache planner：验证各种配置组合（off / automatic / explicit / hybrid）下的断点注入与注册表状态管理。
 - DTO：验证 `input_tokens_details.cached_tokens` 在值为 `0` 时仍被序列化。
@@ -108,7 +108,7 @@ go test ./internal/e2e/ -v -count=1
 
 ### 启用请求追踪
 
-在 `config.yml` 中设置 `trace_requests: true`，Anthropic 转换路径和 Capture 模式的请求/响应会写入 `trace/` 目录；OpenAI protocol 直通路径主要保留 usage 日志，错误场景会写 trace。详见 [architecture.md](architecture.md) trace 模块说明。
+在 `config.yml` 中设置 `trace_requests: true`，Anthropic 转换路径和 Capture 模式的请求/响应会写入 `trace/` 目录；`openai-response` 直通路径主要保留 usage 日志，错误场景会写 trace。详见 [architecture.md](architecture.md) trace 模块说明。
 
 ### 回放缓存策略
 

@@ -11,7 +11,7 @@ func TestProviderManagerRoutesProtocolAndUpstreamModel(t *testing.T) {
 		"openai": {
 			BaseURL:  "https://openai.example.test",
 			APIKey:   "openai-key",
-			Protocol: "openai",
+			Protocol: "openai-response",
 		},
 	}, map[string]ModelRoute{
 		"image": {Provider: "openai", Name: "gpt-image-1.5"},
@@ -20,7 +20,7 @@ func TestProviderManagerRoutesProtocolAndUpstreamModel(t *testing.T) {
 		t.Fatalf("NewProviderManager() error = %v", err)
 	}
 
-	if got := manager.ProtocolForModel("image"); got != "openai" {
+	if got := manager.ProtocolForModel("image"); got != "openai-response" {
 		t.Fatalf("ProtocolForModel(image) = %q", got)
 	}
 	if got := manager.UpstreamModelFor("image"); got != "gpt-image-1.5" {
@@ -39,14 +39,14 @@ func TestProviderManagerUsesDefaultProtocolForUnroutedModels(t *testing.T) {
 		"default": {
 			BaseURL:  "https://openai.example.test",
 			APIKey:   "openai-key",
-			Protocol: "openai",
+			Protocol: "openai-response",
 		},
 	}, nil)
 	if err != nil {
 		t.Fatalf("NewProviderManager() error = %v", err)
 	}
 
-	if got := manager.ProtocolForModel("gpt-test"); got != "openai" {
+	if got := manager.ProtocolForModel("gpt-test"); got != "openai-response" {
 		t.Fatalf("ProtocolForModel(unrouted default openai) = %q", got)
 	}
 }

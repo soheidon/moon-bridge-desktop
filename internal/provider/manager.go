@@ -12,7 +12,6 @@ import (
 	"moonbridge/internal/anthropic"
 )
 
-
 // HTTPConfig controls the HTTP connection pool for a provider.
 type HTTPConfig struct {
 	MaxIdleConnsPerHost int    `yaml:"max_idle_conns_per_host"`
@@ -21,14 +20,14 @@ type HTTPConfig struct {
 
 // ProviderConfig defines how to connect to a single upstream provider.
 type ProviderConfig struct {
-	BaseURL   string     `yaml:"base_url"`
-	APIKey    string     `yaml:"api_key"`
-	Version   string     `yaml:"version"`
-	UserAgent string     `yaml:"user_agent"`
-	Protocol  string     // "anthropic" (default) or "openai"
-	HTTP      HTTPConfig `yaml:"http"`
-	WebSearchSupport string   // "auto", "enabled", "disabled", "injected", or "" (inherit global)
-	ModelNames        []string // upstream model names for this provider
+	BaseURL          string     `yaml:"base_url"`
+	APIKey           string     `yaml:"api_key"`
+	Version          string     `yaml:"version"`
+	UserAgent        string     `yaml:"user_agent"`
+	Protocol         string     // "anthropic" (default) or "openai-response"
+	HTTP             HTTPConfig `yaml:"http"`
+	WebSearchSupport string     // "auto", "enabled", "disabled", "injected", or "" (inherit global)
+	ModelNames       []string   // upstream model names for this provider
 }
 
 // ModelRoute maps a model alias to a provider and an upstream model name.
@@ -46,11 +45,11 @@ type ProviderClient struct {
 // ProviderManager manages multiple upstream provider clients and routes
 // model aliases to the appropriate provider.
 type ProviderManager struct {
-	clients   map[string]*anthropic.Client // provider key -> anthropic.Client
-	providers map[string]ProviderConfig    // provider key -> config (for inspection)
-	routes    map[string]ModelRoute        // model alias -> route
-	defaultK  string                       // default provider key
-	resolvedWS map[string]string           // provider key -> resolved web search support
+	clients    map[string]*anthropic.Client // provider key -> anthropic.Client
+	providers  map[string]ProviderConfig    // provider key -> config (for inspection)
+	routes     map[string]ModelRoute        // model alias -> route
+	defaultK   string                       // default provider key
+	resolvedWS map[string]string            // provider key -> resolved web search support
 }
 
 // NewProviderManager creates a ProviderManager from provider configs and model routes.
@@ -205,7 +204,6 @@ func BuildProviderConfigs(
 	return map[string]ProviderConfig{"default": cfg}
 }
 
-
 func valueOrDefault(value, fallback string) string {
 	if value == "" {
 		return fallback
@@ -288,6 +286,7 @@ func (pm *ProviderManager) ProviderAPIKey(key string) string {
 	}
 	return cfg.APIKey
 }
+
 // ProviderKeyForModel returns the provider key that serves the given model alias.
 // Falls back to defaultK when the model has no explicit route.
 func (pm *ProviderManager) ProviderKeyForModel(modelAlias string) string {

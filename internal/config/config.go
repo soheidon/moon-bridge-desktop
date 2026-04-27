@@ -11,6 +11,11 @@ const (
 	DefaultAddr       = "127.0.0.1:38440"
 )
 
+const (
+	ProtocolAnthropic      = "anthropic"
+	ProtocolOpenAIResponse = "openai-response"
+)
+
 type Mode string
 
 const (
@@ -49,7 +54,7 @@ type Config struct {
 	ProviderAPIKey    string
 	ProviderVersion   string
 	ProviderUserAgent string
-	Protocol          string // "anthropic" (default) or "openai"
+	Protocol          string // "anthropic" (default) or "openai-response"
 	WebSearchSupport  WebSearchSupport
 	WebSearchMaxUses  int
 	TavilyAPIKey      string
@@ -93,7 +98,7 @@ type ProviderDef struct {
 	APIKey           string
 	Version          string
 	UserAgent        string
-	Protocol         string // "anthropic" (default) or "openai"
+	Protocol         string // "anthropic" (default) or "openai-response"
 	WebSearchSupport WebSearchSupport
 	WebSearchMaxUses int
 	TavilyAPIKey     string
@@ -190,9 +195,9 @@ func (cfg Config) validateTransform() error {
 				return fmt.Errorf("providers.%s.api_key is required", key)
 			}
 			switch def.Protocol {
-			case "", "anthropic", "openai":
+			case "", ProtocolAnthropic, ProtocolOpenAIResponse:
 			default:
-				return fmt.Errorf("providers.%s.protocol must be \"anthropic\" or \"openai\"", key)
+				return fmt.Errorf("providers.%s.protocol must be \"anthropic\" or \"openai-response\"", key)
 			}
 			for modelName := range def.Models {
 				if modelName == "" {
@@ -212,8 +217,8 @@ func (cfg Config) validateTransform() error {
 				return fmt.Errorf("routes.%s references unknown provider %q", alias, route.Provider)
 			}
 			if route.DeepSeekV4 {
-				if def, ok := cfg.ProviderDefs[route.Provider]; ok && def.Protocol == "openai" {
-					return fmt.Errorf("routes.%s: deepseek_v4 requires anthropic protocol (provider %s uses openai)", alias, route.Provider)
+				if def, ok := cfg.ProviderDefs[route.Provider]; ok && def.Protocol != "" && def.Protocol != ProtocolAnthropic {
+					return fmt.Errorf("routes.%s: deepseek_v4 requires anthropic protocol (provider %s uses %s)", alias, route.Provider, def.Protocol)
 				}
 			}
 		}

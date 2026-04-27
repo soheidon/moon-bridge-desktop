@@ -142,7 +142,7 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) erro
 // Returns nil when no default provider is configured (all models use explicit routing).
 func resolveDefaultClient(pm *provider.ProviderManager, errors io.Writer) *anthropic.Client {
 	if pm.DefaultKey() == "" {
-		logger.Warn("未配置默认提供商，禁用网页搜索探测和服务器回退")
+		logger.Warn("未配置默认提供商，跳过网页搜索探测和服务器回退")
 		return nil
 	}
 	client, err := pm.ClientForKey(pm.DefaultKey())
@@ -210,9 +210,9 @@ func resolvePerProviderWebSearch(ctx context.Context, cfg config.Config, pm *pro
 	}
 	// 1. Resolve provider-level defaults.
 	for _, key := range pm.ProviderKeys() {
-		if pm.ProtocolForKey(key) != "anthropic" {
+		if pm.ProtocolForKey(key) != config.ProtocolAnthropic {
 			pm.SetResolvedWebSearch(key, "disabled")
-			logger.Info("非 Anthropic 提供商禁用网页搜索", "provider", key)
+			logger.Info("跳过 Anthropic 网页搜索探测与工具注入", "provider", key, "protocol", pm.ProtocolForKey(key))
 			continue
 		}
 		support := cfg.WebSearchForProvider(key)
@@ -248,11 +248,17 @@ func resolvePerProviderWebSearch(ctx context.Context, cfg config.Config, pm *pro
 		resolveModelWebSearch(ctx, alias, modelWS, providerWS, pm, errors)
 	}
 }
+
 func resolveModelWebSearch(ctx context.Context, alias string, modelWS config.WebSearchSupport, providerWS config.WebSearchSupport, pm *provider.ProviderManager, errors io.Writer) {
 	if modelWS == providerWS {
 		return // no model-level override, provider resolution applies
 	}
 	modelKey := "model:" + alias
+	if protocol := pm.ProtocolForModel(alias); protocol != config.ProtocolAnthropic {
+		pm.SetResolvedWebSearch(modelKey, "disabled")
+		logger.Info("跳过模型级 Anthropic 网页搜索探测与工具注入", "model", alias, "protocol", protocol)
+		return
+	}
 	switch modelWS {
 	case config.WebSearchSupportDisabled:
 		pm.SetResolvedWebSearch(modelKey, "disabled")

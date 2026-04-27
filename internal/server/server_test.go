@@ -447,7 +447,7 @@ func TestResponsesHandlerPassesOpenAIProtocolThroughWithUpstreamModel(t *testing
 		"openai": {
 			BaseURL:  "https://openai.example.test",
 			APIKey:   "openai-key",
-			Protocol: "openai",
+			Protocol: config.ProtocolOpenAIResponse,
 		},
 	}, map[string]provider.ModelRoute{
 		"image": {Provider: "openai", Name: "gpt-image-1.5"},

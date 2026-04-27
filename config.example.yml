@@ -45,7 +45,7 @@ provider:
     openai:
       base_url: "https://api.openai.com"
       api_key: "replace-with-openai-api-key"
-      protocol: "openai"
+      protocol: "openai-response"
       user_agent: "moonbridge/1.0"
       models:
         gpt-image-1.5: {}
@@ -93,7 +93,7 @@ developer:
       model: "gpt-5.4"
       provider:
         base_url: "https://api.openai.com"
-        api_key: "replace-with-real-openai-compatible-api-key"
+        api_key: "replace-with-real-openai-responses-api-key"
     anthropic:
       model: ""
       provider:

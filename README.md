@@ -1,6 +1,6 @@
 # Moon Bridge
 
-Moon Bridge 是一个 OpenAI Responses 兼容转发层。你可以像调用 OpenAI 一样使用 `/v1/responses`，Moon Bridge 会按模型别名把请求路由到 Anthropic Messages 兼容 Provider，或在配置为 `protocol: "openai"` 时直接透传到 OpenAI-compatible Responses Provider。
+Moon Bridge 是一个 OpenAI Responses 兼容转发层。你可以像调用 OpenAI Responses API 一样使用 `/v1/responses`，Moon Bridge 会按模型别名把请求路由到 Anthropic Messages 兼容 Provider，或在配置为 `protocol: "openai-response"` 时直接透传到 OpenAI Responses Provider。
 
 ## 快速开始
 
@@ -63,7 +63,7 @@ provider:
     openai:
       base_url: "https://api.openai.com"
       api_key: "replace-with-openai-api-key"
-      protocol: "openai"
+      protocol: "openai-response"
       models:
         gpt-image-1.5: {}
 
@@ -73,7 +73,7 @@ provider:
   default_model: "moonbridge"
 ```
 
-`protocol` 默认为 `anthropic`。设置为 `openai` 时，本轮请求不会进入 Anthropic 转换层，而是保留 OpenAI Responses 格式，只把模型别名改写为上游真实模型名。
+`protocol` 默认为 `anthropic`。设置为 `openai-response` 时，本轮请求不会进入 Anthropic 转换层，而是保留 OpenAI Responses 格式，只把模型别名改写为上游真实模型名。
 
 ### 模型定价
 
@@ -117,7 +117,7 @@ Web search 支持按 provider 独立配置。在 `provider.providers.<key>.web_s
 - `disabled`：不注入搜索工具（适合 DeepSeek 等不支持 Anthropic server tool 的 provider）
 - `injected`：不依赖上游 Provider 是否支持 Anthropic 服务端搜索，改为注入 `tavily_search` / `firecrawl_fetch` 工具并在 Transform 内部执行搜索。需配置 `tavily_api_key`；`firecrawl_api_key` 可选
 
-非 Anthropic 协议的 provider（`protocol: "openai"`）会自动禁用 web search，无需手动配置。
+非 Anthropic Messages 协议的 provider（例如 `protocol: "openai-response"`）会跳过 Anthropic `web_search_20250305` 探测与工具注入；Responses 直通请求体会保留，若上游 Responses 模型支持联网搜索则仍可按上游能力执行。
 
 配置示例：
 
@@ -175,7 +175,7 @@ system_prompt: |
 
 ### 调试抓包
 
-打开 `trace_requests: true` 后，Transform 的 Anthropic 转换请求和 Capture 模式的代理流量会按模式写入 `trace/` 目录，方便排查问题。API Key 等敏感 Header 会自动脱敏；OpenAI 协议直通 Provider 当前主要保留上游响应和 usage 日志，错误场景会写入 trace。
+打开 `trace_requests: true` 后，Transform 的 Anthropic 转换请求和 Capture 模式的代理流量会按模式写入 `trace/` 目录，方便排查问题。API Key 等敏感 Header 会自动脱敏；`openai-response` 直通 Provider 当前主要保留上游响应和 usage 日志，错误场景会写入 trace。
 
 ## 配合 Codex CLI 使用
 

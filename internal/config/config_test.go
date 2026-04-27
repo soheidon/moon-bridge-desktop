@@ -127,7 +127,7 @@ provider:
     openai:
       base_url: https://openai.example.test
       api_key: openai-key
-      protocol: openai
+      protocol: openai-response
       models:
         gpt-image-1.5: {}
   routes:
@@ -137,7 +137,7 @@ provider:
 	if err != nil {
 		t.Fatalf("LoadFromYAML() error = %v", err)
 	}
-	if cfg.ProviderDefs["openai"].Protocol != "openai" {
+	if cfg.ProviderDefs["openai"].Protocol != config.ProtocolOpenAIResponse {
 		t.Fatalf("openai provider = %+v", cfg.ProviderDefs["openai"])
 	}
 	if !cfg.DeepSeekV4ForModel("moonbridge") {
@@ -193,7 +193,7 @@ provider:
   providers:
     openai:
       api_key: openai-key
-      protocol: openai
+      protocol: openai-response
       models:
         gpt-image-1.5: {}
   routes:
@@ -212,7 +212,7 @@ provider:
   routes:
     image: "openai/gpt-image-1.5"
 `,
-		"missing provider model catalog and routes": `
+		"old openai protocol name removed": `
 mode: Transform
 provider:
   providers:
@@ -220,6 +220,19 @@ provider:
       base_url: https://openai.example.test
       api_key: openai-key
       protocol: openai
+      models:
+        gpt-image-1.5: {}
+  routes:
+    image: "openai/gpt-image-1.5"
+`,
+		"missing provider model catalog and routes": `
+mode: Transform
+provider:
+  providers:
+    openai:
+      base_url: https://openai.example.test
+      api_key: openai-key
+      protocol: openai-response
 `,
 		"empty provider model name": `
 mode: Transform
@@ -228,7 +241,7 @@ provider:
     openai:
       base_url: https://openai.example.test
       api_key: openai-key
-      protocol: openai
+      protocol: openai-response
       models:
         "": {}
 `,
@@ -239,18 +252,18 @@ provider:
     openai:
       base_url: https://openai.example.test
       api_key: openai-key
-      protocol: openai
+      protocol: openai-response
   routes:
     image: "openai/"
 `,
-		"deepseek extension on openai protocol": `
+		"deepseek extension on openai-response protocol": `
 mode: Transform
 provider:
   providers:
     openai:
       base_url: https://openai.example.test
       api_key: openai-key
-      protocol: openai
+      protocol: openai-response
       deepseek_v4: true
       models:
         gpt-image-1.5: {}

@@ -218,9 +218,9 @@ func (server *Server) handleResponses(writer http.ResponseWriter, request *http.
 		return
 	}
 
-	// Check if this model routes to an OpenAI-protocol provider (skip Anthropic conversion).
+	// Check if this model routes to an OpenAI Responses provider (skip Anthropic conversion).
 	providerKey := server.bridge.ProviderFor(responsesRequest.Model)
-	if server.providerMgr != nil && server.providerMgr.ProtocolForModel(responsesRequest.Model) == "openai" {
+	if server.providerMgr != nil && server.providerMgr.ProtocolForModel(responsesRequest.Model) == config.ProtocolOpenAIResponse {
 		server.handleOpenAIResponse(writer, request, responsesRequest, providerKey, record)
 		return
 	}
@@ -516,12 +516,12 @@ func (w *anthropicClientWrapper) StreamMessage(ctx context.Context, request anth
 	return w.client.StreamMessage(ctx, request)
 }
 
-// handleOpenAIResponse proxies a request directly to an OpenAI-compatible upstream
+// handleOpenAIResponse proxies a request directly to an OpenAI Responses upstream
 // without Anthropic protocol conversion. It handles both streaming and non-streaming.
 func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *http.Request, responsesRequest openai.ResponsesRequest, providerKey string, record mbtrace.Record) {
 	log := logger.L().With("path", request.URL.Path, "method", request.Method)
 	if server.providerMgr == nil {
-		log.Error("未配置 OpenAI 协议的提供商管理器")
+		log.Error("未配置 OpenAI Responses 直通的提供商管理器")
 		writeOpenAIError(writer, http.StatusBadGateway, openai.ErrorResponse{Error: openai.ErrorObject{
 			Message: "提供商路由未配置",
 			Type:    "server_error",

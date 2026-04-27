@@ -100,7 +100,7 @@ func TestResolvePerProviderWebSearchNonAnthropicDisabled(t *testing.T) {
 	}
 	pm, err := provider.NewProviderManager(
 		map[string]provider.ProviderConfig{
-			"openai": {BaseURL: "https://openai.example.test", APIKey: "key", Protocol: "openai"},
+			"openai": {BaseURL: "https://openai.example.test", APIKey: "key", Protocol: config.ProtocolOpenAIResponse},
 		},
 		map[string]provider.ModelRoute{},
 	)
@@ -176,7 +176,6 @@ func TestResolvePerProviderWebSearchAppliesProviderCatalogModelOverride(t *testi
 	}
 }
 
-
 func TestPricingIndexIncludesProviderModelSlugs(t *testing.T) {
 	// Simulate the pricing setup from runTransform():
 	// pricing should be indexed by both route aliases AND provider/model slugs.
@@ -244,7 +243,7 @@ func TestPricingIndexIncludesProviderModelSlugs(t *testing.T) {
 				pricing[slug] = p
 				pricing[newSlug] = p
 			}
-	}
+		}
 	}
 
 	sessionStats := stats.NewSessionStats()
@@ -322,7 +321,7 @@ func TestBuildProviderDefsFromConfigKeepsMultiProviderDefinitions(t *testing.T) 
 			"openai": {
 				BaseURL:  "https://openai.example.test",
 				APIKey:   "openai-key",
-				Protocol: "openai",
+				Protocol: config.ProtocolOpenAIResponse,
 			},
 		},
 	}
@@ -331,7 +330,7 @@ func TestBuildProviderDefsFromConfigKeepsMultiProviderDefinitions(t *testing.T) 
 	if len(defs) != 2 {
 		t.Fatalf("defs = %+v", defs)
 	}
-	if defs["openai"].BaseURL != "https://openai.example.test" || defs["openai"].Protocol != "openai" {
+	if defs["openai"].BaseURL != "https://openai.example.test" || defs["openai"].Protocol != config.ProtocolOpenAIResponse {
 		t.Fatalf("openai def = %+v", defs["openai"])
 	}
 	if defs["deepseek"].BaseURL != "https://deepseek.example.test" {
