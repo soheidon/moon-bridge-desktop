@@ -229,7 +229,9 @@ export MOONBRIDGE_CLIENT_API_KEY="local-dev"
 ./scripts/start_codex_with_moonbridge.sh '请运行测试并汇报结果'
 ```
 
-脚本会自动生成隔离的 Codex 配置，不会修改你全局的 `~/.codex`；如果全局 `~/.codex/config.toml` 中存在 `[tui].status_line`，会复制到隔离配置里，保持当前 statusline 显示习惯。
+脚本会自动生成隔离的 Codex 配置到 `FakeHome/Codex/config.toml`，不会修改你全局的 `~/.codex`；
+如果全局 `~/.codex/config.toml`（或 `$MOONBRIDGE_CODEX_CONFIG`）中存在 `[tui].status_line`，会逐字复制到隔离配置里。
+因此其中包含的 `"fast-mode"` 等字段也来自全局配置——如需移除，请编辑全局 `~/.codex/config.toml` 的 `status_line` 列表。
 
 ## 配合 Claude Code 使用
 

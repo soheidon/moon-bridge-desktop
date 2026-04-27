@@ -22,7 +22,7 @@ func TestWriteSummaryAlwaysIncludesTotalCost(t *testing.T) {
 	WriteSummary(&output, Summary{})
 
 	for _, want := range []string{
-		"统计：平均缓存命中率 0.0%",
+		"统计：缓存命中率 0.0%",
 		"累计计费 0.00 元",
 		"累计费用:",
 	} {

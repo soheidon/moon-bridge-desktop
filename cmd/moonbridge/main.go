@@ -87,8 +87,36 @@ func main() {
 	}
 }
 
+func valueOrDefault(value string, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+// writeModelsCatalog generates a Codex-compatible models_catalog.json from
+// provider model catalogs, with routes appended as fallback aliases.
+func writeModelsCatalog(path string, cfg config.Config) error {
+	catalog := struct {
+		Models []server.ModelInfo `json:"models"`
+	}{Models: server.BuildModelInfosFromConfig(cfg)}
+	data, err := json.MarshalIndent(catalog, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
+}
+
 func printCodexConfigToml(modelAlias string, baseURL string, codexHome string, cfg config.Config) {
 	route := cfg.RouteFor(modelAlias)
+
+	// Transform "provider/model" format to "model(provider)" for Codex display.
+	if provider, modelName := config.ParseModelRef(modelAlias); provider != "" {
+		modelAlias = modelName + "(" + provider + ")"
+	}
 	fmt.Printf("model = %q\n", modelAlias)
 	fmt.Println(`model_provider = "moonbridge"`)
 	fmt.Println(`service_tier = "flex"`)
@@ -119,27 +147,4 @@ func printCodexConfigToml(modelAlias string, baseURL string, codexHome string, c
 	fmt.Println(`url = "https://mcp.deepwiki.com/mcp"`)
 	fmt.Println("startup_timeout_sec = 3600")
 	fmt.Println("tool_timeout_sec = 3600")
-}
-
-func valueOrDefault(value string, fallback string) string {
-	if value == "" {
-		return fallback
-	}
-	return value
-}
-
-// writeModelsCatalog generates a Codex-compatible models_catalog.json from
-// provider model catalogs, with routes appended as fallback aliases.
-func writeModelsCatalog(path string, cfg config.Config) error {
-	catalog := struct {
-		Models []server.ModelInfo `json:"models"`
-	}{Models: server.BuildModelInfosFromConfig(cfg)}
-	data, err := json.MarshalIndent(catalog, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0644)
 }

@@ -630,22 +630,25 @@ func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *
 }
 
 func logUsageLine(requestModel, actualModel string, usage stats.Usage, sessionStats *stats.SessionStats) {
-	var requestCost, totalCost, hitRate, writeRate float64
+	var requestCost float64
+	var summary stats.Summary
 	if sessionStats != nil {
 		requestCost = sessionStats.ComputeCost(requestModel, usage)
-		totalCost = sessionStats.Summary().TotalCost
-		hitRate = sessionStats.CacheHitRate()
-		writeRate = sessionStats.CacheWriteRate()
+		summary = sessionStats.Summary()
 	}
 	fmt.Fprintln(logger.Output(), stats.FormatUsageLine(stats.UsageLineParams{
 		RequestModel:   requestModel,
 		ActualModel:    actualModel,
 		Usage:          usage,
 		RequestCost:    requestCost,
-		TotalCost:      totalCost,
-		CacheHitRate:   hitRate,
-		CacheWriteRate: writeRate,
+		TotalCost:      summary.TotalCost,
+		CacheHitRate:   summary.CacheHitRate,
+		CacheWriteRate: summary.CacheWriteRate,
 	}))
+	if sessionStats != nil {
+		fmt.Fprintln(logger.Output(), "---")
+		stats.WriteSummary(logger.Output(), summary)
+	}
 }
 
 func openAIUsageFromResponse(data []byte, stream bool) (stats.Usage, bool) {
@@ -798,7 +801,12 @@ func BuildModelInfoFromRoute(alias string, ownedBy string, route config.RouteEnt
 func BuildModelInfoFromProviderModel(slug string, ownedBy string, meta config.ModelMeta) ModelInfo {
 	displayName := meta.DisplayName
 	if displayName == "" {
-		displayName = slug
+		// Extract model name from "model(provider)" slug format.
+		if idx := strings.Index(slug, "("); idx > 0 {
+			displayName = slug[:idx]
+		} else {
+			displayName = slug
+		}
 	}
 	displayName = displayName + "(" + ownedBy + ")"
 	return newModelInfo(slug, displayName, meta.Description, meta.ContextWindow,
@@ -825,7 +833,7 @@ func BuildModelInfosFromConfig(cfg config.Config) []ModelInfo {
 		}
 		sort.Strings(modelNames)
 		for _, name := range modelNames {
-			slug := providerKey + "/" + name
+			slug := name + "(" + providerKey + ")"
 			if seen[slug] {
 				continue
 			}

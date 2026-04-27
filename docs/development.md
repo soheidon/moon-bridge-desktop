@@ -72,7 +72,8 @@ go build -o moonbridge ./cmd/moonbridge
 ```
 
 启动脚本 `scripts/start_codex_with_moonbridge.sh` 和 `scripts/start_claude_code_with_moonbridge.sh` 会自动构建二进制、管理服务进程生命周期，并设置临时 `CODEX_HOME` / `CLAUDE_CONFIG_DIR`。
-Codex 脚本会从 `${MOONBRIDGE_CODEX_CONFIG:-$HOME/.codex/config.toml}` 复制 `[tui].status_line` 到 `FakeHome/Codex/config.toml`，但不会改动全局配置。
+Codex 脚本会从 `${MOONBRIDGE_CODEX_CONFIG:-$HOME/.codex/config.toml}` 逐字复制 `[tui].status_line` 到 `FakeHome/Codex/config.toml`，但不会改动全局配置。
+因此 `status_line` 中包含的 `"fast-mode"` 等字段直接继承自全局 Codex 配置；如需移除，请编辑全局 `~/.codex/config.toml` 的 `status_line` 列表。
 两个脚本每次运行都会先清空对应的 `logs/moonbridge-*.log`，然后把脚本生命周期输出和 Moon Bridge 服务输出追加到同一个日志文件中，方便看到启动前配置、客户端退出状态和服务端退出汇总。
 
 ## 测试

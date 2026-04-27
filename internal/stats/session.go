@@ -1,6 +1,7 @@
 package stats
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"log/slog"
@@ -126,36 +127,6 @@ func computeCost(usage Usage, p ModelPricing) float64 {
 		output*p.OutputPrice/1000000
 }
 
-// CacheHitRate returns the cache hit rate as a percentage.
-func (s *SessionStats) CacheHitRate() float64 {
-	if s == nil {
-		return 0
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	totalInput := s.totalInputTokens + s.totalCacheCreation + s.totalCacheRead
-	if totalInput == 0 {
-		return 0
-	}
-	return float64(s.totalCacheRead) / float64(totalInput) * 100
-}
-
-// CacheWriteRate returns the cache write (creation) rate as a percentage.
-func (s *SessionStats) CacheWriteRate() float64 {
-	if s == nil {
-		return 0
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	totalInput := s.totalInputTokens + s.totalCacheCreation + s.totalCacheRead
-	if totalInput == 0 {
-		return 0
-	}
-	return float64(s.totalCacheCreation) / float64(totalInput) * 100
-}
-
 // Summary returns a summary of the session stats.
 func (s *SessionStats) Summary() Summary {
 	s.mu.RLock()
@@ -163,8 +134,10 @@ func (s *SessionStats) Summary() Summary {
 
 	totalInput := s.totalInputTokens + s.totalCacheCreation + s.totalCacheRead
 	var cacheHitRate float64
+	var cacheWriteRate float64
 	if totalInput > 0 {
 		cacheHitRate = float64(s.totalCacheRead) / float64(totalInput) * 100
+		cacheWriteRate = float64(s.totalCacheCreation) / float64(totalInput) * 100
 	}
 
 	return Summary{
@@ -175,6 +148,7 @@ func (s *SessionStats) Summary() Summary {
 		CacheCreation:       s.totalCacheCreation,
 		CacheRead:           s.totalCacheRead,
 		CacheHitRate:        cacheHitRate,
+		CacheWriteRate:      cacheWriteRate,
 		EffectiveInputSaved: s.totalCacheRead,
 		TotalCost:           s.totalCost,
 		ByModel:             copyByModel(s.byModel),
@@ -214,6 +188,7 @@ type Summary struct {
 	CacheCreation       int64
 	CacheRead           int64
 	CacheHitRate        float64
+	CacheWriteRate      float64
 	EffectiveInputSaved int64
 	TotalCost           float64
 	ByModel             map[string]*ModelStats
@@ -229,6 +204,7 @@ func (s Summary) LogValue() slog.Value {
 		slog.Int64("cache_creation", s.CacheCreation),
 		slog.Int64("cache_read", s.CacheRead),
 		slog.Float64("cache_hit_rate", s.CacheHitRate),
+		slog.Float64("cache_write_rate", s.CacheWriteRate),
 		slog.Int64("cache_saved_tokens", s.EffectiveInputSaved),
 		slog.Duration("duration", s.Duration),
 	}
@@ -279,7 +255,7 @@ func FormatSummaryLine(s Summary) string {
 	if s.CacheCreation > 0 {
 		rwRatio = float64(s.CacheRead) / float64(s.CacheCreation)
 	}
-	return fmt.Sprintf("统计：平均缓存命中率 %.1f%%, 读写比 %.2f, 累计计费 %.2f 元", s.CacheHitRate, rwRatio, s.TotalCost)
+	return fmt.Sprintf("统计：缓存命中率 %.1f%%, 读写比 %.2f, 累计计费 %.2f 元", s.CacheHitRate, rwRatio, s.TotalCost)
 }
 
 // ErrorLineParams holds data needed to format a per-request error log block.
@@ -301,36 +277,39 @@ func FormatErrorLine(p ErrorLineParams) string {
 
 // WriteSummary writes a human-readable summary to the writer.
 func WriteSummary(w io.Writer, s Summary) {
-	fmt.Fprintln(w, FormatSummaryLine(s))
-	fmt.Fprintf(w, "会话统计: %d 次请求, 耗时 %s\n", s.Requests, s.Duration.Round(time.Second))
-	fmt.Fprintf(w, "  输入: %d tokens (首次 %d, 缓存写入 %d, 缓存读取 %d)\n",
+	var buf bytes.Buffer
+	fmt.Fprintln(&buf, FormatSummaryLine(s))
+	fmt.Fprintf(&buf, "会话统计: %d 次请求, 耗时 %s\n", s.Requests, s.Duration.Round(time.Second))
+	fmt.Fprintf(&buf, "  输入: %d tokens (首次 %d, 缓存写入 %d, 缓存读取 %d)\n",
 		s.InputTokens+s.CacheCreation+s.CacheRead,
 		s.InputTokens,
 		s.CacheCreation,
 		s.CacheRead)
-	fmt.Fprintf(w, "  输出: %d tokens\n", s.OutputTokens)
+	fmt.Fprintf(&buf, "  输出: %d tokens\n", s.OutputTokens)
 	if s.CacheHitRate > 0 {
-		fmt.Fprintf(w, "  缓存命中率: %.1f%% (节省 %d tokens)\n", s.CacheHitRate, s.EffectiveInputSaved)
+		fmt.Fprintf(&buf, "  缓存命中率: %.1f%% (节省 %d tokens)\n", s.CacheHitRate, s.EffectiveInputSaved)
 	}
 	rwRatio := float64(0)
 	if s.CacheCreation > 0 {
 		rwRatio = float64(s.CacheRead) / float64(s.CacheCreation)
 	}
 	if rwRatio > 0 {
-		fmt.Fprintf(w, "  缓存读写比: %.2f\n", rwRatio)
+		fmt.Fprintf(&buf, "  缓存读写比: %.2f\n", rwRatio)
 	}
-	fmt.Fprintf(w, "  累计费用: ¥%.6f\n", s.TotalCost)
+	fmt.Fprintf(&buf, "  累计费用: ¥%.6f\n", s.TotalCost)
 	for model, ms := range s.ByModel {
 		displayName := model
 		if actual, ok := s.ActualModelNames[model]; ok && actual != model {
 			displayName = model + " → " + actual
 		}
 		if ms.Cost > 0 {
-			fmt.Fprintf(w, "    %s: ¥%.6f (%d 次, %d 输入, %d 输出)\n",
+			fmt.Fprintf(&buf, "    %s: ¥%.6f (%d 次, %d 输入, %d 输出)\n",
 				displayName, ms.Cost, ms.Requests, ms.InputTokens+ms.CacheCreation+ms.CacheRead, ms.OutputTokens)
 		}
 	}
+	buf.WriteTo(w)
 }
+
 
 // ComputeCost returns the cost in RMB for a given model and usage without
 // recording it in the session stats. Returns 0 if no pricing is configured

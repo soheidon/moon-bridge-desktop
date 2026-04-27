@@ -226,18 +226,25 @@ func TestPricingIndexIncludesProviderModelSlugs(t *testing.T) {
 	for providerKey, def := range providerDefs {
 		for modelName, meta := range def.Models {
 			slug := providerKey + "/" + modelName
+			newSlug := modelName + "(" + providerKey + ")"
 			if _, exists := pricing[slug]; exists {
+				// route alias already has pricing; also index new format.
+				if _, exists := pricing[newSlug]; !exists {
+					pricing[newSlug] = pricing[slug]
+				}
 				continue
 			}
 			if meta.InputPrice > 0 || meta.OutputPrice > 0 || meta.CacheWritePrice > 0 || meta.CacheReadPrice > 0 {
-				pricing[slug] = stats.ModelPricing{
+				p := stats.ModelPricing{
 					InputPrice:      meta.InputPrice,
 					OutputPrice:     meta.OutputPrice,
 					CacheWritePrice: meta.CacheWritePrice,
 					CacheReadPrice:  meta.CacheReadPrice,
 				}
+				pricing[slug] = p
+				pricing[newSlug] = p
 			}
-		}
+	}
 	}
 
 	sessionStats := stats.NewSessionStats()
@@ -260,6 +267,15 @@ func TestPricingIndexIncludesProviderModelSlugs(t *testing.T) {
 	}
 
 	// Verify deepseek-v4-pro also works via slug (and route pricing takes priority).
+
+	// Verify model(provider) format pricing works.
+	cost = sessionStats.ComputeCost("deepseek-v4-flash(deepseek)", stats.Usage{
+		InputTokens: 1000, OutputTokens: 500,
+	})
+	if cost <= 0 {
+		t.Fatalf("ComputeCost(deepseek-v4-flash(deepseek), ...) = %f, want > 0", cost)
+	}
+
 	cost = sessionStats.ComputeCost("deepseek/deepseek-v4-pro", stats.Usage{
 		InputTokens: 1000, OutputTokens: 500,
 	})
@@ -268,6 +284,19 @@ func TestPricingIndexIncludesProviderModelSlugs(t *testing.T) {
 	}
 
 	// Verify Record() accumulates cost for provider/model slug.
+
+	// Verify Record() works with model(provider) format.
+	sessionStats.Record("deepseek-v4-flash(deepseek)", "", stats.Usage{
+		InputTokens: 1000, OutputTokens: 200,
+	})
+	summary2 := sessionStats.Summary()
+	if _, ok := summary2.ByModel["deepseek-v4-flash(deepseek)"]; !ok {
+		t.Fatal("Summary().ByModel missing deepseek-v4-flash(deepseek)")
+	}
+	if summary2.ByModel["deepseek-v4-flash(deepseek)"].Cost <= 0 {
+		t.Fatalf("ByModel[deepseek-v4-flash(deepseek)].Cost = %f, want > 0", summary2.ByModel["deepseek-v4-flash(deepseek)"].Cost)
+	}
+
 	sessionStats.Record("deepseek/deepseek-v4-flash", "", stats.Usage{
 		InputTokens: 1000, OutputTokens: 200,
 	})

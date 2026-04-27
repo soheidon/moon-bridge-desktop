@@ -255,7 +255,7 @@ func TestBuildModelInfosFromConfigIncludesProviderModelsBeforeRouteFallback(t *t
 	for _, model := range models {
 		slugs = append(slugs, model.Slug)
 	}
-	want := []string{"p1/model-a", "p1/model-b", "p2/model-c", "alias-a"}
+	want := []string{"model-a(p1)", "model-b(p1)", "model-c(p2)", "alias-a", "p1/model-a"}
 	if strings.Join(slugs, ",") != strings.Join(want, ",") {
 		t.Fatalf("slugs = %v, want %v", slugs, want)
 	}
@@ -265,7 +265,7 @@ func TestBuildModelInfosFromConfigIncludesProviderModelsBeforeRouteFallback(t *t
 }
 
 func TestBuildModelInfoPreservesReasoningLevelsForDeepSeekV4(t *testing.T) {
-	info := server.BuildModelInfoFromProviderModel("deepseek/deepseek-v4-pro", "deepseek", config.ModelMeta{
+	info := server.BuildModelInfoFromProviderModel("deepseek-v4-pro(deepseek)", "deepseek", config.ModelMeta{
 		DeepSeekV4:            true,
 		DefaultReasoningLevel: "high",
 		SupportedReasoningLevels: []config.ReasoningLevelPreset{
