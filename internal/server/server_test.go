@@ -19,6 +19,7 @@ import (
 	"moonbridge/internal/extensions/codex"
 	deepseekv4 "moonbridge/internal/extensions/deepseek_v4"
 	"moonbridge/internal/logger"
+	"moonbridge/internal/openai"
 	"moonbridge/internal/plugin"
 	"moonbridge/internal/provider"
 	"moonbridge/internal/server"
@@ -592,6 +593,233 @@ func TestOpenAIResponsePassthroughWritesTraceOnSuccess(t *testing.T) {
 		if strings.Contains(traceContent, notWant) {
 			t.Fatalf("trace should not contain %q: %s", notWant, traceContent)
 		}
+	}
+}
+
+
+func TestInjectWebSearchToolAppendsWhenMissing(t *testing.T) {
+	tools := server.InjectWebSearchTool(nil)
+	if len(tools) != 1 || tools[0].Type != "web_search" {
+		t.Fatalf("InjectWebSearchTool(nil) = %+v, want [web_search]", tools)
+	}
+}
+
+func TestInjectWebSearchToolSkipsWhenPresent(t *testing.T) {
+	original := []openai.Tool{{Type: "web_search"}}
+	result := server.InjectWebSearchTool(original)
+	if len(result) != 1 {
+		t.Fatalf("InjectWebSearchTool with web_search present = %+v, want unchanged", result)
+	}
+}
+
+func TestInjectWebSearchToolPreservesExistingTools(t *testing.T) {
+	original := []openai.Tool{{Type: "function", Name: "exec_command"}}
+	result := server.InjectWebSearchTool(original)
+	if len(result) != 2 || result[1].Type != "web_search" {
+		t.Fatalf("InjectWebSearchTool = %+v, want [exec_command, web_search]", result)
+	}
+}
+
+func TestOpenAIResponsePassthroughInjectsWebSearchOnEnabledModel(t *testing.T) {
+	traceRoot := t.TempDir()
+	var upstreamBody struct {
+		Model string       `json:"model"`
+		Tools []openai.Tool `json:"tools,omitempty"`
+		Input string        `json:"input"`
+	}
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if err := json.NewDecoder(request.Body).Decode(&upstreamBody); err != nil {
+			t.Fatalf("Decode upstream request error = %v", err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"id":"resp_ws_1","object":"response","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":3}}`)),
+		}, nil
+	})}
+
+	providerMgr, err := provider.NewProviderManager(
+		map[string]provider.ProviderConfig{
+			"openai": {
+				BaseURL:  "https://openai.example.test",
+				APIKey:   "openai-key",
+				Protocol: config.ProtocolOpenAIResponse,
+			},
+		},
+		map[string]provider.ModelRoute{
+			"gpt-direct": {Provider: "openai", Name: "gpt-upstream"},
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewProviderManager() error = %v", err)
+	}
+	// Enable web_search for this provider.
+	providerMgr.SetResolvedWebSearch("openai", "enabled")
+
+	handler := server.New(server.Config{
+		Bridge: bridge.New(config.Config{
+			Routes: map[string]config.RouteEntry{
+				"gpt-direct": {Provider: "openai", Model: "gpt-upstream"},
+			},
+			Cache: config.CacheConfig{Mode: "off"},
+		}, cache.NewMemoryRegistry(), nil),
+		ProviderMgr:      providerMgr,
+		OpenAIHTTPClient: httpClient,
+		Tracer:           mbtrace.New(mbtrace.Config{Enabled: true, Root: traceRoot, SessionID: "session-test"}),
+	})
+
+	requestBody := bytes.NewBufferString(`{"model":"gpt-direct","input":"search the web"}`)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", requestBody)
+
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	// Verify web_search tool was injected into the upstream request.
+	hasWebSearch := false
+	for _, tool := range upstreamBody.Tools {
+		if tool.Type == "web_search" {
+			hasWebSearch = true
+			break
+		}
+	}
+	if !hasWebSearch {
+		t.Fatalf("upstream request tools = %+v, expected web_search to be injected", upstreamBody.Tools)
+	}
+	if upstreamBody.Model != "gpt-upstream" {
+		t.Fatalf("upstream model = %q, want gpt-upstream", upstreamBody.Model)
+	}
+}
+
+
+func TestOpenAIResponsePassthroughSkipsWebSearchOnDisabledModel(t *testing.T) {
+	var upstreamBody struct {
+		Model string       `json:"model"`
+		Tools []openai.Tool `json:"tools,omitempty"`
+		Input string        `json:"input"`
+	}
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if err := json.NewDecoder(request.Body).Decode(&upstreamBody); err != nil {
+			t.Fatalf("Decode upstream request error = %v", err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"id":"resp_d1","object":"response","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":3}}`)),
+		}, nil
+	})}
+
+	providerMgr, err := provider.NewProviderManager(
+		map[string]provider.ProviderConfig{
+			"openai": {
+				BaseURL:  "https://openai.example.test",
+				APIKey:   "openai-key",
+				Protocol: config.ProtocolOpenAIResponse,
+			},
+		},
+		map[string]provider.ModelRoute{
+			"gpt-direct": {Provider: "openai", Name: "gpt-upstream"},
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewProviderManager() error = %v", err)
+	}
+	// Disable web_search for this provider.
+	providerMgr.SetResolvedWebSearch("openai", "disabled")
+
+	handler := server.New(server.Config{
+		Bridge: bridge.New(config.Config{
+			Routes: map[string]config.RouteEntry{
+				"gpt-direct": {Provider: "openai", Model: "gpt-upstream"},
+			},
+			Cache: config.CacheConfig{Mode: "off"},
+		}, cache.NewMemoryRegistry(), nil),
+		ProviderMgr:      providerMgr,
+		OpenAIHTTPClient: httpClient,
+	})
+
+	requestBody := bytes.NewBufferString(`{"model":"gpt-direct","input":"no search"}`)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", requestBody)
+
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	// Verify web_search tool was NOT injected.
+	for _, tool := range upstreamBody.Tools {
+		if tool.Type == "web_search" {
+			t.Fatalf("upstream request should not have web_search when disabled, got tools = %+v", upstreamBody.Tools)
+		}
+	}
+}
+
+func TestOpenAIResponsePassthroughDoesNotDuplicateWebSearch(t *testing.T) {
+	var upstreamBody struct {
+		Model string       `json:"model"`
+		Tools []openai.Tool `json:"tools,omitempty"`
+	}
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if err := json.NewDecoder(request.Body).Decode(&upstreamBody); err != nil {
+			t.Fatalf("Decode upstream request error = %v", err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"id":"resp_d2","object":"response","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":3}}`)),
+		}, nil
+	})}
+
+	providerMgr, err := provider.NewProviderManager(
+		map[string]provider.ProviderConfig{
+			"openai": {
+				BaseURL:  "https://openai.example.test",
+				APIKey:   "openai-key",
+				Protocol: config.ProtocolOpenAIResponse,
+			},
+		},
+		map[string]provider.ModelRoute{
+			"gpt-direct": {Provider: "openai", Name: "gpt-upstream"},
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewProviderManager() error = %v", err)
+	}
+	providerMgr.SetResolvedWebSearch("openai", "enabled")
+
+	handler := server.New(server.Config{
+		Bridge: bridge.New(config.Config{
+			Routes: map[string]config.RouteEntry{
+				"gpt-direct": {Provider: "openai", Model: "gpt-upstream"},
+			},
+			Cache: config.CacheConfig{Mode: "off"},
+		}, cache.NewMemoryRegistry(), nil),
+		ProviderMgr:      providerMgr,
+		OpenAIHTTPClient: httpClient,
+	})
+
+	// Request already includes web_search tool.
+	requestBody := bytes.NewBufferString(`{"model":"gpt-direct","input":"search","tools":[{"type":"web_search"}]}`)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", requestBody)
+
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	// Verify web_search tool appears exactly once.
+	count := 0
+	for _, tool := range upstreamBody.Tools {
+		if tool.Type == "web_search" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("upstream request tools = %+v, expected exactly 1 web_search, got %d", upstreamBody.Tools, count)
 	}
 }
 

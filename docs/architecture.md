@@ -250,7 +250,7 @@ session 级 token 和费用统计。
 - `usage.input_tokens_details.cached_tokens` 即使为 0 也序列化输出，避免 Codex 压缩上下文时解析失败。
 - `local_shell_call` 使用独立 JSON schema 和 output item 类型，不走普通 `function_call` 路径。
 - `web_search_call` 流式中 `input_json_delta` 不产生 `function_call_arguments.delta`，而是并入 `action` 字段；当 Provider 探测不支持 web search 时，不向上游注入搜索工具；`injected` 模式则改为服务端 Tavily/Firecrawl 工具循环。
-- web search 支持按模型独立判断：每个模型根据其 resolved web search mode（`enabled` / `disabled` / `injected` / auto 探测结果）决定是否向上游注入搜索工具或启用服务端 Tavily/Firecrawl 工具循环。配置优先级：route → model（provider catalog）→ provider → global。
+- web search 支持按模型独立判断：每个模型根据其 resolved web search mode（`enabled` / `disabled` / `injected` / auto 探测结果）决定是否向上游注入搜索工具或启用服务端 Tavily/Firecrawl 工具循环。`openai-response` 协议的 Provider 会在 `enabled` 时自动注入 OpenAI Responses 原生 `{"type": "web_search"}` 工具（`injected` 模式因 Tavily/Firecrawl 为 Anthropic 专用，会映射为 `disabled`）。配置优先级：route → model（provider catalog）→ provider → global。
 - 空 `text_delta` / 空 `output_text` 不再生成 message 输出或 Anthropic `text` block，避免下一轮工具历史里出现 `{"type":"text"}` 这种缺少 `text` 字段的非法内容。
 
 ### 消息顺序

@@ -117,7 +117,7 @@ Web search 支持按 provider 独立配置。在 `provider.providers.<key>.web_s
 - `disabled`：不注入搜索工具（适合 DeepSeek 等不支持 Anthropic server tool 的 provider）
 - `injected`：不依赖上游 Provider 是否支持 Anthropic 服务端搜索，改为注入 `tavily_search` / `firecrawl_fetch` 工具并在 Transform 内部执行搜索。需配置 `tavily_api_key`；`firecrawl_api_key` 可选
 
-非 Anthropic Messages 协议的 provider（例如 `protocol: "openai-response"`）会跳过 Anthropic `web_search_20250305` 探测与工具注入；Responses 直通请求体会保留，若上游 Responses 模型支持联网搜索则仍可按上游能力执行。
+`protocol: "openai-response"` 的 provider 会跳过 Anthropic `web_search_20250305` 探测与注入（Tavily/Firecrawl），但会在 resolved web search mode 为 `enabled` 时自动注入 OpenAI Responses 原生 `{"type": "web_search"}` 工具到上游请求中。
 
 配置示例：
 

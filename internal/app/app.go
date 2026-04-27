@@ -215,25 +215,39 @@ func resolvePerProviderWebSearch(ctx context.Context, cfg config.Config, pm *pro
 	}
 	// 1. Resolve provider-level defaults.
 	for _, key := range pm.ProviderKeys() {
-		if pm.ProtocolForKey(key) != config.ProtocolAnthropic {
-			pm.SetResolvedWebSearch(key, "disabled")
-			logger.Info("跳过 Anthropic 网页搜索探测与工具注入", "provider", key, "protocol", pm.ProtocolForKey(key))
-			continue
-		}
+		protocol := pm.ProtocolForKey(key)
 		support := cfg.WebSearchForProvider(key)
-		switch support {
-		case config.WebSearchSupportDisabled:
-			pm.SetResolvedWebSearch(key, "disabled")
-			logger.Info("配置禁用网页搜索", "provider", key)
-		case config.WebSearchSupportEnabled:
-			pm.SetResolvedWebSearch(key, "enabled")
-			logger.Info("配置强制启用网页搜索", "provider", key)
-		case config.WebSearchSupportInjected:
-			pm.SetResolvedWebSearch(key, "injected")
-			logger.Info("网页搜索注入模式已启用", "provider", key)
+		switch protocol {
+		case config.ProtocolAnthropic:
+			switch support {
+			case config.WebSearchSupportDisabled:
+				pm.SetResolvedWebSearch(key, "disabled")
+				logger.Info("配置禁用网页搜索", "provider", key)
+			case config.WebSearchSupportEnabled:
+				pm.SetResolvedWebSearch(key, "enabled")
+				logger.Info("配置强制启用网页搜索", "provider", key)
+			case config.WebSearchSupportInjected:
+				pm.SetResolvedWebSearch(key, "injected")
+				logger.Info("网页搜索注入模式已启用", "provider", key)
+			default:
+				resolved := probeProviderWebSearch(ctx, key, pm, errors)
+				pm.SetResolvedWebSearch(key, resolved)
+			}
+		case config.ProtocolOpenAIResponse:
+			// OpenAI Responses API natively supports the web_search tool type.
+			// Auto-discovery is unnecessary: "auto"/"enabled"/empty all enable it.
+			// "injected" mode (Tavily/Firecrawl) is Anthropic-only; map to "disabled".
+			switch support {
+			case config.WebSearchSupportDisabled, config.WebSearchSupportInjected:
+				pm.SetResolvedWebSearch(key, "disabled")
+				logger.Info("响应端网页搜索已禁用", "provider", key, "protocol", protocol, "config", support)
+			default:
+				pm.SetResolvedWebSearch(key, "enabled")
+				logger.Info("已启用响应端网页搜索", "provider", key, "protocol", protocol)
+			}
 		default:
-			resolved := probeProviderWebSearch(ctx, key, pm, errors)
-			pm.SetResolvedWebSearch(key, resolved)
+			pm.SetResolvedWebSearch(key, "disabled")
+			logger.Info("跳过网页搜索：不支持的协议", "provider", key, "protocol", protocol)
 		}
 	}
 	// 2. Resolve model-level overrides for provider catalog slugs and route aliases.
@@ -259,9 +273,25 @@ func resolveModelWebSearch(ctx context.Context, alias string, modelWS config.Web
 		return // no model-level override, provider resolution applies
 	}
 	modelKey := "model:" + alias
-	if protocol := pm.ProtocolForModel(alias); protocol != config.ProtocolAnthropic {
+	protocol := pm.ProtocolForModel(alias)
+	switch protocol {
+	case config.ProtocolAnthropic:
+		// Continue to Anthropic-specific handling below.
+	case config.ProtocolOpenAIResponse:
+		// OpenAI Responses API natively supports web_search.
+		// "injected" mode (Tavily/Firecrawl) is Anthropic-only; map to "disabled".
+		switch modelWS {
+		case config.WebSearchSupportDisabled, config.WebSearchSupportInjected:
+			pm.SetResolvedWebSearch(modelKey, "disabled")
+			logger.Info("模型禁用响应端网页搜索", "model", alias, "config", modelWS)
+		default:
+			pm.SetResolvedWebSearch(modelKey, "enabled")
+			logger.Info("模型启用响应端网页搜索", "model", alias)
+		}
+		return
+	default:
 		pm.SetResolvedWebSearch(modelKey, "disabled")
-		logger.Info("跳过模型级 Anthropic 网页搜索探测与工具注入", "model", alias, "protocol", protocol)
+		logger.Info("跳过模型级网页搜索：不支持的协议", "model", alias, "protocol", protocol)
 		return
 	}
 	switch modelWS {

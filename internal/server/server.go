@@ -510,6 +510,11 @@ func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *
 	upstreamRequest := responsesRequest
 	upstreamRequest.Model = server.providerMgr.UpstreamModelFor(responsesRequest.Model)
 
+	// Inject web_search tool if enabled for this model.
+	if server.providerMgr != nil && server.providerMgr.ResolvedWebSearchForModel(responsesRequest.Model) == "enabled" {
+		upstreamRequest.Tools = InjectWebSearchTool(upstreamRequest.Tools)
+	}
+
 	body, err := json.Marshal(upstreamRequest)
 	if err != nil {
 		log.Error("序列化请求失败", "error", err)
@@ -760,3 +765,18 @@ func (server *Server) resolveRequestOptions(modelAlias string, providerKey strin
 	}
 }
 
+
+// injectWebSearchTool adds a native web_search tool to the tools array if
+// one is not already present. OpenAI Responses API supports this as a
+// built-in tool type.
+func InjectWebSearchTool(tools []openai.Tool) []openai.Tool {
+	for _, t := range tools {
+		if t.Type == "web_search" {
+			return tools // already present
+		}
+	}
+	if tools == nil {
+		tools = make([]openai.Tool, 0, 1)
+	}
+	return append(tools, openai.Tool{Type: "web_search"})
+}

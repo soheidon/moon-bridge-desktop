@@ -91,7 +91,7 @@ func TestResolvePerProviderWebSearchEnabledByConfig(t *testing.T) {
 	}
 }
 
-func TestResolvePerProviderWebSearchNonAnthropicDisabled(t *testing.T) {
+func TestResolvePerProviderWebSearchOpenAIResponseEnabled(t *testing.T) {
 	cfg := config.Config{
 		WebSearchSupport: config.WebSearchSupportEnabled,
 		ProviderDefs: map[string]config.ProviderDef{
@@ -109,8 +109,8 @@ func TestResolvePerProviderWebSearchNonAnthropicDisabled(t *testing.T) {
 	}
 
 	resolvePerProviderWebSearch(context.Background(), cfg, pm, &bytes.Buffer{})
-	if got := pm.ResolvedWebSearch("openai"); got != "disabled" {
-		t.Fatalf("ResolvedWebSearch(openai) = %q, want disabled for non-anthropic", got)
+	if got := pm.ResolvedWebSearch("openai"); got != "enabled" {
+		t.Fatalf("ResolvedWebSearch(openai) = %q, want enabled for openai-response protocol", got)
 	}
 }
 
