@@ -32,11 +32,12 @@ cp config.example.yml config.yml
 │   │   ├── config.go        # 运行时方法 + DTO
 │   │   └── config_loader.go # YAML 加载和校验
 │   ├── bridge/              # 协议转换核心
-│   ├── extensions/          # Provider 扩展（如 DeepSeek V4）
+│   ├── extensions/          # Provider 扩展（如 DeepSeek V4, Codex 兼容层）
 │   ├── cache/               # Prompt cache 规划
 │   ├── anthropic/           # Anthropic Messages 客户端
 │   ├── openai/              # OpenAI Responses DTO
 │   ├── provider/            # 多 Provider 路由和连接池
+│   ├── extensions/codex/    # Codex catalog/config + toolcall codec
 │   ├── server/              # HTTP 服务器
 │   ├── session/             # 每请求状态隔离
 │   ├── stats/               # session usage / billing 统计
@@ -162,3 +163,39 @@ scripts/replay_anthropic_cache.py trace/Transform/20260426T110909Z-79bfa6d6 --st
 - Go 1.22+（项目使用 `range-over-int` 等新特性）
 - `gopkg.in/yaml.v3` — YAML 配置解析
 - 无其他外部依赖
+
+
+## Codex 兼容验证
+
+完成模块化重构后，可通过以下清单验证 Codex 兼容性：
+
+### 自动化测试
+
+```bash
+go test ./internal/extensions/codex ./internal/bridge ./internal/server ./cmd/moonbridge
+go test ./...
+git diff --check
+go build -o /tmp/moonbridge-verify ./cmd/moonbridge
+```
+
+### 静态 Catalog 验证
+
+```bash
+./moonbridge --print-codex-config gpt-5.4 --codex-base-url http://127.0.0.1:38440/v1 --codex-home /tmp/moonbridge-codex-verify
+```
+
+确认生成的 `models_catalog.json` 中：
+- `.models | length > 0`
+- 所有模型 `visibility == "list"`、`supported_in_api == true`、`apply_patch_tool_type == "freeform"`
+
+### 关键行为清单
+
+| 场景 | 验证方式 |
+|------|----------|
+| MCP 工具保留 namespace | 请求/响应中 `mcp__*` 工具名保持 namespace 回拆 |
+| apply_patch | Codex 入站 custom grammar → Anthropic split tools → 回拼 raw patch |
+| Code Mode exec | exec custom grammar → `{"source": "..."}` proxy → 回拼 |
+| local_shell_call | 走 local shell item，不降级为 function call |
+| streaming custom tool | 使用 `response.custom_tool_call_input.delta` |
+| 插件注入工具 | 出现在 Anthropic request tools 中 |
+| web search | 行为与 provider 配置一致 |

@@ -590,3 +590,162 @@ func TestToAnthropicDefaultsToolChoiceToAuto(t *testing.T) {
 		t.Fatalf("tool choice = %+v", converted.ToolChoice)
 	}
 }
+
+
+// bridgePluginRecorder records which plugin hooks were called and their order.
+type bridgePluginRecorder struct {
+	plugin.BasePlugin
+	called                    []string
+	sawApplyPatchBatchInMutate bool
+}
+
+func (p *bridgePluginRecorder) Name() string                      { return "bridge_recorder" }
+func (p *bridgePluginRecorder) EnabledForModel(model string) bool { return model == "gpt-test" }
+
+func (p *bridgePluginRecorder) RewriteMessages(ctx *plugin.RequestContext, msgs []anthropic.Message) []anthropic.Message {
+	p.called = append(p.called, "RewriteMessages")
+	return msgs
+}
+
+func (p *bridgePluginRecorder) InjectTools(ctx *plugin.RequestContext) []anthropic.Tool {
+	p.called = append(p.called, "InjectTools")
+	return []anthropic.Tool{{Name: "plugin_tool", Description: "Injected by plugin", InputSchema: map[string]any{"type": "object"}}}
+}
+
+func (p *bridgePluginRecorder) MutateRequest(ctx *plugin.RequestContext, req *anthropic.MessageRequest) {
+	p.called = append(p.called, "MutateRequest")
+	for _, tool := range req.Tools {
+		if tool.Name == "apply_patch_batch" {
+			p.sawApplyPatchBatchInMutate = true
+		}
+	}
+	if req.Metadata == nil {
+		req.Metadata = map[string]any{}
+	}
+	req.Metadata["mutated_by_plugin"] = "yes"
+}
+
+func TestToAnthropicPluginHooksCalledWithCodexCustomTool(t *testing.T) {
+	cfg := config.Config{
+		DefaultMaxTokens: 1024,
+		Routes:           map[string]config.RouteEntry{"gpt-test": {Provider: "default", Model: "claude-test"}},
+		Cache:            config.CacheConfig{Mode: "off"},
+	}
+	plugins := plugin.NewRegistry(nil)
+	recorder := &bridgePluginRecorder{}
+	plugins.Register(recorder)
+	bridgeUnderTest := bridge.New(cfg, cache.NewMemoryRegistry(), plugins)
+
+	// Send a request with apply_patch custom grammar, verifying MutateRequest
+	// sees the proxy Anthropic tools.
+	converted, _, err := bridgeUnderTest.ToAnthropic(openai.ResponsesRequest{
+		Model: "gpt-test",
+		Input: json.RawMessage(`"hello"`),
+		Tools: []openai.Tool{
+			{
+				Type: "custom",
+				Name: "apply_patch",
+				Format: map[string]any{
+					"definition": `begin_patch: "*** Begin Patch" end_patch: "*** End Patch" add_hunk: "*** Add File: "`,
+				},
+			},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("ToAnthropic() error = %v", err)
+	}
+
+	// Verify plugin hooks were called in order
+	expectedOrder := []string{"RewriteMessages", "InjectTools", "MutateRequest"}
+	if len(recorder.called) != 3 {
+		t.Fatalf("plugin hooks called = %v, want %v", recorder.called, expectedOrder)
+	}
+	for i, name := range expectedOrder {
+		if recorder.called[i] != name {
+			t.Fatalf("hook %d = %s, want %s", i, recorder.called[i], name)
+		}
+	}
+
+	// Verify MutateRequest saw the proxy tools (apply_patch_batch etc.)
+	if converted.Metadata == nil || converted.Metadata["mutated_by_plugin"] != "yes" {
+		t.Fatalf("MutateRequest was not called or did not modify metadata: %+v", converted.Metadata)
+	}
+
+	// Verify apply_patch was split into proxy tools
+	if !recorder.sawApplyPatchBatchInMutate {
+		t.Fatalf("MutateRequest did not see apply_patch_batch in req.Tools")
+	}
+
+	// Verify plugin tool is present
+	hasPluginTool := false
+	for _, tool := range converted.Tools {
+		if tool.Name == "plugin_tool" {
+			hasPluginTool = true
+			break
+		}
+	}
+	if !hasPluginTool {
+		t.Fatalf("plugin_tool not found in converted tools: %+v", converted.Tools)
+	}
+}
+
+func TestToAnthropicNamespaceToolsWithPluginInjectedTools(t *testing.T) {
+	cfg := config.Config{
+		DefaultMaxTokens: 1024,
+		Routes:           map[string]config.RouteEntry{"gpt-test": {Provider: "default", Model: "claude-test"}},
+		Cache:            config.CacheConfig{Mode: "off"},
+	}
+	plugins := plugin.NewRegistry(nil)
+	injector := &bridgeToolInjector{}
+	plugins.Register(injector)
+	bridgeUnderTest := bridge.New(cfg, cache.NewMemoryRegistry(), plugins)
+
+	// Send request with namespace tool + plugin tool
+	converted, _, err := bridgeUnderTest.ToAnthropic(openai.ResponsesRequest{
+		Model: "gpt-test",
+		Input: json.RawMessage(`"hello"`),
+		Tools: []openai.Tool{
+			{
+				Type:        "namespace",
+				Name:        "mcp__deepwiki__",
+				Description: "DeepWiki tools",
+				Tools: []openai.Tool{
+					{
+						Type:        "function",
+						Name:        "ask_question",
+						Description: "Ask a repository question",
+						Parameters: map[string]any{
+							"type":     "object",
+							"required": []string{"repoName", "question"},
+							"properties": map[string]any{
+								"repoName": map[string]any{"type": "string"},
+								"question": map[string]any{"type": "string"},
+							},
+						},
+					},
+				},
+			},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("ToAnthropic() error = %v", err)
+	}
+
+	// Verify namespace was flattened and plugin tool is present
+	hasNamespaceTool := false
+	hasPluginTool := false
+	for _, tool := range converted.Tools {
+		if tool.Name == "mcp__deepwiki__ask_question" {
+			hasNamespaceTool = true
+		}
+		if tool.Name == "plugin_tool" {
+			hasPluginTool = true
+		}
+	}
+	if !hasNamespaceTool {
+		t.Fatalf("flattened namespace tool not found: %+v", converted.Tools)
+	}
+	if !hasPluginTool {
+		t.Fatalf("plugin_tool not found: %+v", converted.Tools)
+	}
+}

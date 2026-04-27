@@ -8,15 +8,15 @@ import (
 	"moonbridge/internal/bridge"
 	"moonbridge/internal/cache"
 	"moonbridge/internal/config"
-	"moonbridge/internal/plugin"
 	deepseekv4 "moonbridge/internal/extensions/deepseek_v4"
 	"moonbridge/internal/openai"
+	"moonbridge/internal/plugin"
 )
 
 func testBridge() *bridge.Bridge {
 	return testBridgeWithConfig(config.Config{
 		DefaultMaxTokens: 1024,
-		Routes: map[string]config.RouteEntry{"gpt-test": {Provider: "default", Model: "claude-test"}},
+		Routes:           map[string]config.RouteEntry{"gpt-test": {Provider: "default", Model: "claude-test"}},
 		Cache: config.CacheConfig{
 			Mode:                     "explicit",
 			TTL:                      "1h",
@@ -38,7 +38,7 @@ func testBridgeWithConfig(cfg config.Config) *bridge.Bridge {
 func testBridgeWithWebSearchDisabled() *bridge.Bridge {
 	cfg := config.Config{
 		DefaultMaxTokens: 1024,
-		Routes: map[string]config.RouteEntry{"gpt-test": {Provider: "default", Model: "claude-test"}},
+		Routes:           map[string]config.RouteEntry{"gpt-test": {Provider: "default", Model: "claude-test"}},
 		WebSearchSupport: config.WebSearchSupportDisabled,
 		Cache: config.CacheConfig{
 			Mode:                     "explicit",
@@ -108,7 +108,7 @@ func TestToAnthropicConvertsTextToolsToolChoiceAndCache(t *testing.T) {
 func TestToAnthropicAutomaticCacheAddsExplicitBreakpoints(t *testing.T) {
 	bridgeUnderTest := bridge.New(config.Config{
 		DefaultMaxTokens: 1024,
-		Routes: map[string]config.RouteEntry{"gpt-test": {Provider: "default", Model: "claude-test"}},
+		Routes:           map[string]config.RouteEntry{"gpt-test": {Provider: "default", Model: "claude-test"}},
 		Cache: config.CacheConfig{
 			Mode:                     "automatic",
 			TTL:                      "5m",
@@ -147,7 +147,7 @@ func TestToAnthropicAutomaticCacheAddsExplicitBreakpoints(t *testing.T) {
 func TestToAnthropicCanDisableTopLevelAutomaticCache(t *testing.T) {
 	bridgeUnderTest := bridge.New(config.Config{
 		DefaultMaxTokens: 1024,
-		Routes: map[string]config.RouteEntry{"gpt-test": {Provider: "default", Model: "claude-test"}},
+		Routes:           map[string]config.RouteEntry{"gpt-test": {Provider: "default", Model: "claude-test"}},
 		Cache: config.CacheConfig{
 			Mode:                     "automatic",
 			TTL:                      "5m",

@@ -233,9 +233,9 @@ func TestFromAnthropicBuildsApplyPatchGrammarFromProxyOperations(t *testing.T) {
 		Role:       "assistant",
 		StopReason: "tool_use",
 		Content: []anthropic.ContentBlock{{
-			Type: "tool_use",
-			ID:   "tool_patch",
-			Name: "apply_patch",
+			Type:  "tool_use",
+			ID:    "tool_patch",
+			Name:  "apply_patch",
 			Input: mustMarshalRaw(t, map[string]any{"operations": []map[string]any{{"type": "add_file", "path": "docs/api.md", "content": "# API\ncontent\n"}}}),
 		}},
 	}
@@ -299,9 +299,9 @@ func TestFromAnthropicBuildsApplyPatchReplacementFromUpdateContent(t *testing.T)
 		Role:       "assistant",
 		StopReason: "tool_use",
 		Content: []anthropic.ContentBlock{{
-			Type: "tool_use",
-			ID:   "tool_patch",
-			Name: "apply_patch",
+			Type:  "tool_use",
+			ID:    "tool_patch",
+			Name:  "apply_patch",
 			Input: mustMarshalRaw(t, map[string]any{"operations": []map[string]any{{"type": "update_file", "path": "internal/app/app.go", "content": "package app\n\nconst Name = \"Moon Bridge\"\n"}}}),
 		}},
 	}

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +15,7 @@ import (
 	"moonbridge/internal/bridge"
 	"moonbridge/internal/cache"
 	"moonbridge/internal/config"
+	"moonbridge/internal/extensions/codex"
 	"moonbridge/internal/extensions/websearchinjected"
 	"moonbridge/internal/logger"
 	"moonbridge/internal/openai"
@@ -91,64 +91,6 @@ func (server *Server) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 	server.mux.ServeHTTP(writer, request)
 }
 
-// ModelInfo represents a model entry in the OpenAI /v1/models response.
-type ModelInfo struct {
-	Slug                        string                    `json:"slug"`
-	DisplayName                 string                    `json:"display_name"`
-	Description                 string                    `json:"description,omitempty"`
-	DefaultReasoningLevel       string                    `json:"default_reasoning_level,omitempty"`
-	SupportedReasoningLevels    []ReasoningLevelPresetDTO `json:"supported_reasoning_levels"`
-	ShellType                   string                    `json:"shell_type"`
-	Visibility                  string                    `json:"visibility"`
-	SupportedInAPI              bool                      `json:"supported_in_api"`
-	Priority                    int                       `json:"priority"`
-	AdditionalSpeedTiers        []string                  `json:"additional_speed_tiers"`
-	AvailabilityNux             *ModelAvailabilityNux     `json:"availability_nux"`
-	Upgrade                     *ModelInfoUpgrade         `json:"upgrade"`
-	BaseInstructions            string                    `json:"base_instructions"`
-	SupportsReasoningSummaries  bool                      `json:"supports_reasoning_summaries"`
-	DefaultReasoningSummary     string                    `json:"default_reasoning_summary"`
-	SupportVerbosity            bool                      `json:"support_verbosity"`
-	DefaultVerbosity            *string                   `json:"default_verbosity"`
-	ApplyPatchToolType          *string                   `json:"apply_patch_tool_type"`
-	WebSearchToolType           string                    `json:"web_search_tool_type"`
-	TruncationPolicy            TruncationPolicyConfig    `json:"truncation_policy"`
-	SupportsParallelToolCalls   bool                      `json:"supports_parallel_tool_calls"`
-	SupportsImageDetailOriginal bool                      `json:"supports_image_detail_original"`
-	ContextWindow               *int                      `json:"context_window,omitempty"`
-	MaxContextWindow            *int                      `json:"max_context_window,omitempty"`
-	AutoCompactTokenLimit       *int                      `json:"auto_compact_token_limit,omitempty"`
-	EffectiveContextWindowPct   int                       `json:"effective_context_window_percent"`
-	ExperimentalSupportedTools  []string                  `json:"experimental_supported_tools"`
-	InputModalities             []string                  `json:"input_modalities"`
-	SupportsSearchTool          bool                      `json:"supports_search_tool"`
-}
-
-// ModelAvailabilityNux is a placeholder for Codex model availability nux.
-type ModelAvailabilityNux struct{}
-
-// ModelInfoUpgrade is a placeholder for Codex model upgrade info.
-type ModelInfoUpgrade struct{}
-
-// TruncationPolicyConfig matches Codex's truncation_policy field.
-type TruncationPolicyConfig struct {
-	Mode  string `json:"mode"`
-	Limit int64  `json:"limit"`
-}
-
-const (
-	defaultApplyPatchToolType = "freeform"
-	// DefaultCatalogTruncationLimit keeps shell tool output from being clamped
-	// to zero while using a consistent token policy across generated models.
-	DefaultCatalogTruncationLimit int64 = 10000
-)
-
-// ReasoningLevelPresetDTO is the JSON shape Codex expects for reasoning presets.
-type ReasoningLevelPresetDTO struct {
-	Effort      string `json:"effort"`
-	Description string `json:"description"`
-}
-
 func (server *Server) handleModels(writer http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodGet {
 		writeOpenAIError(writer, http.StatusMethodNotAllowed, openai.ErrorResponse{Error: openai.ErrorObject{
@@ -160,7 +102,7 @@ func (server *Server) handleModels(writer http.ResponseWriter, request *http.Req
 	}
 	models := server.listModels()
 	resp := struct {
-		Models []ModelInfo `json:"models"`
+		Models []codex.ModelInfo `json:"models"`
 	}{
 		Models: models,
 	}
@@ -168,8 +110,8 @@ func (server *Server) handleModels(writer http.ResponseWriter, request *http.Req
 	json.NewEncoder(writer).Encode(resp)
 }
 
-func (server *Server) listModels() []ModelInfo {
-	return BuildModelInfosFromConfig(server.appConfig)
+func (server *Server) listModels() []codex.ModelInfo {
+	return codex.BuildModelInfosFromConfig(server.appConfig)
 }
 
 func (server *Server) handleResponses(writer http.ResponseWriter, request *http.Request) {
@@ -295,7 +237,7 @@ func (server *Server) handleResponses(writer http.ResponseWriter, request *http.
 	writeJSON(writer, http.StatusOK, openAIResponse)
 }
 
-func (server *Server) handleStream(writer http.ResponseWriter, request *http.Request, responsesRequest openai.ResponsesRequest, anthropicRequest anthropic.MessageRequest, plan cache.CacheCreationPlan, record mbtrace.Record, context bridge.ConversionContext, sess *session.Session, provider Provider) {
+func (server *Server) handleStream(writer http.ResponseWriter, request *http.Request, responsesRequest openai.ResponsesRequest, anthropicRequest anthropic.MessageRequest, plan cache.CacheCreationPlan, record mbtrace.Record, context codex.ConversionContext, sess *session.Session, provider Provider) {
 	log := logger.L().With("model", responsesRequest.Model)
 	log.Debug("开始流式传输")
 	stream, err := provider.StreamMessage(request.Context(), anthropicRequest)
@@ -784,137 +726,3 @@ func (server *Server) resolveRequestOptions(modelAlias string, providerKey strin
 	}
 }
 
-// BuildModelInfoFromRoute creates a Codex-compatible ModelInfo from a route entry.
-func BuildModelInfoFromRoute(alias string, ownedBy string, route config.RouteEntry) ModelInfo {
-	displayName := route.DisplayName
-	if displayName == "" {
-		displayName = alias
-	}
-	displayName = displayName + "(" + ownedBy + ")"
-	return newModelInfo(alias, displayName, route.Description, route.ContextWindow,
-		route.DefaultReasoningLevel, route.SupportedReasoningLevels,
-		route.SupportsReasoningSummaries, route.DefaultReasoningSummary)
-}
-
-// BuildModelInfoFromProviderModel creates a Codex-compatible ModelInfo from a
-// provider model catalog entry.
-func BuildModelInfoFromProviderModel(slug string, ownedBy string, meta config.ModelMeta) ModelInfo {
-	displayName := meta.DisplayName
-	if displayName == "" {
-		// Extract model name from "model(provider)" slug format.
-		if idx := strings.Index(slug, "("); idx > 0 {
-			displayName = slug[:idx]
-		} else {
-			displayName = slug
-		}
-	}
-	displayName = displayName + "(" + ownedBy + ")"
-	return newModelInfo(slug, displayName, meta.Description, meta.ContextWindow,
-		meta.DefaultReasoningLevel, meta.SupportedReasoningLevels,
-		meta.SupportsReasoningSummaries, meta.DefaultReasoningSummary)
-}
-
-// BuildModelInfosFromConfig returns Codex model catalog entries. Provider model
-// catalogs are the primary source; routes are appended as fallback aliases.
-func BuildModelInfosFromConfig(cfg config.Config) []ModelInfo {
-	seen := make(map[string]bool)
-	var models []ModelInfo
-
-	providerKeys := make([]string, 0, len(cfg.ProviderDefs))
-	for key := range cfg.ProviderDefs {
-		providerKeys = append(providerKeys, key)
-	}
-	sort.Strings(providerKeys)
-	for _, providerKey := range providerKeys {
-		def := cfg.ProviderDefs[providerKey]
-		modelNames := make([]string, 0, len(def.Models))
-		for name := range def.Models {
-			modelNames = append(modelNames, name)
-		}
-		sort.Strings(modelNames)
-		for _, name := range modelNames {
-			slug := name + "(" + providerKey + ")"
-			if seen[slug] {
-				continue
-			}
-			seen[slug] = true
-			models = append(models, BuildModelInfoFromProviderModel(slug, providerKey, def.Models[name]))
-		}
-	}
-
-	routeAliases := make([]string, 0, len(cfg.Routes))
-	for alias := range cfg.Routes {
-		routeAliases = append(routeAliases, alias)
-	}
-	sort.Strings(routeAliases)
-	for _, alias := range routeAliases {
-		if seen[alias] {
-			continue
-		}
-		seen[alias] = true
-		route := cfg.Routes[alias]
-		ownedBy := "system"
-		if route.Provider != "" {
-			ownedBy = route.Provider
-		}
-		models = append(models, BuildModelInfoFromRoute(alias, ownedBy, route))
-	}
-
-	return models
-}
-
-// newModelInfo builds a ModelInfo with all fields Codex requires.
-func newModelInfo(
-	slug, displayName, description string,
-	contextWindow int,
-	defaultReasoningLevel string,
-	supportedLevels []config.ReasoningLevelPreset,
-	supportsReasoningSummaries bool,
-	defaultReasoningSummary string,
-) ModelInfo {
-	var levels []ReasoningLevelPresetDTO
-	for _, p := range supportedLevels {
-		levels = append(levels, ReasoningLevelPresetDTO{Effort: p.Effort, Description: p.Description})
-	}
-	if levels == nil {
-		levels = []ReasoningLevelPresetDTO{}
-	}
-	var ctxWin, maxCtxWin *int
-	if contextWindow > 0 {
-		v := contextWindow
-		ctxWin = &v
-		maxCtxWin = &v
-	}
-	if defaultReasoningSummary == "" {
-		defaultReasoningSummary = "none"
-	}
-	applyPatchToolType := defaultApplyPatchToolType
-	return ModelInfo{
-		Slug:                       slug,
-		DisplayName:                displayName,
-		Description:                description,
-		DefaultReasoningLevel:      defaultReasoningLevel,
-		SupportedReasoningLevels:   levels,
-		ShellType:                  "unified_exec",
-		Visibility:                 "list",
-		SupportedInAPI:             true,
-		Priority:                   0,
-		AdditionalSpeedTiers:       []string{},
-		BaseInstructions:           "",
-		SupportsReasoningSummaries: supportsReasoningSummaries,
-		DefaultReasoningSummary:    defaultReasoningSummary,
-		WebSearchToolType:          "text",
-		ApplyPatchToolType:         &applyPatchToolType,
-		TruncationPolicy:           truncationPolicyForModel(slug),
-		SupportsParallelToolCalls:  true,
-		ContextWindow:              ctxWin,
-		MaxContextWindow:           maxCtxWin,
-		EffectiveContextWindowPct:  95,
-		ExperimentalSupportedTools: []string{},
-		InputModalities:            []string{"text"},
-	}
-}
-
-func truncationPolicyForModel(string) TruncationPolicyConfig {
-	return TruncationPolicyConfig{Mode: "tokens", Limit: DefaultCatalogTruncationLimit}
-}

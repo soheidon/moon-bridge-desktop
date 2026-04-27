@@ -9,13 +9,14 @@ import (
 
 	"moonbridge/internal/anthropic"
 	"moonbridge/internal/cache"
+	"moonbridge/internal/extensions/codex"
 	"moonbridge/internal/extensions/websearchinjected"
 	"moonbridge/internal/logger"
 	"moonbridge/internal/openai"
 	"moonbridge/internal/session"
 )
 
-func (bridge *Bridge) convertInput(raw json.RawMessage, context ConversionContext, sess *session.Session, modelAlias string) ([]anthropic.Message, []anthropic.ContentBlock, error) {
+func (bridge *Bridge) convertInput(raw json.RawMessage, context codex.ConversionContext, sess *session.Session, modelAlias string) ([]anthropic.Message, []anthropic.ContentBlock, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, nil, nil
 	}
@@ -91,7 +92,7 @@ func (bridge *Bridge) convertInput(raw json.RawMessage, context ConversionContex
 				Type:  "tool_use",
 				ID:    firstNonEmpty(item.CallID, item.ID),
 				Name:  "local_shell",
-				Input: localShellInputFromAction(item.Action),
+				Input: codex.LocalShellInputFromAction(item.Action),
 			})
 		case strings.HasSuffix(item.Type, "_output") || item.Type == "function_call_output":
 			seenToolHistory = true
@@ -137,26 +138,26 @@ func (bridge *Bridge) convertTools(tools []openai.Tool, opt RequestOptions) ([]a
 	for index, tool := range tools {
 		switch tool.Type {
 		case "function":
-			converted = append(converted, anthropicToolFromOpenAIFunction(tool.Name, tool.Description, tool.Parameters))
+			converted = append(converted, codex.AnthropicToolFromOpenAIFunction(tool.Name, tool.Description, tool.Parameters))
 		case "local_shell":
 			converted = append(converted, anthropic.Tool{
 				Name:        "local_shell",
 				Description: "Run a local shell command. Use only when you need command output from the user's workspace.",
-				InputSchema: localShellSchema(),
+				InputSchema: codex.LocalShellSchema(),
 			})
 		case "custom":
-			converted = append(converted, anthropicCustomToolsFromOpenAI(tool.Name, tool)...)
+			converted = append(converted, codex.AnthropicCustomToolsFromOpenAI(tool.Name, tool)...)
 		case "namespace":
 			for _, child := range tool.Tools {
 				switch child.Type {
 				case "function":
-					converted = append(converted, anthropicToolFromOpenAIFunction(
-						namespacedToolName(tool.Name, child.Name),
+					converted = append(converted, codex.AnthropicToolFromOpenAIFunction(
+						codex.NamespacedToolName(tool.Name, child.Name),
 						child.Description,
 						child.Parameters,
 					))
 				case "custom":
-					converted = append(converted, anthropicCustomToolsFromOpenAI(namespacedToolName(tool.Name, child.Name), child)...)
+					converted = append(converted, codex.AnthropicCustomToolsFromOpenAI(codex.NamespacedToolName(tool.Name, child.Name), child)...)
 				}
 			}
 		case "web_search", "web_search_preview":
@@ -214,14 +215,14 @@ func (bridge *Bridge) webSearchMaxUses() int {
 	return 8
 }
 
-func (bridge *Bridge) ConversionContext(request openai.ResponsesRequest) ConversionContext {
-	return ConversionContext{
-		CustomTools:   customToolSpecs(request.Tools, ""),
-		FunctionTools: functionToolSpecs(request.Tools, ""),
+func (bridge *Bridge) ConversionContext(request openai.ResponsesRequest) codex.ConversionContext {
+	return codex.ConversionContext{
+		CustomTools:   codex.CustomToolSpecs(request.Tools, ""),
+		FunctionTools: codex.FunctionToolSpecs(request.Tools, ""),
 	}
 }
 
-func (bridge *Bridge) convertToolChoice(raw json.RawMessage, context ConversionContext) (anthropic.ToolChoice, error) {
+func (bridge *Bridge) convertToolChoice(raw json.RawMessage, context codex.ConversionContext) (anthropic.ToolChoice, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return anthropic.ToolChoice{Type: "auto"}, nil
 	}

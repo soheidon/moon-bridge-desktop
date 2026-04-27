@@ -120,6 +120,33 @@ Transform 模式下，`resolvePerProviderWebSearch()` 分两步解析 web search
 - `ResolvedWebSearchForModel()` 优先查找 `model:<alias>` key，未找到时回退到 provider key。
 - 新增 `FirstUpstreamModelForKey()` 返回某个 provider key 下第一个路由到该 provider 的上游模型名，用于 auto 模式探测。
 
+### internal/extensions/codex
+
+Codex 客户端兼容逻辑集中层，将原先散落在 `internal/bridge`、`internal/server` 和 `cmd/moonbridge` 的 Codex 专属代码抽取到独立包中。
+
+目录结构：
+
+```text
+internal/extensions/codex/
+├── catalog.go          # ModelInfo / BuildModelInfoFromRoute / BuildModelInfosFromConfig / GenerateConfigToml / WriteModelsCatalog
+├── tool_context.go     # ConversionContext / CustomToolSpec / FunctionToolSpec / CustomToolKind
+├── customtool.go       # apply_patch / exec grammar 代理与 raw input 重建
+├── tools.go            # LocalShellSchema / NamespacedToolName / ToolCodec / OutputItem helpers
+└── catalog_test.go     # 单元测试
+```
+
+依赖方向：
+
+- `extensions/codex` 依赖 `internal/openai`、`internal/anthropic`、`internal/config` 等底层包。
+- `extensions/codex` **不依赖** `internal/bridge` 或 `internal/server`，杜绝循环依赖。
+- `bridge` 和 `server` 反向调用 `extensions/codex` 提供的纯函数或 codec。
+
+职责划分：
+
+- **Catalog/config**: `BuildModelInfosFromConfig`、`GenerateConfigToml`、`WriteModelsCatalog` —— 生成 Codex 可读的 `/v1/models` 响应和 `config.toml`。
+- **Toolcall codec**: `ConversionContext` + 各类 helper 负责 Codex `custom_tool_call`、`local_shell_call`、`function_call`（含 namespace）到 Anthropic `tool_use`/`tool_result` 的编解码。不涉及 SSE 事件组装，不管理 stream 状态机。
+- **Custom grammar proxy**: `apply_patch` 和 `exec` 自定义 grammar 在 Anthropic 侧拆分为结构化 JSON Schema 代理工具集，响应再回拼为 Codex 原始 grammar 格式。
+
 ### internal/server
 
 HTTP 服务器层。提供 `/v1/responses` 和 `/responses` 两个 POST 端点，以及 `/v1/models` 和 `/models` 两个 GET 端点。

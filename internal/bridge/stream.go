@@ -5,19 +5,20 @@ import (
 	"fmt"
 
 	"moonbridge/internal/anthropic"
+	"moonbridge/internal/extensions/codex"
 	"moonbridge/internal/openai"
 	"moonbridge/internal/session"
 )
 
 func (bridge *Bridge) ConvertStreamEvents(events []anthropic.StreamEvent, model string) []openai.StreamEvent {
-	return bridge.ConvertStreamEventsWithContext(events, model, ConversionContext{}, nil)
+	return bridge.ConvertStreamEventsWithContext(events, model, codex.ConversionContext{}, nil)
 }
 
 type StreamOptions struct {
 	PersistFinalTextReasoning bool
 }
 
-func (bridge *Bridge) ConvertStreamEventsWithContext(events []anthropic.StreamEvent, model string, context ConversionContext, sess *session.Session, opts ...StreamOptions) []openai.StreamEvent {
+func (bridge *Bridge) ConvertStreamEventsWithContext(events []anthropic.StreamEvent, model string, context codex.ConversionContext, sess *session.Session, opts ...StreamOptions) []openai.StreamEvent {
 	var opt StreamOptions
 	if len(opts) > 0 {
 		opt = opts[0]
@@ -54,7 +55,7 @@ func (bridge *Bridge) ConvertStreamEventsWithContext(events []anthropic.StreamEv
 type streamConverter struct {
 	bridge                  *Bridge
 	model                   string
-	context                 ConversionContext
+	context                 codex.ConversionContext
 	sequence                int64
 	response                openai.Response
 	contentText             map[int]string

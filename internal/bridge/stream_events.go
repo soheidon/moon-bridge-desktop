@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"moonbridge/internal/anthropic"
+	"moonbridge/internal/extensions/codex"
 	"moonbridge/internal/openai"
 )
 
@@ -27,49 +28,15 @@ func (converter *streamConverter) contentBlockStart(event anthropic.StreamEvent)
 	case "tool_use":
 		converter.hasToolCalls = true
 		events := converter.emitPendingReasoningItem()
-		if block.Name == "local_shell" {
-			item := openai.OutputItem{
-				Type:   "local_shell_call",
-				ID:     "lc_" + block.ID,
-				CallID: block.ID,
-				Status: "in_progress",
-				Action: localShellActionFromRaw(block.Input),
-			}
-			converter.itemIDs[index] = item.ID
-			converter.bridge.plugins.OnStreamToolCall(converter.model, block.ID, converter.extStreamStates)
-			converter.addOutput(index, item)
-			return append(events, converter.outputItem("response.output_item.added", index, item))
-		}
-		if converter.context.IsCustomTool(block.Name) {
-			item := openai.OutputItem{
-				Type:   "custom_tool_call",
-				ID:     customToolItemID(block.ID),
-				CallID: block.ID,
-				Name:   converter.context.OpenAINameForCustomTool(block.Name),
-				Input:  "",
-				Status: "in_progress",
-			}
-			converter.itemIDs[index] = item.ID
+		item := codex.OutputItemForToolUseStart(*block, converter.context)
+		converter.itemIDs[index] = item.ID
+		if item.Type == "custom_tool_call" {
 			converter.customToolInputs[index] = ""
 			converter.customToolNames[index] = block.Name
 			if len(block.Input) > 0 && string(block.Input) != "{}" {
 				converter.customToolInitialInputs[index] = string(block.Input)
 			}
-			converter.bridge.plugins.OnStreamToolCall(converter.model, block.ID, converter.extStreamStates)
-			converter.addOutput(index, item)
-			return append(events, converter.outputItem("response.output_item.added", index, item))
 		}
-		name, namespace := converter.context.OpenAIFunctionToolName(block.Name)
-		item := openai.OutputItem{
-			Type:      "function_call",
-			ID:        "fc_" + block.ID,
-			CallID:    block.ID,
-			Name:      name,
-			Namespace: namespace,
-			Arguments: "",
-			Status:    "in_progress",
-		}
-		converter.itemIDs[index] = item.ID
 		converter.bridge.plugins.OnStreamToolCall(converter.model, block.ID, converter.extStreamStates)
 		converter.addOutput(index, item)
 		return append(events, converter.outputItem("response.output_item.added", index, item))
@@ -247,15 +214,10 @@ func (converter *streamConverter) contentBlockStop(event anthropic.StreamEvent) 
 		if toolName == "" {
 			toolName = item.Name
 		}
-		item.Type = "custom_tool_call"
-		item.ID = converter.itemIDs[index]
+		item, input := codex.CompleteCustomToolCall(item, converter.itemIDs[index], toolName, compactJSON(inputJSON), converter.context)
 		if item.CallID == "" {
 			item.CallID = strings.TrimPrefix(converter.itemIDs[index], "ctc_")
 		}
-		input := converter.context.CustomToolInputFromRaw(toolName, json.RawMessage(compactJSON(inputJSON)))
-		item.Name = converter.context.OpenAINameForCustomTool(toolName)
-		item.Input = input
-		item.Status = "completed"
 		converter.setOutput(index, item)
 		events := make([]openai.StreamEvent, 0, 2)
 		if input != "" {
@@ -276,24 +238,14 @@ func (converter *streamConverter) contentBlockStop(event anthropic.StreamEvent) 
 	}
 	if arguments, ok := converter.toolArguments[index]; ok {
 		if strings.HasPrefix(converter.itemIDs[index], "lc_") {
-			item := openai.OutputItem{
-				Type:   "local_shell_call",
-				ID:     converter.itemIDs[index],
-				CallID: strings.TrimPrefix(converter.itemIDs[index], "lc_"),
-				Action: localShellActionFromRaw(json.RawMessage(compactJSON(arguments))),
-				Status: "completed",
-			}
+			item := codex.CompleteLocalShellCall(converter.itemIDs[index], compactJSON(arguments))
 			converter.setOutput(index, item)
 			return []openai.StreamEvent{
 				converter.outputItem("response.output_item.done", index, item),
 			}
 		}
 		item := converter.outputAt(index)
-		item.Type = "function_call"
-		item.ID = converter.itemIDs[index]
-		item.CallID = strings.TrimPrefix(converter.itemIDs[index], "fc_")
-		item.Arguments = compactJSON(arguments)
-		item.Status = "completed"
+		item = codex.CompleteFunctionCall(item, converter.itemIDs[index], compactJSON(arguments))
 		converter.setOutput(index, item)
 		return []openai.StreamEvent{
 			{

@@ -8,6 +8,7 @@ import (
 	"moonbridge/internal/anthropic"
 	"moonbridge/internal/bridge"
 	"moonbridge/internal/config"
+	"moonbridge/internal/extensions/codex"
 	"moonbridge/internal/openai"
 )
 
@@ -608,7 +609,7 @@ func TestDeepSeekThinkingIsStatefullyInjectedOnlyForToolCalls(t *testing.T) {
 	}
 
 	sess := bridgeUnderTest.NewSession()
-	convertedEvents := bridgeUnderTest.ConvertStreamEventsWithContext(events, "gpt-test", bridge.ConversionContext{}, sess)
+	convertedEvents := bridgeUnderTest.ConvertStreamEventsWithContext(events, "gpt-test", codex.ConversionContext{}, sess)
 	completed := streamLifecycleResponse(t, convertedEvents, "response.completed")
 	// Reasoning item should be emitted alongside the tool call.
 	if len(completed.Output) != 2 {
@@ -698,7 +699,7 @@ func TestDeepSeekSignatureOnlyThinkingIsReinjectedForToolCalls(t *testing.T) {
 	}
 
 	sess := bridgeUnderTest.NewSession()
-	convertedEvents := bridgeUnderTest.ConvertStreamEventsWithContext(events, "gpt-test", bridge.ConversionContext{}, sess)
+	convertedEvents := bridgeUnderTest.ConvertStreamEventsWithContext(events, "gpt-test", codex.ConversionContext{}, sess)
 
 	completed := streamLifecycleResponse(t, convertedEvents, "response.completed")
 	if len(completed.Output) != 2 || completed.Output[0].Type != "reasoning" || completed.Output[1].Type != "function_call" {
@@ -763,12 +764,12 @@ func TestDeepSeekThinkingIsInjectedForToolChainFinalAssistantText(t *testing.T) 
 	}
 
 	sess := bridgeUnderTest.NewSession()
-	nonPersistedEvents := bridgeUnderTest.ConvertStreamEventsWithContext(events, "gpt-test", bridge.ConversionContext{}, sess)
+	nonPersistedEvents := bridgeUnderTest.ConvertStreamEventsWithContext(events, "gpt-test", codex.ConversionContext{}, sess)
 	nonPersistedCompleted := streamLifecycleResponse(t, nonPersistedEvents, "response.completed")
 	if len(nonPersistedCompleted.Output) != 1 || nonPersistedCompleted.Output[0].Type != "message" {
 		t.Fatalf("non-persisted completed output = %+v", nonPersistedCompleted.Output)
 	}
-	persistedEvents := bridgeUnderTest.ConvertStreamEventsWithContext(events, "gpt-test", bridge.ConversionContext{}, bridgeUnderTest.NewSession(), bridge.StreamOptions{
+	persistedEvents := bridgeUnderTest.ConvertStreamEventsWithContext(events, "gpt-test", codex.ConversionContext{}, bridgeUnderTest.NewSession(), bridge.StreamOptions{
 		PersistFinalTextReasoning: true,
 	})
 	persistedCompleted := streamLifecycleResponse(t, persistedEvents, "response.completed")

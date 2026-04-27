@@ -1,4 +1,4 @@
-package bridge
+package codex
 
 import (
 	"encoding/json"
@@ -8,14 +8,14 @@ import (
 	"moonbridge/internal/openai"
 )
 
-func customToolSpecs(tools []openai.Tool, namespace string) map[string]CustomToolSpec {
+func CustomToolSpecs(tools []openai.Tool, namespace string) map[string]CustomToolSpec {
 	specs := map[string]CustomToolSpec{}
 	for _, tool := range tools {
 		switch tool.Type {
 		case "custom":
 			definition := customToolGrammarDefinition(tool)
 			name := namespacedToolName(namespace, tool.Name)
-			kind := customToolKindFromGrammar(definition)
+			kind := CustomToolKindFromGrammar(definition)
 			specs[name] = CustomToolSpec{
 				GrammarDefinition: definition,
 				Kind:              kind,
@@ -32,7 +32,7 @@ func customToolSpecs(tools []openai.Tool, namespace string) map[string]CustomToo
 				}
 			}
 		case "namespace":
-			for name, spec := range customToolSpecs(tool.Tools, namespacedToolName(namespace, tool.Name)) {
+			for name, spec := range CustomToolSpecs(tool.Tools, namespacedToolName(namespace, tool.Name)) {
 				specs[name] = spec
 			}
 		}
@@ -40,7 +40,7 @@ func customToolSpecs(tools []openai.Tool, namespace string) map[string]CustomToo
 	return specs
 }
 
-func functionToolSpecs(tools []openai.Tool, namespace string) map[string]FunctionToolSpec {
+func FunctionToolSpecs(tools []openai.Tool, namespace string) map[string]FunctionToolSpec {
 	specs := map[string]FunctionToolSpec{}
 	for _, tool := range tools {
 		switch tool.Type {
@@ -54,7 +54,7 @@ func functionToolSpecs(tools []openai.Tool, namespace string) map[string]Functio
 				Name:      tool.Name,
 			}
 		case "namespace":
-			for name, spec := range functionToolSpecs(tool.Tools, namespacedToolName(namespace, tool.Name)) {
+			for name, spec := range FunctionToolSpecs(tool.Tools, namespacedToolName(namespace, tool.Name)) {
 				specs[name] = spec
 			}
 		}
@@ -62,7 +62,7 @@ func functionToolSpecs(tools []openai.Tool, namespace string) map[string]Functio
 	return specs
 }
 
-func anthropicToolFromOpenAIFunction(name string, description string, parameters map[string]any) anthropic.Tool {
+func AnthropicToolFromOpenAIFunction(name string, description string, parameters map[string]any) anthropic.Tool {
 	if parameters == nil {
 		parameters = map[string]any{"type": "object"}
 	}
@@ -73,9 +73,9 @@ func anthropicToolFromOpenAIFunction(name string, description string, parameters
 	}
 }
 
-func anthropicCustomToolsFromOpenAI(name string, tool openai.Tool) []anthropic.Tool {
+func AnthropicCustomToolsFromOpenAI(name string, tool openai.Tool) []anthropic.Tool {
 	definition := customToolGrammarDefinition(tool)
-	kind := customToolKindFromGrammar(definition)
+	kind := CustomToolKindFromGrammar(definition)
 	if kind == CustomToolKindApplyPatch {
 		return anthropicApplyPatchProxyTools(name)
 	}
@@ -118,7 +118,7 @@ func customToolDescription(tool openai.Tool) string {
 func customToolInputDescription(tool openai.Tool) string {
 	description := "Raw freeform input for this custom tool. Put only the tool input text here, not a JSON string or markdown wrapper."
 	if definition := customToolGrammarDefinition(tool); definition != "" {
-		if isApplyPatchGrammar(definition) {
+		if IsApplyPatchGrammar(definition) {
 			description = "Raw apply_patch patch text. It must start with '*** Begin Patch' and end with a bare '*** End Patch' line. Use Codex apply_patch headers such as '*** Add File:', '*** Delete File:' or '*** Update File:'. In Add File hunks, file content lines start with '+', but patch metadata lines like '*** End Patch' must not be prefixed with '+'. Do not use unified diff headers like 'diff --git', '---', '+++' and do not wrap the patch in markdown fences."
 		}
 		description += "\n\nGrammar:\n" + definition
@@ -134,24 +134,24 @@ func customToolGrammarDefinition(tool openai.Tool) string {
 	return strings.TrimSpace(definition)
 }
 
-func customToolKindFromGrammar(definition string) CustomToolKind {
+func CustomToolKindFromGrammar(definition string) CustomToolKind {
 	switch {
-	case isApplyPatchGrammar(definition):
+	case IsApplyPatchGrammar(definition):
 		return CustomToolKindApplyPatch
-	case isExecGrammar(definition):
+	case IsExecGrammar(definition):
 		return CustomToolKindExec
 	default:
 		return CustomToolKindRaw
 	}
 }
 
-func isApplyPatchGrammar(definition string) bool {
+func IsApplyPatchGrammar(definition string) bool {
 	return strings.Contains(definition, `begin_patch: "*** Begin Patch"`) &&
 		strings.Contains(definition, `end_patch: "*** End Patch"`) &&
 		strings.Contains(definition, `add_hunk: "*** Add File: "`)
 }
 
-func isExecGrammar(definition string) bool {
+func IsExecGrammar(definition string) bool {
 	return strings.Contains(definition, "@exec") ||
 		(strings.Contains(definition, "pragma_source") && strings.Contains(definition, "plain_source"))
 }
@@ -337,7 +337,7 @@ func execProxySchema() map[string]any {
 	}
 }
 
-func customToolItemID(toolUseID string) string {
+func CustomToolItemID(toolUseID string) string {
 	if toolUseID == "" {
 		return "ctc_generated"
 	}
@@ -750,17 +750,4 @@ func normalizeApplyPatchInput(input string) string {
 		return strings.Join(lines, "\n")
 	}
 	return input
-}
-
-func namespacedToolName(namespace string, name string) string {
-	if namespace == "" {
-		return name
-	}
-	if name == "" {
-		return namespace
-	}
-	if strings.HasSuffix(namespace, "_") || strings.HasPrefix(name, "_") {
-		return namespace + name
-	}
-	return namespace + "_" + name
 }

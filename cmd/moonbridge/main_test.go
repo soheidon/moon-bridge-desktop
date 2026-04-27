@@ -8,11 +8,12 @@ import (
 	"testing"
 
 	"moonbridge/internal/config"
+	"moonbridge/internal/extensions/codex"
 )
 
 func TestPrintCodexConfigTomlDoesNotSetServiceTier(t *testing.T) {
 	var output bytes.Buffer
-	err := writeCodexConfigToml(&output, "moonbridge", "http://127.0.0.1:38440/v1", "", config.Config{
+	err := codex.GenerateConfigToml(&output, "moonbridge", "http://127.0.0.1:38440/v1", "", config.Config{
 		Routes: map[string]config.RouteEntry{
 			"moonbridge": {
 				Provider:      "openai",
@@ -22,7 +23,7 @@ func TestPrintCodexConfigTomlDoesNotSetServiceTier(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("writeCodexConfigToml() error = %v", err)
+		t.Fatalf("codex.GenerateConfigToml() error = %v", err)
 	}
 	generated := output.String()
 

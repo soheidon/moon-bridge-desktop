@@ -2,20 +2,18 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 
 	"moonbridge/internal/app"
 	"moonbridge/internal/config"
+	"moonbridge/internal/extensions/codex"
 	"moonbridge/internal/logger"
-	"moonbridge/internal/server"
 )
 
 const (
@@ -101,7 +99,7 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 		return exitOK
 	}
 	if *printCodexConfig != "" {
-		if err := writeCodexConfigToml(stdout, *printCodexConfig, *codexBaseURL, *codexHome, cfg); err != nil {
+		if err := codex.GenerateConfigToml(stdout, *printCodexConfig, *codexBaseURL, *codexHome, cfg); err != nil {
 			writeStartupError(stderr, "生成 Codex 配置失败", resolvedConfigPath, err,
 				"确认 -codex-home 目录可写，或去掉 -codex-home 只打印 config.toml。")
 			return exitRuntimeErr
@@ -118,68 +116,6 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 		return exitRuntimeErr
 	}
 	return exitOK
-}
-
-func valueOrDefault(value string, fallback string) string {
-	if value == "" {
-		return fallback
-	}
-	return value
-}
-
-// writeModelsCatalog generates a Codex-compatible models_catalog.json from
-// provider model catalogs, with routes appended as fallback aliases.
-func writeModelsCatalog(path string, cfg config.Config) error {
-	catalog := struct {
-		Models []server.ModelInfo `json:"models"`
-	}{Models: server.BuildModelInfosFromConfig(cfg)}
-	data, err := json.MarshalIndent(catalog, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0644)
-}
-
-func writeCodexConfigToml(output io.Writer, modelAlias string, baseURL string, codexHome string, cfg config.Config) error {
-	route := cfg.RouteFor(modelAlias)
-
-	// Transform "provider/model" format to "model(provider)" for Codex display.
-	if provider, modelName := config.ParseModelRef(modelAlias); provider != "" {
-		modelAlias = modelName + "(" + provider + ")"
-	}
-	fmt.Fprintf(output, "model = %q\n", modelAlias)
-	fmt.Fprintln(output, `model_provider = "moonbridge"`)
-	if route.ContextWindow > 0 {
-		fmt.Fprintf(output, "model_context_window = %d\n", route.ContextWindow)
-	}
-	if route.MaxOutputTokens > 0 {
-		fmt.Fprintf(output, "model_max_output_tokens = %d\n", route.MaxOutputTokens)
-	}
-
-	// Write models catalog JSON so Codex uses our metadata instead of bundled presets.
-	if codexHome != "" {
-		catalogPath := filepath.Join(codexHome, "models_catalog.json")
-		if err := writeModelsCatalog(catalogPath, cfg); err != nil {
-			return fmt.Errorf("write models catalog: %w", err)
-		}
-		fmt.Fprintf(output, "model_catalog_json = %q\n", catalogPath)
-	}
-
-	fmt.Fprintln(output)
-	fmt.Fprintln(output, "[model_providers.moonbridge]")
-	fmt.Fprintln(output, `name = "Moon Bridge"`)
-	fmt.Fprintf(output, "base_url = %q\n", valueOrDefault(baseURL, "http://"+config.DefaultAddr+"/v1"))
-	fmt.Fprintln(output, `env_key = "MOONBRIDGE_CLIENT_API_KEY"`)
-	fmt.Fprintln(output, `wire_api = "responses"`)
-	fmt.Fprintln(output)
-	fmt.Fprintln(output, "[mcp_servers.deepwiki]")
-	fmt.Fprintln(output, `url = "https://mcp.deepwiki.com/mcp"`)
-	fmt.Fprintln(output, "startup_timeout_sec = 3600")
-	fmt.Fprintln(output, "tool_timeout_sec = 3600")
-	return nil
 }
 
 func writeStartupError(output io.Writer, title string, configPath string, err error, hints ...string) {

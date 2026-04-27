@@ -16,6 +16,7 @@ import (
 	"moonbridge/internal/bridge"
 	"moonbridge/internal/cache"
 	"moonbridge/internal/config"
+	"moonbridge/internal/extensions/codex"
 	deepseekv4 "moonbridge/internal/extensions/deepseek_v4"
 	"moonbridge/internal/logger"
 	"moonbridge/internal/plugin"
@@ -208,30 +209,30 @@ func TestResponsesHandlerAcceptsCodexResponsesPath(t *testing.T) {
 }
 
 func TestBuildModelInfoFromRouteEnablesApplyPatchFreeform(t *testing.T) {
-	info := server.BuildModelInfoFromRoute("gpt-test", "default", config.RouteEntry{
+	info := codex.BuildModelInfoFromRoute("gpt-test", "default", config.RouteEntry{
 		DisplayName: "GPT Test",
 	})
 
 	if info.ApplyPatchToolType == nil || *info.ApplyPatchToolType != "freeform" {
 		t.Fatalf("apply_patch_tool_type = %v", info.ApplyPatchToolType)
 	}
-	if info.TruncationPolicy.Mode != "tokens" || info.TruncationPolicy.Limit != server.DefaultCatalogTruncationLimit {
+	if info.TruncationPolicy.Mode != "tokens" || info.TruncationPolicy.Limit != codex.DefaultCatalogTruncationLimit {
 		t.Fatalf("truncation_policy = %+v", info.TruncationPolicy)
 	}
 }
 
 func TestBuildModelInfoFromRouteUsesTokenTruncationPolicyForGPT52(t *testing.T) {
-	info := server.BuildModelInfoFromRoute("gpt-5.2", "default", config.RouteEntry{
+	info := codex.BuildModelInfoFromRoute("gpt-5.2", "default", config.RouteEntry{
 		DisplayName: "GPT 5.2",
 	})
 
-	if info.TruncationPolicy.Mode != "tokens" || info.TruncationPolicy.Limit != server.DefaultCatalogTruncationLimit {
+	if info.TruncationPolicy.Mode != "tokens" || info.TruncationPolicy.Limit != codex.DefaultCatalogTruncationLimit {
 		t.Fatalf("truncation_policy = %+v", info.TruncationPolicy)
 	}
 }
 
 func TestBuildModelInfosFromConfigIncludesProviderModelsBeforeRouteFallback(t *testing.T) {
-	models := server.BuildModelInfosFromConfig(config.Config{
+	models := codex.BuildModelInfosFromConfig(config.Config{
 		ProviderDefs: map[string]config.ProviderDef{
 			"p1": {
 				Models: map[string]config.ModelMeta{
@@ -265,7 +266,7 @@ func TestBuildModelInfosFromConfigIncludesProviderModelsBeforeRouteFallback(t *t
 }
 
 func TestBuildModelInfoPreservesReasoningLevelsForDeepSeekV4(t *testing.T) {
-	info := server.BuildModelInfoFromProviderModel("deepseek-v4-pro(deepseek)", "deepseek", config.ModelMeta{
+	info := codex.BuildModelInfoFromProviderModel("deepseek-v4-pro(deepseek)", "deepseek", config.ModelMeta{
 		DeepSeekV4:            true,
 		DefaultReasoningLevel: "high",
 		SupportedReasoningLevels: []config.ReasoningLevelPreset{
