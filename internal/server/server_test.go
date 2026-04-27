@@ -508,8 +508,10 @@ func TestResponsesHandlerPassesOpenAIProtocolThroughWithUpstreamModel(t *testing
 	}
 	for _, want := range []string{
 		"模型: image ➡️ gpt-image-1.5",
-		"输出: 0.5000 M",
+		"输出: 500.00K",
 		"累计 3.0400 元",
+		"全局平均成本:",
+		"总token 2.70M",
 	} {
 		if !strings.Contains(logOutput.String(), want) {
 			t.Fatalf("log missing %q: %s", want, logOutput.String())
