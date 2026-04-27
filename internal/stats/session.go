@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 )
@@ -300,7 +301,15 @@ func WriteSummary(w io.Writer, s Summary) {
 	for model, ms := range s.ByModel {
 		displayName := model
 		if actual, ok := s.ActualModelNames[model]; ok && actual != model {
-			displayName = model + " → " + actual
+			// For direct "provider/model" or "model(provider)" references,
+			// show just the model name without the misleading arrow.
+			if idx := strings.LastIndex(model, "/"); idx > 0 {
+				displayName = model[idx+1:]
+			} else if idx := strings.LastIndex(model, "("); idx > 0 && strings.HasSuffix(model, ")") {
+				displayName = model[:idx]
+			} else {
+				displayName = model + " → " + actual
+			}
 		}
 		if ms.Cost > 0 {
 			fmt.Fprintf(&buf, "    %s: ¥%.6f (%d 次, %d 输入, %d 输出)\n",
