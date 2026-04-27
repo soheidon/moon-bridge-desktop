@@ -354,7 +354,7 @@ SSE 不变量：
 
 当 `trace_requests: true` 时，桥接器将请求/响应对转储到本地文件系统用于调试。追踪按模式和会话组织：
 
-- `Transform`：`trace/Transform/{session_id}/Response/{n}.json` + `Anthropic/{n}.json`
+- `Transform`：`trace/Transform/{session_id}/{model}/Response/{n}.json` + `{session_id}/{model}/Anthropic/{n}.json`
 - `Capture`：`trace/Capture/{Response|Anthropic}/{session_id}/{n}.json`
 
 API 密钥已脱敏。追踪路径在 `.gitignore` 中。

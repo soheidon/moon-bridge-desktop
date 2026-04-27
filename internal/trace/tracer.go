@@ -36,6 +36,7 @@ type Record struct {
 	SessionID             string      `json:"session_id,omitempty"`
 	RequestNumber         uint64      `json:"request_number"`
 	CapturedAt            string      `json:"captured_at"`
+	Model                 string      `json:"model,omitempty"`
 	HTTPRequest           HTTPRequest `json:"http_request"`
 	ProxyRequest          any         `json:"proxy_request,omitempty"`
 	UpstreamRequest       any         `json:"upstream_request,omitempty"`
@@ -131,6 +132,9 @@ func (tracer *Tracer) WriteNumbered(category string, requestNumber uint64, recor
 	data = append(data, '\n')
 
 	traceDir := tracer.Directory()
+	if !tracer.flat && record.Model != "" {
+		traceDir = filepath.Join(traceDir, SanitizePathSegment(record.Model))
+	}
 	if category != "" {
 		traceDir = filepath.Join(traceDir, category)
 	}
@@ -143,6 +147,28 @@ func (tracer *Tracer) WriteNumbered(category string, requestNumber uint64, recor
 	}
 	logger.Debug("跟踪已写入", "path", path, "category", category, "request_number", requestNumber)
 	return path, nil
+}
+
+// SanitizePathSegment replaces characters unsuitable for filesystem paths
+// with underscores, producing a safe single-directory segment.
+// Special cases: "." and ".." are replaced with "_", and empty results return "_".
+func SanitizePathSegment(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "_"
+	}
+	cleaned := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '-' || r == '_' {
+			return r
+		}
+		return '_'
+	}, value)
+	// Prevent path traversal via "." or ".." as a standalone segment.
+	switch cleaned {
+	case ".", "..":
+		return "_"
+	}
+	return cleaned
 }
 
 func NewHTTPRequest(request *http.Request) HTTPRequest {

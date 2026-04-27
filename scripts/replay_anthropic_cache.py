@@ -237,9 +237,16 @@ def main() -> int:
 
 
 def load_records(trace_path: Path, *, include_errors: bool) -> list[RequestRecord]:
+    # Support both old layout (session/Anthropic/*.json) and new layout
+    # (session/model/Anthropic/*.json) and direct Anthropic directory.
     anthropic_dir = trace_path
     if (trace_path / "Anthropic").is_dir():
         anthropic_dir = trace_path / "Anthropic"
+    if not any(anthropic_dir.glob("*.json")):
+        # Try model subdirectory layout: session/{model}/Anthropic/*.json
+        paths = sorted(trace_path.rglob("Anthropic/*.json"), key=lambda path: numeric_sort_key(path.name))
+        if paths:
+            return list(load_all(paths, include_errors=include_errors))
     paths = sorted(anthropic_dir.glob("*.json"), key=lambda path: numeric_sort_key(path.name))
     records: list[RequestRecord] = []
     for path in paths:

@@ -160,6 +160,7 @@ func (server *Server) handleResponses(writer http.ResponseWriter, request *http.
 		return
 	}
 
+	record.Model = responsesRequest.Model
 	// Check if this model routes to an OpenAI Responses provider (skip Anthropic conversion).
 	providerKey := server.bridge.ProviderFor(responsesRequest.Model)
 	if server.providerMgr != nil && server.providerMgr.ProtocolForModel(responsesRequest.Model) == config.ProtocolOpenAIResponse {
@@ -393,6 +394,7 @@ func (server *Server) writeTrace(record mbtrace.Record) {
 		server.writeTraceCategory("Response", requestNumber, mbtrace.Record{
 			HTTPRequest:        record.HTTPRequest,
 			OpenAIRequest:      record.OpenAIRequest,
+			Model:              record.Model,
 			OpenAIResponse:     record.OpenAIResponse,
 			OpenAIStreamEvents: record.OpenAIStreamEvents,
 			Error:              record.Error,
@@ -402,6 +404,7 @@ func (server *Server) writeTrace(record mbtrace.Record) {
 		server.writeTraceCategory("Anthropic", requestNumber, mbtrace.Record{
 			HTTPRequest:           record.HTTPRequest,
 			AnthropicRequest:      record.AnthropicRequest,
+			Model:                 record.Model,
 			AnthropicResponse:     record.AnthropicResponse,
 			AnthropicStreamEvents: record.AnthropicStreamEvents,
 			Error:                 record.Error,
@@ -465,11 +468,15 @@ func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *
 	log := logger.L().With("path", request.URL.Path, "method", request.Method)
 	if server.providerMgr == nil {
 		log.Error("未配置 OpenAI Responses 直通的提供商管理器")
-		writeOpenAIError(writer, http.StatusBadGateway, openai.ErrorResponse{Error: openai.ErrorObject{
+		payload := openai.ErrorResponse{Error: openai.ErrorObject{
 			Message: "提供商路由未配置",
 			Type:    "server_error",
 			Code:    "internal_error",
-		}})
+		}}
+		record.Error = map[string]string{"stage": "openai_provider_config", "message": "provider manager not configured"}
+		record.OpenAIResponse = payload
+		server.writeTrace(record)
+		writeOpenAIError(writer, http.StatusBadGateway, payload)
 		return
 	}
 
@@ -482,11 +489,15 @@ func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *
 	apiKey := server.providerMgr.ProviderAPIKey(resolvedKey)
 	if baseURL == "" {
 		log.Error("OpenAI 提供商缺少 base_url", "provider", providerKey)
-		writeOpenAIError(writer, http.StatusBadGateway, openai.ErrorResponse{Error: openai.ErrorObject{
+		payload := openai.ErrorResponse{Error: openai.ErrorObject{
 			Message: "提供商未配置",
 			Type:    "server_error",
 			Code:    "internal_error",
-		}})
+		}}
+		record.Error = map[string]string{"stage": "openai_provider_config", "message": "missing base_url"}
+		record.OpenAIResponse = payload
+		server.writeTrace(record)
+		writeOpenAIError(writer, http.StatusBadGateway, payload)
 		return
 	}
 
@@ -502,11 +513,15 @@ func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *
 	body, err := json.Marshal(upstreamRequest)
 	if err != nil {
 		log.Error("序列化请求失败", "error", err)
-		writeOpenAIError(writer, http.StatusInternalServerError, openai.ErrorResponse{Error: openai.ErrorObject{
+		payload := openai.ErrorResponse{Error: openai.ErrorObject{
 			Message: "内部错误",
 			Type:    "server_error",
 			Code:    "internal_error",
-		}})
+		}}
+		record.Error = traceError("encode_openai_upstream_request", err)
+		record.OpenAIResponse = payload
+		server.writeTrace(record)
+		writeOpenAIError(writer, http.StatusInternalServerError, payload)
 		return
 	}
 
@@ -514,11 +529,15 @@ func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *
 	upstreamReq, err := http.NewRequestWithContext(request.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body))
 	if err != nil {
 		log.Error("创建上游请求失败", "error", err)
-		writeOpenAIError(writer, http.StatusBadGateway, openai.ErrorResponse{Error: openai.ErrorObject{
+		payload := openai.ErrorResponse{Error: openai.ErrorObject{
 			Message: "上游请求失败",
 			Type:    "server_error",
 			Code:    "internal_error",
-		}})
+		}}
+		record.Error = traceError("create_openai_upstream_request", err)
+		record.OpenAIResponse = payload
+		server.writeTrace(record)
+		writeOpenAIError(writer, http.StatusBadGateway, payload)
 		return
 	}
 	upstreamReq.Header.Set("Content-Type", "application/json")
@@ -538,13 +557,15 @@ func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *
 		})
 		fmt.Fprintln(logger.Output(), errLine)
 		log.Error("OpenAI 上游请求失败", "status", http.StatusBadGateway)
-		record.Error = map[string]string{"stage": "openai_upstream", "message": err.Error()}
-		server.writeTrace(record)
-		writeOpenAIError(writer, http.StatusBadGateway, openai.ErrorResponse{Error: openai.ErrorObject{
+		payload := openai.ErrorResponse{Error: openai.ErrorObject{
 			Message: err.Error(),
 			Type:    "server_error",
 			Code:    "provider_error",
-		}})
+		}}
+		record.Error = traceError("openai_upstream", err)
+		record.OpenAIResponse = payload
+		server.writeTrace(record)
+		writeOpenAIError(writer, http.StatusBadGateway, payload)
 		return
 	}
 	defer upstreamResp.Body.Close()
@@ -557,18 +578,29 @@ func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *
 	}
 	writer.WriteHeader(upstreamResp.StatusCode)
 
+	traceEnabled := server.tracer != nil && server.tracer.Enabled()
+	statsEnabled := server.stats != nil && upstreamResp.StatusCode >= 200 && upstreamResp.StatusCode <= 299
+	shouldCapture := traceEnabled || statsEnabled
+
 	var captured bytes.Buffer
 	target := io.Writer(writer)
-	if server.stats != nil && upstreamResp.StatusCode >= 200 && upstreamResp.StatusCode <= 299 {
+	if shouldCapture {
 		target = io.MultiWriter(writer, &captured)
 	}
 	if _, err := io.Copy(target, upstreamResp.Body); err != nil {
 		log.Error("复制上游响应失败", "error", err)
 		return
 	}
-	if usage, ok := openAIUsageFromResponse(captured.Bytes(), responsesRequest.Stream); ok {
-		server.stats.Record(responsesRequest.Model, upstreamRequest.Model, usage)
-		logUsageLine(responsesRequest.Model, upstreamRequest.Model, usage, server.stats)
+
+	if traceEnabled {
+		record.OpenAIResponse = mbtrace.RawJSONOrString(captured.Bytes())
+		server.writeTrace(record)
+	}
+	if statsEnabled {
+		if usage, ok := openAIUsageFromResponse(captured.Bytes(), responsesRequest.Stream); ok {
+			server.stats.Record(responsesRequest.Model, upstreamRequest.Model, usage)
+			logUsageLine(responsesRequest.Model, upstreamRequest.Model, usage, server.stats)
+		}
 	}
 }
 

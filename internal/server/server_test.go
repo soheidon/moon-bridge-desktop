@@ -138,7 +138,7 @@ func TestResponsesHandlerWritesTraceFile(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
-	responseData, err := os.ReadFile(filepath.Join(traceRoot, "session-test", "Response", "1.json"))
+	responseData, err := os.ReadFile(filepath.Join(traceRoot, "session-test", "gpt-test", "Response", "1.json"))
 	if err != nil {
 		t.Fatalf("ReadFile(response trace) error = %v", err)
 	}
@@ -148,6 +148,7 @@ func TestResponsesHandlerWritesTraceFile(t *testing.T) {
 	}
 	for _, want := range []string{
 		`"request_number": 1`,
+		`"model": "gpt-test"`,
 		`"openai_request"`,
 		"Hello trace debug",
 		`"openai_response"`,
@@ -163,13 +164,14 @@ func TestResponsesHandlerWritesTraceFile(t *testing.T) {
 		}
 	}
 
-	anthropicData, err := os.ReadFile(filepath.Join(traceRoot, "session-test", "Anthropic", "1.json"))
+	anthropicData, err := os.ReadFile(filepath.Join(traceRoot, "session-test", "gpt-test", "Anthropic", "1.json"))
 	if err != nil {
 		t.Fatalf("ReadFile(anthropic trace) error = %v", err)
 	}
 	anthropicContent := string(anthropicData)
 	for _, want := range []string{
 		`"request_number": 1`,
+		`"model": "gpt-test"`,
 		`"anthropic_request"`,
 		"claude-test",
 		`"anthropic_response"`,
@@ -518,3 +520,78 @@ func TestResponsesHandlerPassesOpenAIProtocolThroughWithUpstreamModel(t *testing
 		}
 	}
 }
+
+
+func TestOpenAIResponsePassthroughWritesTraceOnSuccess(t *testing.T) {
+	traceRoot := t.TempDir()
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"id":"resp_456","object":"response","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"direct response"}]}],"usage":{"input_tokens":10,"output_tokens":3,"input_tokens_details":{"cached_tokens":0}}}`)),
+		}, nil
+	})}
+
+	providerMgr, err := provider.NewProviderManager(map[string]provider.ProviderConfig{
+		"openai": {
+			BaseURL:  "https://openai.example.test",
+			APIKey:   "openai-key",
+			Protocol: config.ProtocolOpenAIResponse,
+		},
+	}, map[string]provider.ModelRoute{
+		"gpt-direct": {Provider: "openai", Name: "gpt-upstream"},
+	})
+	if err != nil {
+		t.Fatalf("NewProviderManager() error = %v", err)
+	}
+
+	handler := server.New(server.Config{
+		Bridge: bridge.New(config.Config{
+			Routes: map[string]config.RouteEntry{
+				"gpt-direct": {Provider: "openai", Model: "gpt-upstream"},
+			},
+			Cache: config.CacheConfig{Mode: "off"},
+		}, cache.NewMemoryRegistry(), nil),
+		ProviderMgr:      providerMgr,
+		OpenAIHTTPClient: httpClient,
+		Tracer:           mbtrace.New(mbtrace.Config{Enabled: true, Root: traceRoot, SessionID: "session-test"}),
+	})
+
+	requestBody := bytes.NewBufferString(`{"model":"gpt-direct","input":"hello direct"}`)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", requestBody)
+	request.Header.Set("Authorization", "Bearer client-api-key")
+
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+
+	tracePath := filepath.Join(traceRoot, "session-test", "gpt-direct", "Response", "1.json")
+	traceData, err := os.ReadFile(tracePath)
+	if err != nil {
+		t.Fatalf("ReadFile(trace) error = %v", err)
+	}
+	traceContent := string(traceData)
+
+	for _, want := range []string{
+		`"model": "gpt-direct"`,
+		`"openai_request"`,
+		"hello direct",
+		`"openai_response"`,
+		"resp_456",
+		"direct response",
+		`"request_number": 1`,
+	} {
+		if !strings.Contains(traceContent, want) {
+			t.Fatalf("trace missing %q: %s", want, traceContent)
+		}
+	}
+	for _, notWant := range []string{`"anthropic_request"`, `"anthropic_response"`, "client-api-key"} {
+		if strings.Contains(traceContent, notWant) {
+			t.Fatalf("trace should not contain %q: %s", notWant, traceContent)
+		}
+	}
+}
+

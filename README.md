@@ -175,7 +175,7 @@ system_prompt: |
 
 ### 调试抓包
 
-打开 `trace_requests: true` 后，Transform 的 Anthropic 转换请求和 Capture 模式的代理流量会按模式写入 `trace/` 目录，方便排查问题。API Key 等敏感 Header 会自动脱敏；`openai-response` 直通 Provider 当前主要保留上游响应和 usage 日志，错误场景会写入 trace。
+打开 `trace_requests: true` 后，Transform 的请求（包括 Anthropic 转换和 OpenAI Responses 直通）和 Capture 模式的代理流量会按模式写入 `trace/` 目录，方便排查问题。API Key 等敏感 Header 会自动脱敏。Transform 模式下 trace 按模型建立子目录，例如 `trace/Transform/{session_id}/{model}/Response/{n}.json` 和 `trace/Transform/{session_id}/{model}/Anthropic/{n}.json`。
 
 ## 配合 Codex CLI 使用
 

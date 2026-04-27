@@ -109,11 +109,11 @@ go test ./internal/e2e/ -v -count=1
 
 ### 启用请求追踪
 
-在 `config.yml` 中设置 `trace_requests: true`，Anthropic 转换路径和 Capture 模式的请求/响应会写入 `trace/` 目录；`openai-response` 直通路径主要保留 usage 日志，错误场景会写 trace。详见 [architecture.md](architecture.md) trace 模块说明。
+在 `config.yml` 中设置 `trace_requests: true`，Anthropic 转换路径、OpenAI Responses 直通路径和 Capture 模式的所有请求/响应都会写入 `trace/` 目录（成功和错误场景均会写入）。详见 [architecture.md](architecture.md) trace 模块说明。
 
 ### 回放缓存策略
 
-`scripts/replay_anthropic_cache.py` 可以回放 `trace/Transform/<session>/Anthropic/*.json`，按 Anthropic Messages prompt cache 的 `tools -> system -> messages` 前缀、`cache_control` 断点、TTL、最小 token 门槛和 lookback 规则模拟缓存读写，用于在真实请求之外先筛策略：
+`scripts/replay_anthropic_cache.py` 可以回放 `trace/Transform/<session>/<model>/Anthropic/*.json`，按 Anthropic Messages prompt cache 的 `tools -> system -> messages` 前缀、`cache_control` 断点、TTL、最小 token 门槛和 lookback 规则模拟缓存读写，用于在真实请求之外先筛策略：
 
 ```bash
 scripts/replay_anthropic_cache.py trace/Transform/20260426T110909Z-79bfa6d6 --compare
