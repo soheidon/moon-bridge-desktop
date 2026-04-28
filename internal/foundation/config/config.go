@@ -82,6 +82,8 @@ type RouteEntry struct {
 	// Codex model catalog metadata.
 	DisplayName                string
 	Description                string
+	// BaseInstructions overrides the default model instructions for the catalog.
+	BaseInstructions string
 	DefaultReasoningLevel      string
 	SupportedReasoningLevels   []ReasoningLevelPreset
 	SupportsReasoningSummaries bool
@@ -119,6 +121,8 @@ type ModelMeta struct {
 	// Codex model catalog metadata.
 	DisplayName                string
 	Description                string
+	// BaseInstructions overrides the default model instructions for the catalog.
+	BaseInstructions string
 	DefaultReasoningLevel      string
 	SupportedReasoningLevels   []ReasoningLevelPreset
 	SupportsReasoningSummaries bool

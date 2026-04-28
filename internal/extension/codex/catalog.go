@@ -87,7 +87,8 @@ func BuildModelInfoFromRoute(alias string, ownedBy string, route config.RouteEnt
 	displayName = displayName + "(" + ownedBy + ")"
 	return newModelInfo(alias, displayName, route.Description, route.ContextWindow,
 		route.DefaultReasoningLevel, route.SupportedReasoningLevels,
-		route.SupportsReasoningSummaries, route.DefaultReasoningSummary)
+		route.SupportsReasoningSummaries, route.DefaultReasoningSummary,
+		route.BaseInstructions)
 }
 
 // BuildModelInfoFromProviderModel creates a Codex-compatible ModelInfo from a
@@ -105,7 +106,8 @@ func BuildModelInfoFromProviderModel(slug string, ownedBy string, meta config.Mo
 	displayName = displayName + "(" + ownedBy + ")"
 	return newModelInfo(slug, displayName, meta.Description, meta.ContextWindow,
 		meta.DefaultReasoningLevel, meta.SupportedReasoningLevels,
-		meta.SupportsReasoningSummaries, meta.DefaultReasoningSummary)
+		meta.SupportsReasoningSummaries, meta.DefaultReasoningSummary,
+		meta.BaseInstructions)
 }
 
 // BuildModelInfosFromConfig returns Codex model catalog entries. Provider model
@@ -165,6 +167,7 @@ func newModelInfo(
 	supportedLevels []config.ReasoningLevelPreset,
 	supportsReasoningSummaries bool,
 	defaultReasoningSummary string,
+	baseInstructions string,
 ) ModelInfo {
 	var levels []ReasoningLevelPresetDTO
 	for _, p := range supportedLevels {
@@ -183,6 +186,9 @@ func newModelInfo(
 		defaultReasoningSummary = "none"
 	}
 	applyPatchToolType := defaultApplyPatchToolType
+	if baseInstructions == "" {
+		baseInstructions = defaultBaseInstructions(slug)
+	}
 	return ModelInfo{
 		Slug:                       slug,
 		DisplayName:                displayName,
@@ -194,7 +200,7 @@ func newModelInfo(
 		SupportedInAPI:             true,
 		Priority:                   0,
 		AdditionalSpeedTiers:       []string{},
-		BaseInstructions:           "",
+		BaseInstructions:           baseInstructions,
 		SupportsReasoningSummaries: supportsReasoningSummaries,
 		DefaultReasoningSummary:    defaultReasoningSummary,
 		WebSearchToolType:          "text",
