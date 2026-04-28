@@ -10,10 +10,10 @@ import (
 	"os/signal"
 	"syscall"
 
-	"moonbridge/internal/app"
-	"moonbridge/internal/config"
-	"moonbridge/internal/extensions/codex"
-	"moonbridge/internal/logger"
+	"moonbridge/internal/extension/codex"
+	"moonbridge/internal/foundation/config"
+	"moonbridge/internal/foundation/logger"
+	"moonbridge/internal/service/app"
 )
 
 const (
