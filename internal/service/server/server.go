@@ -44,17 +44,19 @@ type Config struct {
 }
 
 type Server struct {
-	bridge      *bridge.Bridge
-	provider    Provider
-	providerMgr *provider.ProviderManager
-	openAIHTTP  *http.Client
-	tracer      *mbtrace.Tracer
-	traceErrors io.Writer
-	stats       *stats.SessionStats
-	mux         *http.ServeMux
-	sessionsMu  sync.Mutex
-	sessions    map[string]serverSession
-	appConfig   config.Config
+	bridge           *bridge.Bridge
+	provider         Provider
+	providerMgr      *provider.ProviderManager
+	openAIHTTP       *http.Client
+	tracer           *mbtrace.Tracer
+	traceErrors      io.Writer
+	stats            *stats.SessionStats
+	mux              *http.ServeMux
+	sessionsMu       sync.Mutex
+	sessions         map[string]serverSession
+	sessionPruneStop chan struct{}
+	onceClose        sync.Once
+	appConfig        config.Config
 }
 
 type serverSession struct {
@@ -66,21 +68,23 @@ const sessionTTL = 24 * time.Hour
 
 func New(cfg Config) *Server {
 	server := &Server{
-		bridge:      cfg.Bridge,
-		provider:    cfg.Provider,
-		providerMgr: cfg.ProviderMgr,
-		openAIHTTP:  cfg.OpenAIHTTPClient,
-		tracer:      cfg.Tracer,
-		traceErrors: cfg.TraceErrors,
-		stats:       cfg.Stats,
-		mux:         http.NewServeMux(),
-		sessions:    map[string]serverSession{},
-		appConfig:   cfg.AppConfig,
+		bridge:           cfg.Bridge,
+		provider:         cfg.Provider,
+		providerMgr:      cfg.ProviderMgr,
+		openAIHTTP:       cfg.OpenAIHTTPClient,
+		tracer:           cfg.Tracer,
+		traceErrors:      cfg.TraceErrors,
+		stats:            cfg.Stats,
+		mux:              http.NewServeMux(),
+		sessions:         map[string]serverSession{},
+		sessionPruneStop: make(chan struct{}),
+		appConfig:        cfg.AppConfig,
 	}
 	server.mux.HandleFunc("/v1/responses", server.handleResponses)
 	server.mux.HandleFunc("/responses", server.handleResponses)
 	server.mux.HandleFunc("/v1/models", server.handleModels)
 	server.mux.HandleFunc("/models", server.handleModels)
+	go server.startSessionPruning()
 	return server
 }
 
@@ -238,6 +242,7 @@ func (server *Server) handleResponses(writer http.ResponseWriter, request *http.
 func (server *Server) handleStream(writer http.ResponseWriter, request *http.Request, responsesRequest openai.ResponsesRequest, anthropicRequest anthropic.MessageRequest, plan cache.CacheCreationPlan, record mbtrace.Record, context codex.ConversionContext, sess *session.Session, provider Provider) {
 	log := logger.L().With("model", responsesRequest.Model)
 	log.Debug("开始流式传输")
+	server.bridge.MarkCacheAttempt(plan)
 	stream, err := provider.StreamMessage(request.Context(), anthropicRequest)
 	if err != nil {
 		status, payload := server.bridge.ErrorResponseForModel(responsesRequest.Model, err)
@@ -253,6 +258,7 @@ func (server *Server) handleStream(writer http.ResponseWriter, request *http.Req
 		record.OpenAIResponse = payload
 		server.writeTrace(record)
 		writeOpenAIError(writer, status, payload)
+		server.bridge.ResetCacheWarming(plan)
 		logger.Flush()
 		return
 	}
@@ -798,4 +804,39 @@ func InjectWebSearchTool(tools []openai.Tool) []openai.Tool {
 		tools = make([]openai.Tool, 0, 1)
 	}
 	return append(tools, openai.Tool{Type: "web_search"})
+}
+
+// startSessionPruning runs a background goroutine that periodically
+// cleans up expired sessions so they don't leak memory over time.
+func (server *Server) startSessionPruning() {
+	ticker := time.NewTicker(time.Hour) // prune every hour; sessionTTL is 24h
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			server.pruneSessions()
+		case <-server.sessionPruneStop:
+			return
+		}
+	}
+}
+
+// pruneSessions locks and prunes expired sessions.
+func (server *Server) pruneSessions() {
+	now := time.Now()
+	server.sessionsMu.Lock()
+	defer server.sessionsMu.Unlock()
+	for key, entry := range server.sessions {
+		if now.Sub(entry.lastUsed) > sessionTTL {
+			delete(server.sessions, key)
+		}
+	}
+}
+
+// Close stops the background session pruning goroutine.
+func (server *Server) Close() error {
+	server.onceClose.Do(func() {
+		close(server.sessionPruneStop)
+	})
+	return nil
 }
