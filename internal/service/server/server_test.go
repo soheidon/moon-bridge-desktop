@@ -887,8 +887,13 @@ func TestAuthRejectsRequestsWithoutValidToken(t *testing.T) {
 
 func TestAuthAcceptsValidBearerToken(t *testing.T) {
 	handler := server.New(server.Config{
-		Bridge: bridge.New(config.Config{
+		AppConfig: config.Config{
 			AuthToken:        "my-secret",
+			DefaultMaxTokens: 1024,
+			Routes:           map[string]config.RouteEntry{"gpt-test": {Provider: "default", Model: "claude-test"}},
+			Cache:            config.CacheConfig{Mode: "off"},
+		},
+		Bridge: bridge.New(config.Config{
 			DefaultMaxTokens: 1024,
 			Routes:           map[string]config.RouteEntry{"gpt-test": {Provider: "default", Model: "claude-test"}},
 			Cache:            config.CacheConfig{Mode: "off"},

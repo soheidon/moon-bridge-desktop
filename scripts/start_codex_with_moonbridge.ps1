@@ -355,12 +355,10 @@ function Start-CodexTerminal {
     $launch = Get-CodexLaunchCommand
     $allArguments = @($launch.PrefixArguments) + $Arguments
     $argumentLiteralList = ($allArguments | ForEach-Object { ConvertTo-PowerShellLiteral $_ }) -join ", "
-    $clientApiKey = if ($env:MOONBRIDGE_CLIENT_API_KEY) { $env:MOONBRIDGE_CLIENT_API_KEY } else { "local-dev" }
     $logFileLiteral = ConvertTo-PowerShellLiteral $LogFile
 
     $codexScript = @"
 `$env:CODEX_HOME = $(ConvertTo-PowerShellLiteral $CodexHomeDir)
-`$env:MOONBRIDGE_CLIENT_API_KEY = $(ConvertTo-PowerShellLiteral $clientApiKey)
 Set-Location -LiteralPath $(ConvertTo-PowerShellLiteral $RootDir)
 `$logFile = $logFileLiteral
 function Add-LauncherLog {

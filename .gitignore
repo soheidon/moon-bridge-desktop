@@ -44,10 +44,6 @@ docker-compose.yml
 
 # config schema dumps
 *.schema.json
-# user plugin configs
-/plugins/*.yml
-/plugins/*.yaml
-!/plugins/*.example.*
 
 # npm
 node_modules/
@@ -56,3 +52,4 @@ build/
 
 # Wrangler dev vars
 .dev.vars
+moonbridge

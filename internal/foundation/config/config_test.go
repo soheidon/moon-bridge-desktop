@@ -121,184 +121,6 @@ func TestXDGDefaultConfigPathFallsBackToHome(t *testing.T) {
 		t.Fatalf("XDGDefaultConfigPath() = %q, want %q", got, want)
 	}
 }
-func TestLoadFromFileMergesSplitPluginConfigFiles(t *testing.T) {
-	dir := t.TempDir()
-	configPath := filepath.Join(dir, "config.yml")
-	pluginDir := filepath.Join(dir, "plugins")
-	if err := os.Mkdir(pluginDir, 0755); err != nil {
-		t.Fatalf("Mkdir() error = %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(pluginDir, "deepseek_v4.yml"), []byte(`
-reinforce_instructions: true
-reinforce_prompt: split prompt
-`), 0644); err != nil {
-		t.Fatalf("WriteFile(plugin) error = %v", err)
-	}
-	if err := os.WriteFile(configPath, []byte(`
-mode: Transform
-provider:
-  providers:
-    main:
-      base_url: https://provider.example.test
-      api_key: upstream-key
-      models:
-        claude-test: {}
-  routes:
-    moonbridge: "main/claude-test"
-plugins:
-  deepseek_v4:
-    reinforce_instructions: false
-    inline_only: true
-`), 0644); err != nil {
-		t.Fatalf("WriteFile(config) error = %v", err)
-	}
-
-	cfg, err := config.LoadFromFile(configPath)
-	if err != nil {
-		t.Fatalf("LoadFromFile() error = %v", err)
-	}
-	pluginCfg := cfg.PluginConfig("deepseek_v4")
-	if got, ok := pluginCfg["reinforce_instructions"].(bool); !ok || !got {
-		t.Fatalf("reinforce_instructions = %#v, want true", pluginCfg["reinforce_instructions"])
-	}
-	if got, ok := pluginCfg["reinforce_prompt"].(string); !ok || got != "split prompt" {
-		t.Fatalf("reinforce_prompt = %#v, want split prompt", pluginCfg["reinforce_prompt"])
-	}
-	if got, ok := pluginCfg["inline_only"].(bool); !ok || !got {
-		t.Fatalf("inline_only = %#v, want true", pluginCfg["inline_only"])
-	}
-}
-
-func TestLoadFromFileLoadsSplitPluginOnly(t *testing.T) {
-	dir := t.TempDir()
-	configPath := filepath.Join(dir, "config.yml")
-	pluginDir := filepath.Join(dir, "plugins")
-	if err := os.Mkdir(pluginDir, 0755); err != nil {
-		t.Fatalf("Mkdir() error = %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(pluginDir, "my_plugin.yml"), []byte(`
-key1: value1
-key2: 42
-`), 0644); err != nil {
-		t.Fatalf("WriteFile(plugin) error = %v", err)
-	}
-	if err := os.WriteFile(configPath, []byte(`
-mode: Transform
-provider:
-  providers:
-    main:
-      base_url: https://provider.example.test
-      api_key: upstream-key
-      models:
-        claude-test: {}
-  routes:
-    moonbridge: "main/claude-test"
-`), 0644); err != nil {
-		t.Fatalf("WriteFile(config) error = %v", err)
-	}
-
-	cfg, err := config.LoadFromFile(configPath)
-	if err != nil {
-		t.Fatalf("LoadFromFile() error = %v", err)
-	}
-	pluginCfg := cfg.PluginConfig("my_plugin")
-	if pluginCfg == nil {
-		t.Fatal("PluginConfig(my_plugin) = nil, want non-nil")
-	}
-	if got, ok := pluginCfg["key1"].(string); !ok || got != "value1" {
-		t.Fatalf("key1 = %#v, want value1", pluginCfg["key1"])
-	}
-}
-
-func TestLoadFromFileDeduplicatesYmlAndYaml(t *testing.T) {
-	dir := t.TempDir()
-	configPath := filepath.Join(dir, "config.yml")
-	pluginDir := filepath.Join(dir, "plugins")
-	if err := os.Mkdir(pluginDir, 0755); err != nil {
-		t.Fatalf("Mkdir() error = %v", err)
-	}
-	// Both .yml and .yaml exist for the same base name.
-	if err := os.WriteFile(filepath.Join(pluginDir, "my_plugin.yml"), []byte(`
-version: from_yml
-`), 0644); err != nil {
-		t.Fatalf("WriteFile(.yml) error = %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(pluginDir, "my_plugin.yaml"), []byte(`
-version: from_yaml
-`), 0644); err != nil {
-		t.Fatalf("WriteFile(.yaml) error = %v", err)
-	}
-	if err := os.WriteFile(configPath, []byte(`
-mode: Transform
-provider:
-  providers:
-    main:
-      base_url: https://provider.example.test
-      api_key: upstream-key
-      models:
-        claude-test: {}
-  routes:
-    moonbridge: "main/claude-test"
-`), 0644); err != nil {
-		t.Fatalf("WriteFile(config) error = %v", err)
-	}
-
-	cfg, err := config.LoadFromFile(configPath)
-	if err != nil {
-		t.Fatalf("LoadFromFile() error = %v", err)
-	}
-	pluginCfg := cfg.PluginConfig("my_plugin")
-	if pluginCfg == nil {
-		t.Fatal("PluginConfig(my_plugin) = nil, want non-nil")
-	}
-	// Exactly one of the two files should have been loaded (no merge).
-	version, ok := pluginCfg["version"].(string)
-	if !ok {
-		t.Fatalf("version missing or wrong type: %#v", pluginCfg["version"])
-	}
-	if version != "from_yml" && version != "from_yaml" {
-		t.Fatalf("version = %q, want either from_yml or from_yaml", version)
-	}
-	// Only one key should exist.
-	if len(pluginCfg) != 1 {
-		t.Fatalf("pluginCfg has %d keys, want exactly 1", len(pluginCfg))
-	}
-}
-
-func TestLoadFromFileSkipsEmptyPluginFile(t *testing.T) {
-	dir := t.TempDir()
-	configPath := filepath.Join(dir, "config.yml")
-	pluginDir := filepath.Join(dir, "plugins")
-	if err := os.Mkdir(pluginDir, 0755); err != nil {
-		t.Fatalf("Mkdir() error = %v", err)
-	}
-	// Empty plugin file.
-	if err := os.WriteFile(filepath.Join(pluginDir, "empty_plugin.yml"), []byte("   \n\n"), 0644); err != nil {
-		t.Fatalf("WriteFile(empty plugin) error = %v", err)
-	}
-	if err := os.WriteFile(configPath, []byte(`
-mode: Transform
-provider:
-  providers:
-    main:
-      base_url: https://provider.example.test
-      api_key: upstream-key
-      models:
-        claude-test: {}
-  routes:
-    moonbridge: "main/claude-test"
-`), 0644); err != nil {
-		t.Fatalf("WriteFile(config) error = %v", err)
-	}
-
-	cfg, err := config.LoadFromFile(configPath)
-	if err != nil {
-		t.Fatalf("LoadFromFile() error = %v", err)
-	}
-	if got := cfg.PluginConfig("empty_plugin"); got != nil {
-		t.Fatalf("PluginConfig(empty_plugin) = %#v, want nil", got)
-	}
-}
 func TestLoadFromYAMLCanDisableWebSearch(t *testing.T) {
 	cfg, err := config.LoadFromYAML([]byte(`
 mode: Transform
@@ -904,56 +726,6 @@ developer:
 	}
 }
 
-func TestDumpConfigSchemaWritesMainSchemaAndPluginSchemas(t *testing.T) {
-	dir := t.TempDir()
-	configPath := filepath.Join(dir, "config.yml")
-	pluginDir := filepath.Join(dir, "plugins")
-	if err := os.Mkdir(pluginDir, 0755); err != nil {
-		t.Fatalf("Mkdir() error = %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(pluginDir, "deepseek_v4.yml"), []byte("key: val\n"), 0644); err != nil {
-		t.Fatalf("WriteFile(plugin) error = %v", err)
-	}
-	if err := os.WriteFile(configPath, []byte("mode: Transform\n"), 0644); err != nil {
-		t.Fatalf("WriteFile(config) error = %v", err)
-	}
-
-	if err := config.DumpConfigSchema(configPath, map[string]func() any{
-		"deepseek_v4": func() any { return testDeepSeekV4Config() },
-	}); err != nil {
-		t.Fatalf("DumpConfigSchema() error = %v", err)
-	}
-
-	// Main schema should exist.
-	mainSchemaPath := filepath.Join(dir, "config.schema.json")
-	if _, err := os.Stat(mainSchemaPath); err != nil {
-		t.Fatalf("main schema not found: %v", err)
-	}
-	mainData, err := os.ReadFile(mainSchemaPath)
-	if err != nil {
-		t.Fatalf("read main schema: %v", err)
-	}
-	if !strings.Contains(string(mainData), "$metadata") {
-		t.Fatal("main schema missing $metadata")
-	}
-
-	// Plugin schema should exist.
-	pluginSchemaPath := filepath.Join(pluginDir, "deepseek_v4.schema.json")
-	if _, err := os.Stat(pluginSchemaPath); err != nil {
-		t.Fatalf("plugin schema not found: %v", err)
-	}
-
-	// Plugin file schema should have field-level definitions.
-	pluginData, err := os.ReadFile(pluginSchemaPath)
-	if err != nil {
-		t.Fatalf("read plugin schema: %v", err)
-	}
-	pluginStr := string(pluginData)
-	if !strings.Contains(pluginStr, "reinforce_instructions") {
-		t.Fatalf("plugin schema missing reinforce_instructions field; content (first 500 chars): %s", pluginStr[:min(500, len(pluginStr))])
-	}
-}
-
 func TestDumpConfigSchemaSkipsUpToDateSchema(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yml")
@@ -962,10 +734,7 @@ func TestDumpConfigSchemaSkipsUpToDateSchema(t *testing.T) {
 	}
 
 	// First dump.
-	pluginTypes := map[string]func() any{
-		"deepseek_v4": func() any { return testDeepSeekV4Config() },
-	}
-	if err := config.DumpConfigSchema(configPath, pluginTypes); err != nil {
+	if err := config.DumpConfigSchema(configPath, nil); err != nil {
 		t.Fatalf("first DumpConfigSchema() error = %v", err)
 	}
 	schemaPath := filepath.Join(dir, "config.schema.json")
@@ -996,14 +765,4 @@ func TestDumpConfigSchemaSkipsMissingPluginDir(t *testing.T) {
 	if _, err := os.Stat(schemaPath); err != nil {
 		t.Fatalf("main schema not found: %v", err)
 	}
-}
-
-// testPluginConfig is a minimal config struct used for schema generation tests.
-type testPluginConfig struct {
-	ReinforceInstructions *bool   `json:"reinforce_instructions,omitempty"`
-	ReinforcePrompt       *string `json:"reinforce_prompt,omitempty"`
-}
-
-func testDeepSeekV4Config() *testPluginConfig {
-	return &testPluginConfig{}
 }

@@ -20,7 +20,6 @@ type FileConfig struct {
 	Cache         CacheFileConfig                `yaml:"cache" json:"cache,omitempty"`
 	SystemPrompt  string                         `yaml:"system_prompt" json:"system_prompt,omitempty"`
 	Developer     DeveloperFileConfig            `yaml:"developer" json:"developer,omitempty"`
-	Plugins       map[string]any                 `yaml:"plugins" json:"plugins,omitempty"`
 	Extensions    map[string]ExtensionFileConfig `yaml:"extensions" json:"extensions,omitempty"`
 }
 
@@ -62,14 +61,16 @@ type ProviderModelFileConfig struct {
 	MaxOutputTokens int                    `yaml:"max_output_tokens" json:"max_output_tokens,omitempty"`
 	Pricing         ModelPricingFileConfig `yaml:"pricing" json:"pricing,omitempty"`
 	// Codex model catalog metadata (injected into /v1/models responses).
-	DisplayName                string                           `yaml:"display_name" json:"display_name,omitempty"`
-	Description                string                           `yaml:"description" json:"description,omitempty"`
-	DefaultReasoningLevel      string                           `yaml:"default_reasoning_level" json:"default_reasoning_level,omitempty"`
-	SupportedReasoningLevels   []ReasoningLevelPresetFileConfig `yaml:"supported_reasoning_levels" json:"supported_reasoning_levels,omitempty"`
-	SupportsReasoningSummaries *bool                            `yaml:"supports_reasoning_summaries" json:"supports_reasoning_summaries,omitempty"`
-	DefaultReasoningSummary    string                           `yaml:"default_reasoning_summary" json:"default_reasoning_summary,omitempty"`
-	WebSearch                  WebSearchFileConfig              `yaml:"web_search" json:"web_search,omitempty"`
-	Extensions                 map[string]ExtensionFileConfig   `yaml:"extensions" json:"extensions,omitempty"`
+	DisplayName                 string                           `yaml:"display_name" json:"display_name,omitempty"`
+	Description                 string                           `yaml:"description" json:"description,omitempty"`
+	DefaultReasoningLevel       string                           `yaml:"default_reasoning_level" json:"default_reasoning_level,omitempty"`
+	SupportedReasoningLevels    []ReasoningLevelPresetFileConfig `yaml:"supported_reasoning_levels" json:"supported_reasoning_levels,omitempty"`
+	SupportsReasoningSummaries  *bool                            `yaml:"supports_reasoning_summaries" json:"supports_reasoning_summaries,omitempty"`
+	DefaultReasoningSummary     string                           `yaml:"default_reasoning_summary" json:"default_reasoning_summary,omitempty"`
+	InputModalities             []string                         `yaml:"input_modalities" json:"input_modalities,omitempty"`
+	SupportsImageDetailOriginal *bool                            `yaml:"supports_image_detail_original" json:"supports_image_detail_original,omitempty"`
+	WebSearch                   WebSearchFileConfig              `yaml:"web_search" json:"web_search,omitempty"`
+	Extensions                  map[string]ExtensionFileConfig   `yaml:"extensions" json:"extensions,omitempty"`
 }
 
 type ProviderDefFileConfig struct {
@@ -165,9 +166,6 @@ func LoadFromFileWithOptions(path string, opts LoadOptions) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	if err := loadPluginConfigFiles(path, &fileConfig); err != nil {
-		return Config{}, err
-	}
 	cfg, err := FromFileConfigWithOptions(fileConfig, opts)
 	if err != nil {
 		return Config{}, err
@@ -176,7 +174,6 @@ func LoadFromFileWithOptions(path string, opts LoadOptions) (Config, error) {
 }
 
 // LoadFromYAML parses YAML bytes into a Config. Unlike LoadFromFile, it does
-// not discover split plugin config files from the plugins/ directory; it only
 // processes the inline plugins: section of the provided YAML content.
 func LoadFromYAML(data []byte) (Config, error) {
 	return LoadFromYAMLWithOptions(data, LoadOptions{})
@@ -219,83 +216,6 @@ func XDGDefaultConfigPath() (string, error) {
 	return filepath.Join(base, AppConfigDirName, DefaultConfigFileName), nil
 }
 
-func loadPluginConfigFiles(configPath string, fileConfig *FileConfig) error {
-	pluginDir := filepath.Join(filepath.Dir(configPath), DefaultPluginConfigDirName)
-	entries, err := os.ReadDir(pluginDir)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return fmt.Errorf("read plugin config dir %s: %w", pluginDir, err)
-	}
-	seen := make(map[string]bool, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() || !isYAMLFile(entry.Name()) {
-			continue
-		}
-		baseName := strings.TrimSuffix(strings.TrimSuffix(entry.Name(), ".yaml"), ".yml")
-		if strings.TrimSpace(baseName) == "" {
-			continue
-		}
-		// Deduplicate: skip if we already processed a .yml variant of this base name.
-		if seen[baseName] {
-			continue
-		}
-		seen[baseName] = true
-		pluginPath := filepath.Join(pluginDir, entry.Name())
-		raw, err := os.ReadFile(pluginPath)
-		if err != nil {
-			return fmt.Errorf("read plugin config %s: %w", pluginPath, err)
-		}
-		pluginConfig, err := decodePluginConfig(raw)
-		if err != nil {
-			return fmt.Errorf("parse plugin config %s: %w", pluginPath, err)
-		}
-		// Skip empty or whitespace-only plugin files.
-		if len(pluginConfig) == 0 {
-			continue
-		}
-		mergePluginConfig(fileConfig, baseName, pluginConfig)
-	}
-	return nil
-}
-
-func mergePluginConfig(fileConfig *FileConfig, pluginName string, pluginConfig map[string]any) {
-	if fileConfig.Plugins == nil {
-		fileConfig.Plugins = make(map[string]any)
-	}
-	if existing, ok := fileConfig.Plugins[pluginName].(map[string]any); ok {
-		merged := make(map[string]any, len(existing)+len(pluginConfig))
-		for key, value := range existing {
-			merged[key] = value
-		}
-		for key, value := range pluginConfig {
-			merged[key] = value
-		}
-		fileConfig.Plugins[pluginName] = merged
-		return
-	}
-	fileConfig.Plugins[pluginName] = pluginConfig
-}
-
-func decodePluginConfig(data []byte) (map[string]any, error) {
-	if len(bytes.TrimSpace(data)) == 0 {
-		return map[string]any{}, nil
-	}
-	var pluginConfig map[string]any
-	if err := yaml.Unmarshal(data, &pluginConfig); err != nil {
-		return nil, err
-	}
-	if pluginConfig == nil {
-		return map[string]any{}, nil
-	}
-	return pluginConfig, nil
-}
-
-func isYAMLFile(name string) bool {
-	return strings.HasSuffix(name, ".yml") || strings.HasSuffix(name, ".yaml")
-}
-
 func FromFileConfig(fileConfig FileConfig) (Config, error) {
 	return FromFileConfigWithOptions(fileConfig, LoadOptions{})
 }
@@ -334,7 +254,7 @@ func FromFileConfigWithOptions(fileConfig FileConfig, opts LoadOptions) (Config,
 	cfg := Config{
 		Mode:              mode,
 		Addr:              valueOrDefault(strings.TrimSpace(fileConfig.Server.Addr), DefaultAddr),
-		AuthToken:          strings.TrimSpace(fileConfig.Server.AuthToken),
+		AuthToken:         strings.TrimSpace(fileConfig.Server.AuthToken),
 		TraceRequests:     fileConfig.TraceRequests,
 		LogLevel:          valueOrDefault(strings.TrimSpace(fileConfig.Log.Level), "info"),
 		LogFormat:         valueOrDefault(strings.TrimSpace(fileConfig.Log.Format), "text"),
@@ -355,7 +275,6 @@ func FromFileConfigWithOptions(fileConfig FileConfig, opts LoadOptions) (Config,
 		Cache:             fromCacheFileConfig(fileConfig.Cache),
 		ResponseProxy:     FromResponseProxyFileConfig(fileConfig.Developer.Proxy.Response),
 		AnthropicProxy:    FromAnthropicProxyFileConfig(fileConfig.Developer.Proxy.Anthropic),
-		Plugins:           pluginsFromFileConfig(fileConfig.Plugins),
 		Extensions:        topExtensions,
 		extensionSpecs:    specs,
 	}
@@ -459,6 +378,8 @@ func buildRoutes(rawRoutes map[string]RouteFileConfig, providerDefs map[string]P
 				entry.SupportsReasoningSummaries = meta.SupportsReasoningSummaries
 				entry.DefaultReasoningSummary = meta.DefaultReasoningSummary
 				entry.WebSearch = meta.WebSearch
+				entry.InputModalities = meta.InputModalities
+				entry.SupportsImageDetailOriginal = meta.SupportsImageDetailOriginal
 			}
 		}
 		routes[trimmedAlias] = entry
@@ -501,18 +422,20 @@ func fromProviderDefFileConfig(fileConfig map[string]ProviderDefFileConfig, spec
 				return nil, err
 			}
 			meta := ModelMeta{
-				ContextWindow:              m.ContextWindow,
-				MaxOutputTokens:            m.MaxOutputTokens,
-				InputPrice:                 m.Pricing.InputPrice,
-				OutputPrice:                m.Pricing.OutputPrice,
-				CacheWritePrice:            m.Pricing.CacheWritePrice,
-				CacheReadPrice:             m.Pricing.CacheReadPrice,
-				DisplayName:                strings.TrimSpace(m.DisplayName),
-				Description:                strings.TrimSpace(m.Description),
-				DefaultReasoningLevel:      strings.TrimSpace(m.DefaultReasoningLevel),
-				SupportsReasoningSummaries: boolOrDefault(m.SupportsReasoningSummaries, false),
-				DefaultReasoningSummary:    strings.TrimSpace(m.DefaultReasoningSummary),
-				Extensions:                 modelExtensions,
+				ContextWindow:               m.ContextWindow,
+				MaxOutputTokens:             m.MaxOutputTokens,
+				InputPrice:                  m.Pricing.InputPrice,
+				OutputPrice:                 m.Pricing.OutputPrice,
+				CacheWritePrice:             m.Pricing.CacheWritePrice,
+				CacheReadPrice:              m.Pricing.CacheReadPrice,
+				DisplayName:                 strings.TrimSpace(m.DisplayName),
+				Description:                 strings.TrimSpace(m.Description),
+				DefaultReasoningLevel:       strings.TrimSpace(m.DefaultReasoningLevel),
+				SupportsReasoningSummaries:  boolOrDefault(m.SupportsReasoningSummaries, false),
+				DefaultReasoningSummary:     strings.TrimSpace(m.DefaultReasoningSummary),
+				Extensions:                  modelExtensions,
+				InputModalities:             m.InputModalities,
+				SupportsImageDetailOriginal: boolOrDefault(m.SupportsImageDetailOriginal, false),
 			}
 			// Parse model-level web_search config.
 			if m.WebSearch.Support != "" {
@@ -566,20 +489,4 @@ func fromCacheFileConfig(fileConfig CacheFileConfig) CacheConfig {
 		MinimumValueScore:        intOrDefault(fileConfig.MinimumValueScore, 2048),
 		MinBreakpointTokens:      intOrDefault(fileConfig.MinBreakpointTokens, 1024),
 	}
-}
-
-func pluginsFromFileConfig(raw map[string]any) map[string]map[string]any {
-	if len(raw) == 0 {
-		return nil
-	}
-	result := make(map[string]map[string]any, len(raw))
-	for name, cfg := range raw {
-		switch v := cfg.(type) {
-		case map[string]any:
-			result[name] = v
-		default:
-			// Skip non-map entries.
-		}
-	}
-	return result
 }

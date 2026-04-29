@@ -9,6 +9,9 @@ log:
 
 server:
   addr: "127.0.0.1:38440"
+  # Set a Bearer token for API authentication. When non-empty, all requests
+  # must include an Authorization: Bearer <token> header. If empty, auth is disabled.
+  # auth_token: "replace-with-your-secret-token"
 
 trace_requests: false
 
@@ -83,6 +86,34 @@ provider:
       user_agent: "moonbridge/1.0"
       web_search:
         support: "enabled"
+      models:
+        claude-sonnet-4-20250514:
+          context_window: 200000
+          max_output_tokens: 64000
+          display_name: "Claude Sonnet 4"
+          description: "Frontier model for everyday coding."
+          default_reasoning_level: "medium"
+          supported_reasoning_levels:
+            - effort: "low"
+              description: "Fast responses with lighter reasoning"
+            - effort: "medium"
+              description: "Balances speed and reasoning depth for everyday tasks"
+            - effort: "high"
+              description: "Greater reasoning depth for complex problems"
+            - effort: "xhigh"
+              description: "Extra high reasoning depth for complex problems"
+          # Declare this model as multimodal (supports image input).
+          # Codex reads these from models_catalog.json to decide whether
+          # image attachments can be included in user turns.
+          input_modalities:
+            - "text"
+            - "image"
+          supports_image_detail_original: true
+          pricing:
+            input_price: 3
+            output_price: 15
+            cache_write_price: 3.75
+            cache_read_price: 0.30
 
   routes:
     # Optional aliases. Provider models are listed directly in the Codex catalog

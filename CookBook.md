@@ -149,7 +149,7 @@ go run ./cmd/moonbridge \
 启动 Codex：
 
 ```bash
-CODEX_HOME="$CODEX_HOME_DIR" MOONBRIDGE_CLIENT_API_KEY="local-dev" codex --cd "$PWD"
+CODEX_HOME="$CODEX_HOME_DIR" codex --cd "$PWD"
 ```
 
 **验证：** Codex 正常启动，提问后 Moon Bridge 终端出现 `POST /v1/responses` 日志。

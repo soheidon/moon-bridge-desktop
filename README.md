@@ -326,7 +326,9 @@ model_provider = "moonbridge"
 name = "Moon Bridge"
 base_url = "http://localhost:38440/v1"
 wire_api = "responses"
-env_key = "MOONBRIDGE_CLIENT_API_KEY"
+
+# 以下为自动生成（需设置 server.auth_token）或手动配置：
+# requires_openai_auth = true
 
 [mcp_servers.deepwiki]
 url = "https://mcp.deepwiki.com/mcp"

@@ -325,7 +325,7 @@ session 级 token 和费用统计。
 
 - 支持 `/responses` 和 `/v1/responses` 两个路径，兼容 Codex CLI 的不同路由约定。
 - `/v1/models` 响应使用 Codex `ModelsResponse` 格式（`{"models": [...]}`）而非标准 OpenAI `{"object":"list","data":[...]}`，因为 Codex 的 `codex-api` crate 反序列化时期望 `models` 字段。
-- Codex 在使用 `env_key`（API key）认证时不会主动拉取 `/models` 端点（`should_refresh_models` 返回 `false`）。因此 `--print-codex-config --codex-home` 会同时生成 `models_catalog.json` 并在 config.toml 中输出 `model_catalog_json` 指向该文件，让 Codex 在启动时直接加载静态 catalog。
+- Codex 在使用 `requires_openai_auth`、`env_key` 或 `experimental_bearer_token` 认证时不会主动拉取 `/models` 端点（`should_refresh_models` 返回 `false`）。因此 `--print-codex-config --codex-home` 会同时生成 `models_catalog.json` 并在 config.toml 中输出 `model_catalog_json` 指向该文件，让 Codex 在启动时直接加载静态 catalog。
 - `usage.input_tokens_details.cached_tokens` 即使为 0 也序列化输出，避免 Codex 压缩上下文时解析失败。
 - `local_shell_call` 使用独立 JSON schema 和 output item 类型，不走普通 `function_call` 路径。
 - `web_search_call` 流式中 `input_json_delta` 不产生 `function_call_arguments.delta`，而是并入 `action` 字段；当 Provider 探测不支持 web search 时，不向上游注入搜索工具；`injected` 模式则改为服务端 Tavily/Firecrawl 工具循环。

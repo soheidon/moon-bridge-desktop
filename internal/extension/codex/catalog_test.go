@@ -156,3 +156,43 @@ func TestWriteModelsCatalogProducesValidJSON(t *testing.T) {
 		t.Fatal("expected at least 1 model in catalog")
 	}
 }
+
+func TestBuildModelInfoFromProviderModelIncludesInputModalities(t *testing.T) {
+	info := codex.BuildModelInfoFromProviderModel("gpt-4o(openai)", "openai", config.ModelMeta{
+		ContextWindow:   128000,
+		InputModalities: []string{"text", "image"},
+	})
+	if len(info.InputModalities) != 2 {
+		t.Fatalf("InputModalities = %v, want [text image]", info.InputModalities)
+	}
+	if info.InputModalities[0] != "text" || info.InputModalities[1] != "image" {
+		t.Fatalf("InputModalities = %v, want [text image]", info.InputModalities)
+	}
+}
+
+func TestBuildModelInfoDefaultsInputModalitiesToText(t *testing.T) {
+	info := codex.BuildModelInfoFromProviderModel("gpt-4o(openai)", "openai", config.ModelMeta{
+		ContextWindow: 128000,
+		// InputModalities not set; should default to ["text"]
+	})
+	if len(info.InputModalities) != 1 || info.InputModalities[0] != "text" {
+		t.Fatalf("InputModalities = %v, want [text]", info.InputModalities)
+	}
+	if info.SupportsImageDetailOriginal {
+		t.Fatal("SupportsImageDetailOriginal should be false by default")
+	}
+}
+
+func TestBuildModelInfoFromRoutePropagatesInputModalities(t *testing.T) {
+	info := codex.BuildModelInfoFromRoute("gpt-image", "openai", config.RouteEntry{
+		Model:                       "gpt-4o",
+		InputModalities:             []string{"text", "image"},
+		SupportsImageDetailOriginal: true,
+	})
+	if len(info.InputModalities) != 2 || info.InputModalities[1] != "image" {
+		t.Fatalf("InputModalities = %v, want [text image]", info.InputModalities)
+	}
+	if !info.SupportsImageDetailOriginal {
+		t.Fatal("SupportsImageDetailOriginal should be true")
+	}
+}

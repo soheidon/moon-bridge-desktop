@@ -71,7 +71,6 @@ else
 fi
 
 export CODEX_HOME="$CODEX_HOME_DIR"
-export MOONBRIDGE_CLIENT_API_KEY="${MOONBRIDGE_CLIENT_API_KEY:-local-dev}"
 
 log "Starting Codex with CODEX_HOME=${CODEX_HOME_DIR}"
 log "Workspace: ${PROJECT_DIR}"

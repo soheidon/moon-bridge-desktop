@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 
+	"moonbridge/internal/extension/visual"
 	"moonbridge/internal/foundation/config"
 )
 
@@ -88,7 +89,9 @@ func BuildModelInfoFromRoute(alias string, ownedBy string, route config.RouteEnt
 	return newModelInfo(alias, displayName, route.Description, route.ContextWindow,
 		route.DefaultReasoningLevel, route.SupportedReasoningLevels,
 		route.SupportsReasoningSummaries, route.DefaultReasoningSummary,
-		route.BaseInstructions)
+		route.BaseInstructions,
+		inputModalitiesOrDefault(route.InputModalities),
+		route.SupportsImageDetailOriginal)
 }
 
 // BuildModelInfoFromProviderModel creates a Codex-compatible ModelInfo from a
@@ -107,7 +110,9 @@ func BuildModelInfoFromProviderModel(slug string, ownedBy string, meta config.Mo
 	return newModelInfo(slug, displayName, meta.Description, meta.ContextWindow,
 		meta.DefaultReasoningLevel, meta.SupportedReasoningLevels,
 		meta.SupportsReasoningSummaries, meta.DefaultReasoningSummary,
-		meta.BaseInstructions)
+		meta.BaseInstructions,
+		inputModalitiesOrDefault(meta.InputModalities),
+		meta.SupportsImageDetailOriginal)
 }
 
 // BuildModelInfosFromConfig returns Codex model catalog entries. Provider model
@@ -156,7 +161,39 @@ func BuildModelInfosFromConfig(cfg config.Config) []ModelInfo {
 		models = append(models, BuildModelInfoFromRoute(alias, ownedBy, route))
 	}
 
+	models = injectVisualModalities(models, cfg)
 	return models
+}
+
+// injectVisualModalities ensures models with the visual extension enabled
+// include "image" in their input_modalities, so Codex knows to send image
+// content blocks — the visual orchestrator needs them to function.
+func injectVisualModalities(models []ModelInfo, cfg config.Config) []ModelInfo {
+	result := make([]ModelInfo, len(models))
+	copy(result, models)
+	for i, m := range result {
+		if !cfg.ExtensionEnabled(visual.PluginName, m.Slug) {
+			continue
+		}
+		hasImage := false
+		for _, mod := range m.InputModalities {
+			if mod == "image" {
+				hasImage = true
+				break
+			}
+		}
+		if !hasImage {
+			// Append "image" to existing modalities; preserve any non-standard
+			// modalities (e.g. "audio") the user may have configured.
+			// Default to ["text"] if the list is empty.
+			base := result[i].InputModalities
+			if len(base) == 0 {
+				base = []string{"text"}
+			}
+			result[i].InputModalities = append(base, "image")
+		}
+	}
+	return result
 }
 
 // newModelInfo builds a ModelInfo with all fields Codex requires.
@@ -168,6 +205,8 @@ func newModelInfo(
 	supportsReasoningSummaries bool,
 	defaultReasoningSummary string,
 	baseInstructions string,
+	inputModalities []string,
+	supportsImageDetailOriginal bool,
 ) ModelInfo {
 	var levels []ReasoningLevelPresetDTO
 	for _, p := range supportedLevels {
@@ -190,29 +229,37 @@ func newModelInfo(
 		baseInstructions = defaultBaseInstructions(slug)
 	}
 	return ModelInfo{
-		Slug:                       slug,
-		DisplayName:                displayName,
-		Description:                description,
-		DefaultReasoningLevel:      defaultReasoningLevel,
-		SupportedReasoningLevels:   levels,
-		ShellType:                  "unified_exec",
-		Visibility:                 "list",
-		SupportedInAPI:             true,
-		Priority:                   0,
-		AdditionalSpeedTiers:       []string{},
-		BaseInstructions:           baseInstructions,
-		SupportsReasoningSummaries: supportsReasoningSummaries,
-		DefaultReasoningSummary:    defaultReasoningSummary,
-		WebSearchToolType:          "text",
-		ApplyPatchToolType:         &applyPatchToolType,
-		TruncationPolicy:           truncationPolicyForModel(slug),
-		SupportsParallelToolCalls:  true,
-		ContextWindow:              ctxWin,
-		MaxContextWindow:           maxCtxWin,
-		EffectiveContextWindowPct:  95,
-		ExperimentalSupportedTools: []string{},
-		InputModalities:            []string{"text"},
+		Slug:                        slug,
+		DisplayName:                 displayName,
+		Description:                 description,
+		DefaultReasoningLevel:       defaultReasoningLevel,
+		SupportedReasoningLevels:    levels,
+		ShellType:                   "unified_exec",
+		Visibility:                  "list",
+		SupportedInAPI:              true,
+		Priority:                    0,
+		AdditionalSpeedTiers:        []string{},
+		BaseInstructions:            baseInstructions,
+		SupportsReasoningSummaries:  supportsReasoningSummaries,
+		DefaultReasoningSummary:     defaultReasoningSummary,
+		WebSearchToolType:           "text",
+		ApplyPatchToolType:          &applyPatchToolType,
+		TruncationPolicy:            truncationPolicyForModel(slug),
+		SupportsParallelToolCalls:   true,
+		ContextWindow:               ctxWin,
+		MaxContextWindow:            maxCtxWin,
+		EffectiveContextWindowPct:   95,
+		ExperimentalSupportedTools:  []string{},
+		InputModalities:             inputModalities,
+		SupportsImageDetailOriginal: supportsImageDetailOriginal,
 	}
+}
+
+func inputModalitiesOrDefault(modalities []string) []string {
+	if len(modalities) == 0 {
+		return []string{"text"}
+	}
+	return modalities
 }
 
 func truncationPolicyForModel(string) TruncationPolicyConfig {
@@ -268,13 +315,20 @@ func GenerateConfigToml(output io.Writer, modelAlias string, baseURL string, cod
 			return fmt.Errorf("write models catalog: %w", err)
 		}
 		fmt.Fprintf(output, "model_catalog_json = %q\n", catalogPath)
+		if cfg.AuthToken != "" {
+			if err := writeAuthJSON(filepath.Join(codexHome, "auth.json"), cfg.AuthToken); err != nil {
+				return fmt.Errorf("write auth.json: %w", err)
+			}
+		}
 	}
 
 	fmt.Fprintln(output)
 	fmt.Fprintln(output, "[model_providers.moonbridge]")
 	fmt.Fprintln(output, `name = "Moon Bridge"`)
 	fmt.Fprintf(output, "base_url = %q\n", valueOrDefault(baseURL, "http://"+config.DefaultAddr+"/v1"))
-	fmt.Fprintln(output, `env_key = "MOONBRIDGE_CLIENT_API_KEY"`)
+	if cfg.AuthToken != "" {
+		fmt.Fprintln(output, `requires_openai_auth = true`)
+	}
 	fmt.Fprintln(output, `wire_api = "responses"`)
 	fmt.Fprintln(output)
 	fmt.Fprintln(output, "[mcp_servers.deepwiki]")
@@ -282,4 +336,19 @@ func GenerateConfigToml(output io.Writer, modelAlias string, baseURL string, cod
 	fmt.Fprintln(output, "startup_timeout_sec = 3600")
 	fmt.Fprintln(output, "tool_timeout_sec = 3600")
 	return nil
+}
+
+// writeAuthJSON writes the API key into Codex's auth.json so that model_providers
+// using requires_openai_auth can find the bearer token.
+func writeAuthJSON(path, token string) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return json.NewEncoder(f).Encode(map[string]string{"openai_api_key": token})
 }

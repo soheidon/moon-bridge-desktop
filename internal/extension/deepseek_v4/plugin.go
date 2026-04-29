@@ -50,7 +50,6 @@ func NewPlugin(isEnabled ...EnabledFunc) *DSPlugin {
 }
 
 func (p *DSPlugin) Name() string                              { return PluginName }
-func (p *DSPlugin) ConfigType() any                           { return &Config{} }
 func (p *DSPlugin) ConfigSpecs() []config.ExtensionConfigSpec { return ConfigSpecs() }
 func (p *DSPlugin) EnabledForModel(model string) bool {
 	if p.isEnabled != nil {

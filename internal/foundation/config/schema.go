@@ -10,18 +10,17 @@ import (
 	"github.com/invopop/jsonschema"
 )
 
-const SchemaVersion = 3
+const SchemaVersion = 4
 
 const DefaultMainSchemaName = "config.schema.json"
 
-// pluginConfigTypes is populated by Registry.Register when plugins implement
-// plugin.ConfigTypeProvider. It is also populated by SetPluginConfigTypes for
+// pluginConfigTypes is populated by Registry.Register from ExtensionConfigSpec.Factory. It is also populated by SetPluginConfigTypes for
 // schema-dump scenarios where no registry is involved.
 var pluginConfigTypes = map[string]func() any{}
 
 // RegisterPluginConfigType registers a plugin's config type for schema
 // generation and runtime decoding. Called automatically by Registry.Register
-// for plugins that implement ConfigTypeProvider.
+// for extensions that define a config Factory in their ExtensionConfigSpec.
 func RegisterPluginConfigType(name string, factory func() any) {
 	pluginConfigTypes[name] = factory
 }
@@ -41,14 +40,6 @@ func DumpConfigSchema(configPath string, extraPlugins map[string]func() any) err
 func DumpConfigSchemaWithOptions(configPath string, opts SchemaOptions) error {
 	configDir := filepath.Dir(configPath)
 
-	// Main config schema — describes the config format, not individual plugins.
-	mainSchema := generateMainSchema()
-	mainSchemaPath := filepath.Join(configDir, DefaultMainSchemaName)
-	if err := writeSchemaIfStale(mainSchemaPath, mainSchema); err != nil {
-		return fmt.Errorf("write schema %s: %w", mainSchemaPath, err)
-	}
-	ensureSchemaRef(configPath, DefaultMainSchemaName)
-
 	// Merge built-in and externally-provided plugin types.
 	allTypes := make(map[string]func() any, len(pluginConfigTypes)+len(opts.ExtraPlugins)+len(opts.ExtensionSpecs))
 	for k, v := range pluginConfigTypes {
@@ -63,67 +54,122 @@ func DumpConfigSchemaWithOptions(configPath string, opts SchemaOptions) error {
 		}
 	}
 
-	// Per-plugin schema files — each describes its own config structure.
-	pluginDir := filepath.Join(configDir, DefaultPluginConfigDirName)
-	if len(opts.ExtensionSpecs) > 0 {
-		if err := os.MkdirAll(pluginDir, 0755); err != nil {
-			return fmt.Errorf("create plugin schema dir: %w", err)
-		}
-		for _, spec := range opts.ExtensionSpecs {
-			data, err := generatePluginSchema(spec.Name, allTypes)
-			if err != nil {
-				return fmt.Errorf("generate schema for plugin %s: %w", spec.Name, err)
-			}
-			if data == nil {
-				continue
-			}
-			schemaPath := filepath.Join(pluginDir, spec.Name+".schema.json")
-			if err := writeSchemaIfStale(schemaPath, data); err != nil {
-				return fmt.Errorf("write plugin schema %s: %w", schemaPath, err)
-			}
-		}
+	// Main config schema — describes the config format, not individual plugins.
+	mainSchema := generateMainSchema(allTypes)
+	mainSchemaPath := filepath.Join(configDir, DefaultMainSchemaName)
+	if err := writeSchemaIfStale(mainSchemaPath, mainSchema); err != nil {
+		return fmt.Errorf("write schema %s: %w", mainSchemaPath, err)
 	}
-	entries, err := os.ReadDir(pluginDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("read plugin dir: %w", err)
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || !isYAMLFile(entry.Name()) {
-			continue
-		}
-		base := strings.TrimSuffix(strings.TrimSuffix(entry.Name(), ".yaml"), ".yml")
-		// Only generate schemas for known plugins with a registered config type.
-		data, err := generatePluginSchema(base, allTypes)
-		if err != nil {
-			return fmt.Errorf("generate schema for plugin %s: %w", base, err)
-		}
-		if data == nil {
-			continue
-		}
-		schemaPath := filepath.Join(pluginDir, base+".schema.json")
-		if err := writeSchemaIfStale(schemaPath, data); err != nil {
-			return fmt.Errorf("write plugin schema %s: %w", schemaPath, err)
-		}
-		ensureSchemaRef(filepath.Join(pluginDir, entry.Name()), base+".schema.json")
-	}
+	ensureSchemaRef(configPath, DefaultMainSchemaName)
+
 	return nil
 }
 
-func generateMainSchema() []byte {
+func generateMainSchema(knownTypes map[string]func() any) []byte {
 	r := &jsonschema.Reflector{}
 	s := r.Reflect(&FileConfig{})
-	data, _ := json.MarshalIndent(s, "", "  ")
+	raw := schemaToMap(s)
 
-	var raw map[string]any
-	json.Unmarshal(data, &raw)
+	// Inject known extension config types into the 4 extension mount points.
+	injectExtensionSchemas(raw, knownTypes)
+
 	raw["$metadata"] = map[string]any{
 		"schemaVersion": SchemaVersion,
 	}
 	result, _ := json.MarshalIndent(raw, "", "  ")
 	return result
+}
+
+// injectExtensionSchemas replaces the bare ExtensionFileConfig additionalProperties
+// in all 4 extension mount points (global, provider, model, route) with a definition
+// that lists known extensions as named properties with typed config refs.
+func injectExtensionSchemas(raw map[string]any, knownTypes map[string]func() any) {
+	if len(knownTypes) == 0 {
+		return
+	}
+	defs, _ := raw["$defs"].(map[string]any)
+	if defs == nil {
+		return
+	}
+
+	for _, structName := range []string{"FileConfig", "ProviderDefFileConfig", "ProviderModelFileConfig", "RouteFileConfig"} {
+		sc, ok := defs[structName].(map[string]any)
+		if !ok {
+			continue
+		}
+		props, _ := sc["properties"].(map[string]any)
+		extBlock, ok := props["extensions"].(map[string]any)
+		if !ok {
+			continue
+		}
+
+		// Build extension config type defs first, then only reference those
+		// that successfully produced a schema def — avoids dangling $ref.
+		validExtensions := make(map[string]extensionEntry)
+		for name, factory := range knownTypes {
+			r := &jsonschema.Reflector{}
+			s := schemaToMap(r.Reflect(factory()))
+			ref, _ := s["$ref"].(string)
+			tdef, _ := extractTypeDef(s, ref)
+			if tdef == nil {
+				continue
+			}
+			defName := extensionDefName(name)
+			validExtensions[name] = extensionEntry{defName: defName}
+			defs[defName] = map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"enabled": map[string]any{"type": "boolean"},
+					"config":  tdef,
+				},
+				"additionalProperties": false,
+			}
+		}
+		extBlock["properties"] = buildExtensionProperties(validExtensions)
+	}
+}
+
+type extensionEntry struct {
+	defName string
+}
+
+func buildExtensionProperties(validExtensions map[string]extensionEntry) map[string]any {
+	props := make(map[string]any, len(validExtensions))
+	for name := range validExtensions {
+		entry := validExtensions[name]
+		props[name] = map[string]any{
+			"$ref": "#/$defs/" + entry.defName,
+		}
+	}
+	return props
+}
+
+func extensionDefName(name string) string {
+	// deepseek_v4 -> Deepseek_v4Extension
+	if len(name) == 0 {
+		return name
+	}
+	return strings.ToUpper(name[:1]) + name[1:] + "Extension"
+}
+
+// extractTypeDef extracts a type definition from a reflected schema by expected def name.
+// A reflected struct produces {"$ref":"#/$defs/X","$defs":{"X":{...}}}.
+// refPath is the $ref value (e.g. "#/$defs/X") — the def name is the last segment.
+func extractTypeDef(raw map[string]any, refPath string) (map[string]any, bool) {
+	defs, ok := raw["$defs"].(map[string]any)
+	if !ok || len(defs) == 0 {
+		return nil, false
+	}
+	// Extract def name from "#/$defs/X".
+	name := refPath
+	if idx := strings.LastIndex(refPath, "/"); idx >= 0 {
+		name = refPath[idx+1:]
+	}
+	if name == "" {
+		return nil, false
+	}
+	def, ok := defs[name].(map[string]any)
+	return def, ok
 }
 
 // generatePluginSchema returns a JSON Schema for a named plugin config file.
