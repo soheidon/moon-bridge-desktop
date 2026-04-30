@@ -15,6 +15,12 @@ server:
 
 trace_requests: false
 
+
+# Persistence layer: select active provider when multiple are enabled.
+# Leave empty to auto-select when only one is registered.
+persistence:
+  active_provider: db_sqlite
+
 extensions:
   deepseek_v4:
     config:
@@ -28,6 +34,28 @@ extensions:
       model: "kimi-for-coding"
       max_rounds: 4
       max_tokens: 2048
+  # Database provider: SQLite
+  db_sqlite:
+    enabled: true
+    config:
+      path: ./data/moonbridge.db
+      wal: true
+      busy_timeout_ms: 5000
+      max_open_conns: 1
+
+  # Database provider: Cloudflare D1 (Worker only)
+  # db_d1:
+  #   enabled: true
+  #   config:
+  #     binding: MOONBRIDGE_DB
+
+  # Persistence consumer: request metrics
+  metrics:
+    enabled: true
+    config:
+      default_limit: 100
+      max_limit: 1000
+
 
 provider:
   providers:
@@ -37,7 +65,7 @@ provider:
       version: "2023-06-01"
       user_agent: "moonbridge/1.0"
       web_search:
-        support: "disabled"
+        support: "auto"
       models:
         deepseek-v4-pro:
           context_window: 1000000
@@ -64,11 +92,34 @@ provider:
             output_price: 8
             cache_write_price: 1
             cache_read_price: 0.2
+        deepseek-v4-flash:
+          context_window: 1000000
+          max_output_tokens: 384000
+          display_name: "DeepSeek V4 Flash"
+          description: "DeepSeek V4 Flash with selectable high/xhigh reasoning effort."
+          extensions:
+            deepseek_v4:
+              enabled: true
+            visual:
+              enabled: true
+          default_reasoning_level: "high"
+          supported_reasoning_levels:
+            - effort: "high"
+              description: "High reasoning effort"
+            - effort: "xhigh"
+              description: "Extra high reasoning effort (maps to DeepSeek max)"
+          supports_reasoning_summaries: true
+          default_reasoning_summary: "auto"
+          web_search:
+            support: "auto"  # model-level override (auto / enabled / disabled / injected)
+          pricing:
+            input_price: 1
+            output_price: 2
+            cache_write_price: 1
+            cache_read_price: 0.02
     kimi:
-      # Anthropic-compatible base URL. Moon Bridge appends /v1/messages.
-      # If your Moonshot/Kimi account uses a regional domain, keep the
-      # Anthropic base shape so the final path is /anthropic/v1/messages.
-      base_url: "https://api.moonshot.ai/anthropic"
+      # Anthropic-compatible base URL for Kimi/Moonshot.
+      base_url: "https://api.kimi.com/coding/"
       api_key: "replace-with-kimi-api-key"
       version: "2023-06-01"
       user_agent: "moonbridge/1.0"
@@ -120,7 +171,7 @@ provider:
 
   routes:
     # Optional aliases. Provider models are listed directly in the Codex catalog
-    # as provider/upstream_model; routes only add friendly fallback names.
+    # as model(provider) format; routes only add friendly fallback names.
     moonbridge:
       to: "deepseek/deepseek-v4-pro"
     gpt-image:

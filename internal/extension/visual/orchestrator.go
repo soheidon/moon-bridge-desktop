@@ -225,13 +225,9 @@ func (o *Orchestrator) executeVisualTool(ctx context.Context, toolUse anthropic.
 	result, err := o.client.Analyze(ctx, request)
 	if err != nil {
 		logger.L().Warn("Visual tool execution failed", "tool", toolUse.Name, "error", err)
-		fmt.Fprintln(logger.Output(), "Visual tool execution failed:", toolUse.Name, err.Error())
-		logger.Flush()
 		return "Visual error: " + err.Error()
 	}
 	logger.L().Info("Visual tool executed", "tool", toolUse.Name, "images", len(request.Images))
-	fmt.Fprintln(logger.Output(), "Visual tool executed:", toolUse.Name)
-	logger.Flush()
 	switch toolUse.Name {
 	case ToolVisualBrief:
 		return "Visual Brief result:\n" + strings.TrimSpace(result)

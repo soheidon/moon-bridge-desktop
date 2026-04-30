@@ -40,7 +40,7 @@ end
 基础组件层，提供低级别能力：
 
 - **`internal/foundation/config`**：YAML 配置加载、结构校验、多模式支持。`FileConfig` 是 YAML 映射结构，`Config` 是运行时使用的扁平化/合并后结构。
-- **`internal/foundation/logger`**：基于 `slog` 的带缓冲日志系统，支持 `LogConsumer` 插件拦截日志条目。
+- **`internal/foundation/logger`**：基于 `slog` 的结构化日志系统，通过 `consumeHandler` 包装层支持插件日志消费管线。请求级日志通过 slog attrs 输出，支持 `text` 和 `json` 格式。
 - **`internal/foundation/openai`**：共享的 OpenAI Responses API DTO（`ResponsesRequest`、`Response`、`OutputItem`、`Usage`、`StreamEvent` 等），供 bridge、codex、server 等多个包引用，避免循环依赖。
 - **`internal/foundation/modelref`**：统一的模型引用解析器，支持 `provider/model` 和 `model(provider)` 两种格式。
 - **`internal/foundation/session`**：会话管理，携带 `ExtensionData` 用于插件的跨请求状态保持。
@@ -237,7 +237,7 @@ Moon Bridge 支持多提供商和多模型路由。配置通过 `provider.provid
 - 流式：设置 SSE 头后调用 Provider `StreamMessage()` → 收集所有 SSE 事件 → `Bridge.ConvertStreamEventsWithContext()` 批量转换 → 写入 SSE 流。服务端不再生成 synthetic commentary preamble，避免旧等待提示出现在 UI 或被后续 resume 带回上下文；历史中已存在的 `phase: "commentary"` 消息会在请求转换时跳过。
 - Anthropic 转换路径和 OpenAI Responses 直通路径的请求/响应都会经 trace 系统记录，成功和错误场景均写入 trace。
 - 成功请求输出可读 Usage 行，模型名使用实际发往上游的模型名，Billing 使用 session 累计费用。
-- `/v1/models` 端点返回 Codex `ModelsResponse` 格式（`{"models": [...]}`）。Provider 下声明的 `models` 是主数据源，会以 `provider/upstream_model` 形式完整写入；`routes` 只作为后置 fallback alias 补充。每个 `ModelInfo` 包含 Codex 反序列化所需的全部字段（`slug`、`shell_type`、`visibility`、`truncation_policy`、`supported_reasoning_levels` 等）。`truncation_policy` 使用非零默认 token limit，避免 Codex unified_exec 工具输出预算被夹成 0 后只返回 `…N tokens truncated…`。
+- `/v1/models` 端点返回 Codex `ModelsResponse` 格式（`{"models": [...]}`）。Provider 下声明的 `models` 是主数据源，会以 `model(provider)` 格式写入；`routes` 只作为后置 fallback alias 补充。每个 `ModelInfo` 包含 Codex 反序列化所需的全部字段（`slug`、`shell_type`、`visibility`、`truncation_policy`、`supported_reasoning_levels` 等）。`truncation_policy` 使用非零默认 token limit，避免 Codex unified_exec 工具输出预算被夹成 0 后只返回 `…N tokens truncated…`。
 - 错误处理分两层：
   - Bridge 层返回的 `RequestError` 直接转为 OpenAI 错误格式。
   - Anthropic Provider 错误通过 `ProviderError.OpenAIStatus()` 映射为等价 HTTP 状态码。
@@ -257,7 +257,7 @@ Moon Bridge 支持多提供商和多模型路由。配置通过 `provider.provid
 - `convertTools()` 根据 per-request `RequestOptions.WebSearchMode` 而非全局 config 决定 web search 行为。
 - `ToAnthropic()` 在基础工具转换后会调用启用插件的 `ToolInjector`，用于把插件提供的 Anthropic 工具追加到本轮请求。
 - **`FromAnthropicWithPlanAndContext()`**：将 Anthropic MessageResponse 转为 OpenAI Response。处理 tool_use → function_call / local_shell_call / custom_tool_call 映射，namespace function 回拆，web_search_call 过滤，usage 归一化。
-- **`ConvertStreamEventsWithContext()`**：逐事件将 Anthropic SSE 流转为 OpenAI 流。管理 content_block 级别的 state 跟踪，处理 text / tool_use / server_tool_use 三种 block 类型的流式拼接。
+- **`ConvertStreamEventsWithContext()`**：逐事件将 Anthropic SSE 流转为 OpenAI 流。管理 content_block 级别的 state 跟踪，处理 text / tool_use / server_tool_use 三种 block 类型的流式拼接。流式 usage 会兼容不同 Anthropic-compatible Provider 的事件布局：若 `message_start` 已携带 cache 字段则保留；若 `message_delta` 才补充 `cache_read_input_tokens` / `cache_creation_input_tokens`，则合并进最终 OpenAI `usage.input_tokens_details.cached_tokens`。
 - **`ConversionContext`**：缓存本轮请求的 custom tool 集合、grammar kind 和 namespace function 映射，确保 custom grammar 工具不被当成普通 function_call 处理，并能在响应侧拼回 raw custom input / 拆回 Codex namespace。
 - **`convertInput()`**：历史消息转换的关键逻辑：连续 `function_call` / `local_shell_call` 归并为同一个 assistant `tool_use` 消息，连续工具输出归并为随后的 user `tool_result` 消息。
 - **`ErrorResponse()`**：统一错误映射，区分请求校验错误和 Provider 错误。
@@ -319,8 +319,8 @@ session 级 token 和费用统计。
 请求/响应转储系统。
 
 - 目录结构：
-  - Transform 模式：`trace/Transform/{session_id}/{model}/Response/{n}.json` 和 `trace/Transform/{session_id}/{model}/Anthropic/{n}.json`
-  - Capture 模式：`trace/Capture/{Response|Anthropic}/{session_id}/{n}.json`
+  - Transform 模式：`data/trace/Transform/{session_id}/{model}/Response/{n}.json` 和 `data/trace/Transform/{session_id}/{model}/Anthropic/{n}.json`
+  - Capture 模式：`data/trace/Capture/{Response|Anthropic}/{session_id}/{n}.json`
 - 序列化时自动脱敏 `Authorization`、`x-api-key` 等敏感 Header（替换为 `[REDACTED]`）。
 - 文件权限 600，目录权限 700。
 
@@ -449,7 +449,11 @@ flowchart LR
 {UpstreamModel} Usage: {input_m} M Input, {output_m} M Output, Session Cache Hit Rate: {rate}%, Billing: {total} CNY
 ```
 
-其中 `{UpstreamModel}` 是实际转发到上游的模型名，`Billing` 是 session 累计费用。每请求 `Input` 展示采用 OpenAI 语义：`input_tokens + cache_read_input_tokens`，不把 `cache_creation_input_tokens` 额外计入展示值；cache creation 仍按 `cache_write_price` 计费，并保留在详细汇总里。
+其中 `{UpstreamModel}` 是实际转发到上游的模型名，`Billing` 是 session 累计费用。session stats 和 usage log 使用 Provider 计费维度：fresh input、cache creation、cache read、output 分别累计和计价；OpenAI Responses 的 fresh input 由 `usage.input_tokens - input_tokens_details.cached_tokens` 得到。Response normalized usage 只用于下游客户端兼容，不作为 stats 的计费输入。
+
+流式 Anthropic usage 的 cache 字段可能出现在 `message_start` 或后续 `message_delta`。Moon Bridge 会合并两处事件中的 `input_tokens`、`cache_read_input_tokens`、`cache_creation_input_tokens` 和 `output_tokens` 后再记录统计与输出 Responses usage，因此 Kimi for Coding 这类后置 cache usage 的 Provider 也能正确显示缓存命中率。
+
+metrics 扩展在 RequestCompletionHook 侧记录每次请求的观测数据，但 token 字段分成两层：`raw_*` 是 Provider 原始 telemetry，`normalized_*` 是 Moon Bridge 输出给下游客户端的兼容口径。Anthropic non-stream 直接来自 `MessageResponse.Usage`；Anthropic stream 会先合并 `message_start` / `message_delta`，并识别部分 Provider 在 `message_start.input_tokens` 中已包含 cache token 的布局，避免 normalized total 重复相加；`openai-response` 直通则从响应 body 或 SSE 的最后一个 usage 事件读取 OpenAI Responses 原始 usage。OpenAI Responses usage 没有 cache creation 字段，因此 metrics 对该协议的 `raw_cache_creation` / `normalized_cache_creation` 为 0。
 
 服务器关闭时输出完整会话费用汇总，包含按模型分组的费用明细和缓存命中率：
 

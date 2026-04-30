@@ -6,17 +6,27 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 )
 
 var defaultLogger *slog.Logger
-var defaultOutput io.Writer
-var defaultBuffer LogBuffer
+var defaultHandler *consumeHandler
+
+// LogEntry represents a single log entry passed through the consume pipeline.
+type LogEntry struct {
+	Timestamp time.Time
+	Level     slog.Level
+	Message   string
+	Attrs     []slog.Attr
+	Raw       []byte
+}
 
 func init() {
-	defaultOutput = os.Stderr
-	defaultLogger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
-	}))
+	})
+	defaultHandler = newConsumeHandler(h)
+	defaultLogger = slog.New(defaultHandler)
 }
 
 // Level represents a log level.
@@ -53,33 +63,27 @@ type Config struct {
 }
 
 // Init initializes the default logger from config.
+// The inner handler is wrapped with a consumeHandler so that plugins
+// registered via SetConsumeFunc receive every log record.
 func Init(cfg Config) error {
 	lvl, err := ParseLevel(string(cfg.Level))
 	if err != nil {
 		return err
 	}
-	if cfg.Output == nil {
-		cfg.Output = os.Stderr
-	}
-	defaultOutput = cfg.Output
-	oldBuffer := defaultBuffer
-	defaultBuffer = NewMemoryBuffer(cfg.Output)
-	if oldBuffer != nil {
-		if ob, ok := oldBuffer.(*memoryBuffer); ok {
-			if nb, ok := defaultBuffer.(*memoryBuffer); ok {
-				nb.consumeFunc = ob.consumeFunc
-			}
-		}
+	out := cfg.Output
+	if out == nil {
+		out = os.Stderr
 	}
 	opts := &slog.HandlerOptions{Level: lvl}
-	var handler slog.Handler
+	var inner slog.Handler
 	switch strings.ToLower(strings.TrimSpace(cfg.Format)) {
 	case "json":
-		handler = slog.NewJSONHandler(cfg.Output, opts)
+		inner = slog.NewJSONHandler(out, opts)
 	default:
-		handler = slog.NewTextHandler(cfg.Output, opts)
+		inner = slog.NewTextHandler(out, opts)
 	}
-	defaultLogger = slog.New(handler)
+	defaultHandler = newConsumeHandler(inner)
+	defaultLogger = slog.New(defaultHandler)
 	return nil
 }
 
@@ -88,32 +92,12 @@ func L() *slog.Logger {
 	return defaultLogger
 }
 
-// Output returns the writer used by the default logger.
-// After the unified logging system is enabled, this returns the buffer's
-// Writer; call Buffer().Flush() to write accumulated entries.
-func Output() io.Writer {
-	if defaultBuffer != nil {
-		return defaultBuffer.Writer()
-	}
-	return defaultOutput
-}
-
-// Buffer returns the default LogBuffer instance.
-func Buffer() LogBuffer {
-	return defaultBuffer
-}
-
-// Flush flushes the default log buffer. No-op if buffer is nil.
-func Flush() {
-	if defaultBuffer != nil {
-		defaultBuffer.Flush(nil)
-	}
-}
-
-// SetConsumeFunc sets a consume callback on the default buffer.
-func SetConsumeFunc(fn func([]LogEntry) []LogEntry) {
-	if b, ok := defaultBuffer.(*memoryBuffer); ok {
-		b.SetConsumeFunc(fn)
+// SetConsumeFunc registers a consume callback that is invoked for every
+// log record before it is serialized. The callback receives a single-entry
+// LogEntry slice and may return it modified (or empty to suppress).
+func SetConsumeFunc(fn ConsumeFunc) {
+	if defaultHandler != nil {
+		defaultHandler.SetConsumeFunc(fn)
 	}
 }
 

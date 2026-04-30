@@ -2,10 +2,14 @@ package plugin
 
 import (
 	"encoding/json"
+	"net/http"
+	"time"
 
 	"moonbridge/internal/foundation/logger"
 	"moonbridge/internal/foundation/openai"
 	"moonbridge/internal/protocol/anthropic"
+
+	foundationdb "moonbridge/internal/foundation/db"
 )
 
 // --- Request pipeline capabilities ---
@@ -117,11 +121,75 @@ type ReasoningExtractor interface {
 	ExtractThinkingBlock(ctx *RequestContext, summary []openai.ReasoningItemSummary) (anthropic.ContentBlock, bool)
 }
 
+// --- Request completion hook ---
+
+// RequestResult carries per-request outcome data for post-request hooks.
+type RequestResult struct {
+	Model         string
+	ActualModel   string
+	InputTokens   int
+	OutputTokens  int
+	CacheCreation int
+	CacheRead     int
+	Cost          float64
+	Status        string // "success" or "error"
+	ErrorMessage  string
+	Duration      time.Duration
+	Usage         RequestUsage
+}
+
+// RequestUsage carries both provider-native usage and normalized display usage.
+type RequestUsage struct {
+	Protocol    string
+	UsageSource string
+
+	RawInputTokens   int
+	RawOutputTokens  int
+	RawCacheCreation int
+	RawCacheRead     int
+
+	NormalizedInputTokens   int
+	NormalizedOutputTokens  int
+	NormalizedCacheCreation int
+	NormalizedCacheRead     int
+
+	RawUsageJSON json.RawMessage
+}
+
+// RequestCompletionHook is called after each request completes, regardless
+// of success or failure. Use for observability, metrics recording, etc.
+type RequestCompletionHook interface {
+	OnRequestCompleted(ctx *RequestContext, result RequestResult)
+}
+
+// --- HTTP route registration ---
+
+// RouteRegistrar allows plugins to register HTTP handlers on the server's
+// mux during initialization. The register function is goroutine-safe during
+// init time.
+type RouteRegistrar interface {
+	RegisterRoutes(register func(pattern string, handler http.Handler))
+}
+
 // --- Log pipeline capabilities ---
 
-// LogConsumer is called during LogBuffer.Flush before entries are written.
-// It can inspect, modify, or append log entries. Returned entries replace
-// the original batch for output.
+// LogConsumer is called for every slog log record via the consume pipeline.
+// Implementations receive LogEntry slices and may inspect, modify, or suppress them.
 type LogConsumer interface {
 	ConsumeLog(ctx *RequestContext, entries []logger.LogEntry) []logger.LogEntry
+}
+
+// --- Database capabilities ---
+
+// DBProvider is implemented by plugins that provide a database backend.
+// The returned Provider may be nil if the plugin is disabled or
+// unsupported in the current environment.
+type DBProvider interface {
+	DBProvider() foundationdb.Provider
+}
+
+// DBConsumer is implemented by plugins that need database persistence.
+// The returned Consumer may be nil if the plugin is disabled.
+type DBConsumer interface {
+	DBConsumer() foundationdb.Consumer
 }

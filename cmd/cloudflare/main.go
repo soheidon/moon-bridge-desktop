@@ -3,13 +3,14 @@
 package main
 
 import (
-	"log/slog"
+	"context"
 	"os"
 
 	"moonbridge/internal/service/app"
 
 	"moonbridge/internal/extension/pluginhooks"
 	"moonbridge/internal/foundation/config"
+	"moonbridge/internal/foundation/db"
 	"moonbridge/internal/foundation/logger"
 	"moonbridge/internal/protocol/anthropic"
 	"moonbridge/internal/protocol/bridge"
@@ -18,8 +19,11 @@ import (
 	"moonbridge/internal/service/server"
 	"moonbridge/internal/service/stats"
 
+	"database/sql"
 	"github.com/syumai/workers"
 	"github.com/syumai/workers/cloudflare"
+
+	"github.com/syumai/workers/cloudflare/d1"
 )
 
 func main() {
@@ -28,7 +32,7 @@ func main() {
 	//   wrangler secret put MOONBRIDGE_CONFIG < config.yml
 	rawConfig := cloudflare.Getenv("MOONBRIDGE_CONFIG")
 	if rawConfig == "" {
-		slog.Error("MOONBRIDGE_CONFIG environment variable is not set")
+		logger.Error("MOONBRIDGE_CONFIG environment variable is not set")
 		os.Exit(1)
 	}
 
@@ -36,12 +40,12 @@ func main() {
 		ExtensionSpecs: app.BuiltinExtensions().ConfigSpecs(),
 	})
 	if err != nil {
-		slog.Error("parse config", "error", err)
+		logger.Error("parse config", "error", err)
 		os.Exit(1)
 	}
 
 	if cfg.AuthToken == "" && !isDevEnv() {
-		slog.Error("Worker 生产环境必须配置认证：请在 server.auth_token 中设置 Bearer token，" +
+		logger.Error("Worker 生产环境必须配置认证：请在 server.auth_token 中设置 Bearer token，" +
 			"或通过 wrangler secret put MOONBRIDGE_CONFIG 注入包含 auth_token 的配置")
 		os.Exit(1)
 	}
@@ -51,7 +55,7 @@ func main() {
 	modelRoutes := buildModelRoutes(cfg)
 	providerMgr, err := provider.NewProviderManager(providerDefs, modelRoutes)
 	if err != nil {
-		slog.Error("init provider manager", "error", err)
+		logger.Error("init provider manager", "error", err)
 		os.Exit(1)
 	}
 
@@ -59,29 +63,65 @@ func main() {
 	defaultClient := resolveDefaultClient(providerMgr)
 
 	sessionStats := stats.NewSessionStats()
-	// Set per-model pricing.
+	// Create plugin catalog with D1 DB injection (when configured).
 	pricing := buildPricing(cfg)
 	if len(pricing) > 0 {
 		sessionStats.SetPricing(pricing)
 	}
-
-	// Register plugins.
-	plugins := app.BuiltinExtensions().NewRegistry(logger.L(), cfg)
+	cat := app.BuiltinExtensionCatalog{}
+	if d1Cfg := cfg.ExtensionRawConfig("db_d1", ""); len(d1Cfg) > 0 {
+		if binding, ok := d1Cfg["binding"].(string); ok && binding != "" {
+			if cfg.ExtensionEnabled("db_d1", "") {
+				cat.Opts.D1DB = func() *sql.DB {
+					c, err := d1.OpenConnector(binding)
+					if err != nil {
+						logger.Error("D1 connector", "error", err)
+						os.Exit(1)
+					}
+					return sql.OpenDB(c)
+				}()
+			}
+		}
+	}
+	plugins := cat.NewRegistry(logger.L(), cfg)
 	if err := plugins.InitAll(&cfg); err != nil {
-		slog.Error("init plugins", "error", err)
+		logger.Error("init plugins", "error", err)
 		os.Exit(1)
 	}
 
+	defer plugins.ShutdownAll()
+
+	// Wire plugin LogConsumer into the slog consume pipeline.
 	logger.SetConsumeFunc(func(entries []logger.LogEntry) []logger.LogEntry {
 		return plugins.ConsumeGlobalLog(entries)
 	})
 
+	// Initialize persistence layer (db.Registry).
+	ctx := context.Background()
+	dbRegistry := db.NewRegistry(logger.L())
+	for _, p := range plugins.DBProviders() {
+		if prov := p.DBProvider(); prov != nil {
+			dbRegistry.RegisterProvider(prov)
+		}
+	}
+	for _, c := range plugins.DBConsumers() {
+		if cons := c.DBConsumer(); cons != nil {
+			dbRegistry.RegisterConsumer(cons)
+		}
+	}
+	if err := dbRegistry.Init(ctx, cfg.Persistence.ActiveProvider); err != nil {
+		logger.Error("init persistence", "error", err)
+		os.Exit(1)
+	}
+	defer dbRegistry.Shutdown()
+
 	handler := server.New(server.Config{
-		Bridge:      bridge.New(cfg, cache.NewMemoryRegistry(), pluginhooks.PluginHooksFromRegistry(plugins)),
-		Provider:    defaultClient,
-		ProviderMgr: providerMgr,
-		Stats:       sessionStats,
-		AppConfig:   cfg,
+		Bridge:         bridge.New(cfg, cache.NewMemoryRegistry(), pluginhooks.PluginHooksFromRegistry(plugins)),
+		Provider:       defaultClient,
+		ProviderMgr:    providerMgr,
+		Stats:          sessionStats,
+		PluginRegistry: plugins,
+		AppConfig:      cfg,
 	})
 
 	workers.Serve(handler)
@@ -129,7 +169,6 @@ func buildPricing(cfg config.Config) map[string]stats.ModelPricing {
 			}
 		}
 	}
-	// Also index by provider/model and model(provider) slug.
 	for providerKey, def := range cfg.ProviderDefs {
 		for modelName, meta := range def.Models {
 			slug := providerKey + "/" + modelName
@@ -163,8 +202,6 @@ func resolveDefaultClient(pm *provider.ProviderManager) *anthropic.Client {
 	return client
 }
 
-// isDevEnv returns true when running in local dev mode (wrangler dev).
-// Production Workers do not include this variable.
 func isDevEnv() bool {
 	return cloudflare.Getenv("WORKER_ENV") == "development"
 }

@@ -71,6 +71,7 @@ type Config struct {
 	Routes         map[string]RouteEntry
 	ProviderDefs   map[string]ProviderDef
 	Cache          CacheConfig
+	Persistence    PersistenceConfig
 	ResponseProxy  ResponseProxyConfig
 	AnthropicProxy AnthropicProxyConfig
 	Extensions     map[string]ExtensionSettings
@@ -170,6 +171,11 @@ type AnthropicProxyConfig struct {
 type ReasoningLevelPreset struct {
 	Effort      string
 	Description string
+}
+
+// PersistenceConfig holds the persistence layer configuration.
+type PersistenceConfig struct {
+	ActiveProvider string
 }
 
 type CacheConfig struct {

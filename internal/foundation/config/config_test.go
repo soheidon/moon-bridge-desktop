@@ -523,11 +523,13 @@ provider:
 		t.Fatalf("LoadFromYAML() error = %v", err)
 	}
 	route := cfg.RouteFor("gpt-test")
-	if route.DisplayName != "Claude Test" {
-		t.Fatalf("DisplayName = %q", route.DisplayName)
+	// Route DisplayName/Description are no longer auto-copied from upstream model.
+	// They should be empty unless explicitly set in route config.
+	if route.DisplayName != "" {
+		t.Fatalf("DisplayName = %q, want empty", route.DisplayName)
 	}
-	if route.Description != "A test model" {
-		t.Fatalf("Description = %q", route.Description)
+	if route.Description != "" {
+		t.Fatalf("Description = %q, want empty", route.Description)
 	}
 	if route.DefaultReasoningLevel != "medium" {
 		t.Fatalf("DefaultReasoningLevel = %q", route.DefaultReasoningLevel)

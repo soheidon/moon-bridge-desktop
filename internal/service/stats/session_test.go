@@ -36,8 +36,8 @@ func TestFormatUsageLine(t *testing.T) {
 	line := FormatUsageLine(UsageLineParams{
 		RequestModel: "moonbridge",
 		ActualModel:  "deepseek-v4-pro",
-		Usage: Usage{
-			InputTokens:              2_000_000,
+		BillingUsage: BillingUsage{
+			FreshInputTokens:         1_000_000,
 			CacheCreationInputTokens: 500_000,
 			CacheReadInputTokens:     500_000,
 			OutputTokens:             250_000,
@@ -63,6 +63,64 @@ func TestFormatUsageLine(t *testing.T) {
 		if !strings.Contains(line, want) {
 			t.Fatalf("usage line missing %q: %s", want, line)
 		}
+	}
+}
+
+func TestBillingUsageFromLegacyUsage(t *testing.T) {
+	usage := Usage{
+		InputTokens:              2_000_000,
+		OutputTokens:             250_000,
+		CacheCreationInputTokens: 500_000,
+		CacheReadInputTokens:     500_000,
+	}.BillingUsage()
+	if usage.FreshInputTokens != 1_000_000 || usage.InputTokens() != 2_000_000 {
+		t.Fatalf("BillingUsage = %+v", usage)
+	}
+}
+
+func TestRecordBillingUsesRawFreshInputForCost(t *testing.T) {
+	s := NewSessionStats()
+	s.SetPricing(map[string]ModelPricing{
+		"model": {InputPrice: 10, OutputPrice: 40, CacheWritePrice: 5, CacheReadPrice: 2},
+	})
+	s.RecordBilling("model", "actual", BillingUsage{
+		FreshInputTokens:         10,
+		CacheCreationInputTokens: 30,
+		CacheReadInputTokens:     90,
+		OutputTokens:             12,
+	})
+	summary := s.Summary()
+	if summary.InputTokens != 130 || summary.CacheCreation != 30 || summary.CacheRead != 90 || summary.OutputTokens != 12 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	want := (10*10.0 + 30*5.0 + 90*2.0 + 12*40.0) / 1_000_000
+	if summary.TotalCost != want {
+		t.Fatalf("TotalCost = %f, want %f", summary.TotalCost, want)
+	}
+}
+
+func TestRecordBillingKimiStreamDoesNotDoubleCountCache(t *testing.T) {
+	s := NewSessionStats()
+	s.RecordBilling("kimi", "kimi-for-coding", BillingUsage{
+		FreshInputTokens:     574,
+		CacheReadInputTokens: 85248,
+		OutputTokens:         145,
+		ProviderInputTokens:  85822,
+	})
+	summary := s.Summary()
+	if summary.InputTokens != 85822 || summary.CacheRead != 85248 || summary.OutputTokens != 145 {
+		t.Fatalf("summary = %+v", summary)
+	}
+}
+
+func TestOpenAIStyleCachedUsageBilling(t *testing.T) {
+	usage := Usage{
+		InputTokens:          1_200_000,
+		OutputTokens:         500_000,
+		CacheReadInputTokens: 200_000,
+	}.BillingUsage()
+	if usage.FreshInputTokens != 1_000_000 || usage.CacheReadInputTokens != 200_000 {
+		t.Fatalf("BillingUsage = %+v", usage)
 	}
 }
 

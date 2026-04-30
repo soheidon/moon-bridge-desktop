@@ -19,6 +19,7 @@ import (
 
 	"moonbridge/internal/extension/visual"
 	"moonbridge/internal/foundation/config"
+	"moonbridge/internal/foundation/modelref"
 )
 
 // ModelInfo represents a model entry in the OpenAI /v1/models response.
@@ -79,13 +80,46 @@ type ReasoningLevelPresetDTO struct {
 	Description string `json:"description"`
 }
 
+// DisplayNameFromSlug converts a slug like "gpt-5.5-codex" to "GPT 5.5 Codex".
+func DisplayNameFromSlug(slug string) string {
+	slug = strings.ReplaceAll(slug, "-", " ")
+	words := strings.Fields(slug)
+	for i, w := range words {
+		lower := strings.ToLower(w)
+		if isASCIIGPTPrefix(lower) {
+			words[i] = "GPT" + w[3:]
+			continue
+		}
+		words[i] = asciiTitle(w)
+	}
+	return strings.Join(words, " ")
+}
+
+// asciiTitle upper-cases the first ASCII letter and lower-cases the rest.
+func asciiTitle(s string) string {
+	if s == "" {
+		return ""
+	}
+	return strings.ToUpper(s[:1]) + strings.ToLower(s[1:])
+}
+
+// isASCIIGPTPrefix reports whether s starts with "gpt" using ASCII byte match.
+// It returns false for strings shorter than 3 bytes or non-ASCII prefixes.
+func isASCIIGPTPrefix(s string) bool {
+	if len(s) < 3 {
+		return false
+	}
+	lower := strings.ToLower(s)
+	return lower[:3] == "gpt"
+}
+
 // BuildModelInfoFromRoute creates a Codex-compatible ModelInfo from a route entry.
+// ownedBy is kept for API compatibility but no longer affects displayName.
 func BuildModelInfoFromRoute(alias string, ownedBy string, route config.RouteEntry) ModelInfo {
 	displayName := route.DisplayName
 	if displayName == "" {
-		displayName = alias
+		displayName = DisplayNameFromSlug(alias)
 	}
-	displayName = displayName + "(" + ownedBy + ")"
 	return newModelInfo(alias, displayName, route.Description, route.ContextWindow,
 		route.DefaultReasoningLevel, route.SupportedReasoningLevels,
 		route.SupportsReasoningSummaries, route.DefaultReasoningSummary,
@@ -295,11 +329,16 @@ func valueOrDefault(value string, fallback string) string {
 func GenerateConfigToml(output io.Writer, modelAlias string, baseURL string, codexHome string, cfg config.Config) error {
 	route := cfg.RouteFor(modelAlias)
 
-	// Transform "provider/model" format to "model(provider)" for Codex display.
-	if provider, modelName := config.ParseModelRef(modelAlias); provider != "" {
-		modelAlias = modelName + "(" + provider + ")"
+	// When modelAlias is a direct provider/model reference (not a named route),
+	// normalize to model(provider) format so Codex can match it against catalog slugs.
+	catalogAlias := modelAlias
+	if _, isRoute := cfg.Routes[modelAlias]; !isRoute {
+		if provider, model := modelref.Parse(modelAlias); provider != "" {
+			catalogAlias = model + "(" + provider + ")"
+		}
 	}
-	fmt.Fprintf(output, "model = %q\n", modelAlias)
+
+	fmt.Fprintf(output, "model = %q\n", catalogAlias)
 	fmt.Fprintln(output, `model_provider = "moonbridge"`)
 	if route.ContextWindow > 0 {
 		fmt.Fprintf(output, "model_context_window = %d\n", route.ContextWindow)

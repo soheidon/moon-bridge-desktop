@@ -37,8 +37,8 @@ FakeHome
 # local runtime config with provider secrets
 config.yml
 config.yaml
+/data/
 /trace/
-/logs/
 .env
 docker-compose.yml
 

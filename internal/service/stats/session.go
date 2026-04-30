@@ -18,12 +18,45 @@ type ModelPricing struct {
 	CacheReadPrice  float64
 }
 
-// Usage represents token usage from an Anthropic response.
+// Usage represents legacy total-input usage.
+// New request accounting should prefer BillingUsage, which carries explicit
+// billing dimensions and does not need to infer fresh input from a total.
 type Usage struct {
 	InputTokens              int
 	OutputTokens             int
 	CacheCreationInputTokens int
 	CacheReadInputTokens     int
+}
+
+// BillingUsage is the provider billing view used for stats, logs and cost.
+type BillingUsage struct {
+	FreshInputTokens         int
+	OutputTokens             int
+	CacheCreationInputTokens int
+	CacheReadInputTokens     int
+	ProviderInputTokens      int
+}
+
+func (u Usage) BillingUsage() BillingUsage {
+	freshInput := u.InputTokens - u.CacheCreationInputTokens - u.CacheReadInputTokens
+	if freshInput < 0 {
+		freshInput = 0
+	}
+	return BillingUsage{
+		FreshInputTokens:         freshInput,
+		OutputTokens:             u.OutputTokens,
+		CacheCreationInputTokens: u.CacheCreationInputTokens,
+		CacheReadInputTokens:     u.CacheReadInputTokens,
+		ProviderInputTokens:      u.InputTokens,
+	}
+}
+
+func (u BillingUsage) InputTokens() int {
+	sum := u.FreshInputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
+	if u.ProviderInputTokens > sum {
+		return u.ProviderInputTokens
+	}
+	return sum
 }
 
 // SessionStats tracks cumulative token usage and cost across a session.
@@ -80,11 +113,18 @@ func (s *SessionStats) SetPricing(pricing map[string]ModelPricing) {
 // Record adds a usage record to the session stats.
 // If pricing is configured for the model, cost is computed automatically.
 func (s *SessionStats) Record(model string, actualModel string, usage Usage) {
+	s.RecordBilling(model, actualModel, usage.BillingUsage())
+}
+
+// RecordBilling adds provider billing usage to the session stats.
+// If pricing is configured for the model, cost is computed automatically.
+func (s *SessionStats) RecordBilling(model string, actualModel string, usage BillingUsage) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	inputTokens := usage.InputTokens()
 	s.totalRequests++
-	s.totalInputTokens += int64(usage.InputTokens)
+	s.totalInputTokens += int64(inputTokens)
 	s.totalOutputTokens += int64(usage.OutputTokens)
 	s.totalCacheCreation += int64(usage.CacheCreationInputTokens)
 	s.totalCacheRead += int64(usage.CacheReadInputTokens)
@@ -92,7 +132,7 @@ func (s *SessionStats) Record(model string, actualModel string, usage Usage) {
 	// Compute cost if pricing is available for this model
 	var cost float64
 	if p, ok := s.pricing[model]; ok {
-		cost = computeCost(usage, p)
+		cost = computeBillingCost(usage, p)
 		s.totalCost += cost
 	}
 
@@ -101,7 +141,7 @@ func (s *SessionStats) Record(model string, actualModel string, usage Usage) {
 			s.byModel[model] = &ModelStats{}
 		}
 		s.byModel[model].Requests++
-		s.byModel[model].InputTokens += int64(usage.InputTokens)
+		s.byModel[model].InputTokens += int64(inputTokens)
 		s.byModel[model].OutputTokens += int64(usage.OutputTokens)
 		s.byModel[model].CacheCreation += int64(usage.CacheCreationInputTokens)
 		s.byModel[model].CacheRead += int64(usage.CacheReadInputTokens)
@@ -117,10 +157,11 @@ func (s *SessionStats) Record(model string, actualModel string, usage Usage) {
 // computeCost calculates the cost in RMB for a single usage record.
 // All prices are per M tokens.
 func computeCost(usage Usage, p ModelPricing) float64 {
-	freshInput := float64(usage.InputTokens - usage.CacheCreationInputTokens - usage.CacheReadInputTokens)
-	if freshInput < 0 {
-		freshInput = 0
-	}
+	return computeBillingCost(usage.BillingUsage(), p)
+}
+
+func computeBillingCost(usage BillingUsage, p ModelPricing) float64 {
+	freshInput := float64(usage.FreshInputTokens)
 	cacheWrite := float64(usage.CacheCreationInputTokens)
 	cacheRead := float64(usage.CacheReadInputTokens)
 	output := float64(usage.OutputTokens)
@@ -221,6 +262,7 @@ type UsageLineParams struct {
 	RequestModel   string
 	ActualModel    string
 	Usage          Usage
+	BillingUsage   BillingUsage
 	RequestCost    float64
 	TotalCost      float64
 	CacheHitRate   float64
@@ -277,18 +319,24 @@ func FormatAvgCost(cost float64, tokens int64) string {
 // CacheRWRatio returns the cache read/write ratio (reads per write).
 // Returns 0 if no cache writes occurred.
 func CacheRWRatio(usage Usage) float64 {
+	return BillingCacheRWRatio(usage.BillingUsage())
+}
+
+func BillingCacheRWRatio(usage BillingUsage) float64 {
 	if usage.CacheCreationInputTokens == 0 {
 		return 0
 	}
 	return float64(usage.CacheReadInputTokens) / float64(usage.CacheCreationInputTokens)
 }
 
+// Deprecated: FormatUsageLine is retained for backward compatibility.
+// Request logging now uses structured slog attrs.
 func FormatUsageLine(p UsageLineParams) string {
-	rwRatio := CacheRWRatio(p.Usage)
-	freshInput := p.Usage.InputTokens - p.Usage.CacheCreationInputTokens - p.Usage.CacheReadInputTokens
-	if freshInput < 0 {
-		freshInput = 0
+	usage := p.BillingUsage
+	if usage == (BillingUsage{}) {
+		usage = p.Usage.BillingUsage()
 	}
+	rwRatio := BillingCacheRWRatio(usage)
 	return fmt.Sprintf(
 		"模型: %s ➡️ %s\n"+
 			"输入: 读取 %s + 写入 %s + 首次 %s\n"+
@@ -296,10 +344,10 @@ func FormatUsageLine(p UsageLineParams) string {
 			"计费: 本请求 %.4f 元, 累计 %.4f 元\n"+
 			"缓存: 命中率 %.2f%%, 写入率 %.2f%%, 读写比 %.2f",
 		p.RequestModel, p.ActualModel,
-		FormatTokenCount(int64(p.Usage.CacheReadInputTokens)),
-		FormatTokenCount(int64(p.Usage.CacheCreationInputTokens)),
-		FormatTokenCount(int64(freshInput)),
-		FormatTokenCount(int64(p.Usage.OutputTokens)),
+		FormatTokenCount(int64(usage.CacheReadInputTokens)),
+		FormatTokenCount(int64(usage.CacheCreationInputTokens)),
+		FormatTokenCount(int64(usage.FreshInputTokens)),
+		FormatTokenCount(int64(usage.OutputTokens)),
 		p.RequestCost, p.TotalCost,
 		p.CacheHitRate, p.CacheWriteRate, rwRatio,
 	)
@@ -323,6 +371,8 @@ type ErrorLineParams struct {
 	Message      string
 }
 
+// Deprecated: FormatErrorLine is retained for backward compatibility.
+// Error logging now uses structured slog attrs.
 func FormatErrorLine(p ErrorLineParams) string {
 	return fmt.Sprintf(
 		"模型: %s ➡️ %s\n"+
@@ -392,6 +442,13 @@ func WriteSummary(w io.Writer, s Summary) {
 // recording it in the session stats. Returns 0 if no pricing is configured
 // for the model.
 func (s *SessionStats) ComputeCost(model string, usage Usage) float64 {
+	return s.ComputeBillingCost(model, usage.BillingUsage())
+}
+
+// ComputeBillingCost returns the cost in RMB for a given model and billing
+// usage without recording it in the session stats. Returns 0 if no pricing is
+// configured for the model.
+func (s *SessionStats) ComputeBillingCost(model string, usage BillingUsage) float64 {
 	if s == nil {
 		return 0
 	}
@@ -401,5 +458,5 @@ func (s *SessionStats) ComputeCost(model string, usage Usage) float64 {
 	if !ok {
 		return 0
 	}
-	return computeCost(usage, p)
+	return computeBillingCost(usage, p)
 }

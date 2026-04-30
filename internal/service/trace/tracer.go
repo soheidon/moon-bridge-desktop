@@ -15,7 +15,7 @@ import (
 	"moonbridge/internal/foundation/logger"
 )
 
-const DefaultRoot = "trace"
+const DefaultRoot = "data" + "/" + "trace"
 
 type Config struct {
 	Enabled   bool

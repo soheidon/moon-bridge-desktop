@@ -22,7 +22,7 @@ flowchart LR
     subgraph fnd_c["foundation/\n基础组件"]
         direction TB
         fnd_c1["config/\n配置加载/校验"]
-        fnd_c2["logger/\n缓冲日志"]
+        fnd_c2["logger/\n结构化日志"]
         fnd_c3["modelref/\n模型引用解析"]
         fnd_c4["openai/\n共享 DTO"]
         fnd_c5["session/\n会话管理"]

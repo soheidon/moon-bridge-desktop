@@ -234,7 +234,7 @@ func (o *Orchestrator) StreamMessage(ctx context.Context, req anthropic.MessageR
 
 		req.Messages = append(req.Messages, anthropic.Message{
 			Role:    "assistant",
-			Content: toolUses,
+			Content: collectContentFromEvents(events),
 		})
 		req.Messages = append(req.Messages, anthropic.Message{
 			Role:    "user",
@@ -406,15 +406,135 @@ func collectStream(stream anthropic.Stream) ([]anthropic.StreamEvent, error) {
 	return events, nil
 }
 
-// collectToolUsesFromEvents extracts tool_use blocks from stream events.
+// streamContentBlock accumulates a content block from SSE events.
+type streamContentBlock struct {
+	block     anthropic.ContentBlock
+	input     strings.Builder
+	text      strings.Builder
+	thinking  strings.Builder
+	signature strings.Builder
+}
+
+// collectToolUsesFromEvents extracts tool_use blocks from stream events,
+// assembling the Input field from content_block_delta partial_json fragments.
 func collectToolUsesFromEvents(events []anthropic.StreamEvent) []anthropic.ContentBlock {
-	var toolUses []anthropic.ContentBlock
+	blockMap := make(map[int]*streamContentBlock)
+	order := make([]int, 0)
+
 	for _, event := range events {
-		if event.Type == "content_block_start" && event.ContentBlock != nil && event.ContentBlock.Type == "tool_use" {
-			toolUses = append(toolUses, *event.ContentBlock)
+		switch event.Type {
+		case "content_block_start":
+			if event.ContentBlock == nil || event.ContentBlock.Type != "tool_use" {
+				continue
+			}
+			if _, exists := blockMap[event.Index]; !exists {
+				order = append(order, event.Index)
+			}
+			block := *event.ContentBlock
+			block.Input = nil // Will be assembled from deltas
+			blockMap[event.Index] = &streamContentBlock{block: block}
+
+		case "content_block_delta":
+			if event.Delta.Type != "input_json_delta" || event.Delta.PartialJSON == "" {
+				continue
+			}
+			if current := blockMap[event.Index]; current != nil {
+				current.input.WriteString(event.Delta.PartialJSON)
+			}
 		}
 	}
+
+	toolUses := make([]anthropic.ContentBlock, 0, len(order))
+	for _, idx := range order {
+		current := blockMap[idx]
+		if current == nil {
+			continue
+		}
+		block := current.block
+		if current.input.Len() > 0 {
+			block.Input = json.RawMessage(current.input.String())
+		}
+		toolUses = append(toolUses, block)
+	}
 	return toolUses
+}
+
+// collectContentFromEvents reconstructs all content blocks from stream events,
+// assembling text from text_delta, thinking/signature from thinking_delta/signature_delta,
+// and input from input_json_delta.
+func collectContentFromEvents(events []anthropic.StreamEvent) []anthropic.ContentBlock {
+	blockMap := make(map[int]*streamContentBlock)
+	order := make([]int, 0)
+
+	for _, event := range events {
+		switch event.Type {
+		case "content_block_start":
+			if event.ContentBlock == nil {
+				continue
+			}
+			if _, exists := blockMap[event.Index]; !exists {
+				order = append(order, event.Index)
+			}
+			block := *event.ContentBlock
+			// Only clear fields for types we can reconstruct from deltas.
+			switch block.Type {
+			case "tool_use":
+				block.Input = nil
+			case "text":
+				block.Text = ""
+			case "thinking":
+				block.Thinking = ""
+				block.Signature = ""
+			}
+			blockMap[event.Index] = &streamContentBlock{block: block}
+
+		case "content_block_delta":
+			current := blockMap[event.Index]
+			if current == nil {
+				continue
+			}
+			if event.Delta.Text != "" {
+				current.text.WriteString(event.Delta.Text)
+			}
+			if event.Delta.Thinking != "" {
+				current.thinking.WriteString(event.Delta.Thinking)
+			}
+			if event.Delta.Signature != "" {
+				current.signature.WriteString(event.Delta.Signature)
+			}
+			if event.Delta.Type == "input_json_delta" && event.Delta.PartialJSON != "" {
+				current.input.WriteString(event.Delta.PartialJSON)
+			}
+		}
+	}
+
+	blocks := make([]anthropic.ContentBlock, 0, len(order))
+	for _, idx := range order {
+		current := blockMap[idx]
+		if current == nil {
+			continue
+		}
+		block := current.block
+		switch block.Type {
+		case "tool_use":
+			if current.input.Len() > 0 {
+				block.Input = json.RawMessage(current.input.String())
+			}
+		case "text":
+			if current.text.Len() > 0 {
+				block.Text = current.text.String()
+			}
+		case "thinking":
+			if current.thinking.Len() > 0 {
+				block.Thinking = current.thinking.String()
+			}
+			if current.signature.Len() > 0 {
+				block.Signature = current.signature.String()
+			}
+		}
+		blocks = append(blocks, block)
+	}
+	return blocks
 }
 
 // injectUsageIntoStart adds usage data to the message_start event.

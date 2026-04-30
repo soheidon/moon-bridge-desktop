@@ -54,6 +54,19 @@ func (provider *fakeProvider) StreamMessage(_ context.Context, request anthropic
 	return &sliceStream{events: provider.streamEvents}, nil
 }
 
+type providerFunc struct {
+	create func(context.Context, anthropic.MessageRequest) (anthropic.MessageResponse, error)
+	stream func(context.Context, anthropic.MessageRequest) (anthropic.Stream, error)
+}
+
+func (provider providerFunc) CreateMessage(ctx context.Context, request anthropic.MessageRequest) (anthropic.MessageResponse, error) {
+	return provider.create(ctx, request)
+}
+
+func (provider providerFunc) StreamMessage(ctx context.Context, request anthropic.MessageRequest) (anthropic.Stream, error) {
+	return provider.stream(ctx, request)
+}
+
 type sliceStream struct {
 	events []anthropic.StreamEvent
 	index  int
@@ -76,6 +89,28 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return fn(request)
+}
+
+type captureCompletionPlugin struct {
+	plugin.BasePlugin
+	result plugin.RequestResult
+	called bool
+}
+
+func (p *captureCompletionPlugin) Name() string { return "capture_completion" }
+func (p *captureCompletionPlugin) EnabledForModel(string) bool {
+	return true
+}
+func (p *captureCompletionPlugin) OnRequestCompleted(_ *plugin.RequestContext, result plugin.RequestResult) {
+	p.result = result
+	p.called = true
+}
+
+func registryWithCompletionCapture(t *testing.T, p *captureCompletionPlugin) *plugin.Registry {
+	t.Helper()
+	registry := plugin.NewRegistry(nil)
+	registry.Register(p)
+	return registry
 }
 
 func TestResponsesHandlerReturnsOpenAIResponse(t *testing.T) {
@@ -116,8 +151,166 @@ func TestResponsesHandlerReturnsOpenAIResponse(t *testing.T) {
 		t.Fatalf("response = %+v", response)
 	}
 	logStr := logOutput.String()
-	if !strings.Contains(logStr, "模型: gpt-test ➡️ claude-test") {
+	if !strings.Contains(logStr, "request_model=gpt-test") || !strings.Contains(logStr, "actual_model=claude-test") {
 		t.Fatalf("log should contain model routing, got: %s", logStr)
+	}
+}
+
+func TestResponsesHandlerCompletionMetricsUsesRawAnthropicUsage(t *testing.T) {
+	provider := &fakeProvider{}
+	providerResponseUsage := anthropic.Usage{
+		InputTokens:              10,
+		OutputTokens:             12,
+		CacheCreationInputTokens: 30,
+		CacheReadInputTokens:     90,
+	}
+	providerWithUsage := providerFunc{
+		create: func(_ context.Context, request anthropic.MessageRequest) (anthropic.MessageResponse, error) {
+			provider.request = request
+			return anthropic.MessageResponse{
+				ID:         "msg_123",
+				Type:       "message",
+				Role:       "assistant",
+				StopReason: "end_turn",
+				Content:    []anthropic.ContentBlock{{Type: "text", Text: "usage"}},
+				Usage:      providerResponseUsage,
+			}, nil
+		},
+	}
+	capture := &captureCompletionPlugin{}
+	sessionStats := stats.NewSessionStats()
+	handler := server.New(server.Config{
+		Bridge: bridge.New(config.Config{
+			Routes: map[string]config.RouteEntry{"gpt-test": {Provider: "default", Model: "claude-test"}},
+			Cache:  config.CacheConfig{Mode: "off"},
+		}, cache.NewMemoryRegistry(), bridge.PluginHooks{}),
+		Provider:       providerWithUsage,
+		Stats:          sessionStats,
+		PluginRegistry: registryWithCompletionCapture(t, capture),
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewBufferString(`{"model":"gpt-test","input":"Hello"}`))
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if !capture.called {
+		t.Fatal("completion hook was not called")
+	}
+	usage := capture.result.Usage
+	if usage.Protocol != "anthropic" || usage.UsageSource != "anthropic_response" {
+		t.Fatalf("usage source = %q/%q", usage.Protocol, usage.UsageSource)
+	}
+	if usage.RawInputTokens != 10 || usage.RawCacheCreation != 30 || usage.RawCacheRead != 90 || usage.RawOutputTokens != 12 {
+		t.Fatalf("raw usage = %+v", usage)
+	}
+	if usage.NormalizedInputTokens != 130 || capture.result.InputTokens != 130 {
+		t.Fatalf("normalized usage = %+v result=%+v", usage, capture.result)
+	}
+	summary := sessionStats.Summary()
+	if summary.InputTokens != 130 || summary.CacheCreation != 30 || summary.CacheRead != 90 || summary.OutputTokens != 12 {
+		t.Fatalf("summary = %+v", summary)
+	}
+}
+
+func TestStreamingCompletionMetricsMergesRawAnthropicDeltaUsage(t *testing.T) {
+	provider := &fakeProvider{
+		streamEvents: []anthropic.StreamEvent{
+			{Type: "message_start", Message: &anthropic.MessageResponse{ID: "msg_1", Type: "message", Role: "assistant", Usage: anthropic.Usage{InputTokens: 85822}}},
+			{Type: "content_block_start", Index: 0, ContentBlock: &anthropic.ContentBlock{Type: "text"}},
+			{Type: "content_block_delta", Index: 0, Delta: anthropic.StreamDelta{Type: "text_delta", Text: "Hi"}},
+			{Type: "content_block_stop", Index: 0},
+			{Type: "message_delta", Delta: anthropic.StreamDelta{StopReason: "end_turn"}, Usage: &anthropic.Usage{
+				InputTokens:          574,
+				OutputTokens:         145,
+				CacheReadInputTokens: 85248,
+			}},
+			{Type: "message_stop"},
+		},
+	}
+	capture := &captureCompletionPlugin{}
+	sessionStats := stats.NewSessionStats()
+	handler := server.New(server.Config{
+		Bridge: bridge.New(config.Config{
+			Routes: map[string]config.RouteEntry{"gpt-test": {Provider: "default", Model: "claude-test"}},
+			Cache:  config.CacheConfig{Mode: "off"},
+		}, cache.NewMemoryRegistry(), bridge.PluginHooks{}),
+		Provider:       provider,
+		Stats:          sessionStats,
+		PluginRegistry: registryWithCompletionCapture(t, capture),
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewBufferString(`{"model":"gpt-test","input":"Hello","stream":true}`))
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if !capture.called {
+		t.Fatal("completion hook was not called")
+	}
+	usage := capture.result.Usage
+	if usage.Protocol != "anthropic" || usage.UsageSource != "anthropic_stream" {
+		t.Fatalf("usage source = %q/%q", usage.Protocol, usage.UsageSource)
+	}
+	if usage.RawInputTokens != 85822 || usage.RawCacheRead != 85248 || usage.RawOutputTokens != 145 {
+		t.Fatalf("raw usage = %+v", usage)
+	}
+	if usage.NormalizedInputTokens != 85822 || capture.result.InputTokens != 85822 {
+		t.Fatalf("normalized usage = %+v result=%+v", usage, capture.result)
+	}
+	summary := sessionStats.Summary()
+	if summary.InputTokens != 85822 || summary.CacheRead != 85248 || summary.OutputTokens != 145 {
+		t.Fatalf("summary = %+v", summary)
+	}
+}
+
+func TestStreamingCompletionMetricsKeepsStartFreshInputForCacheOnlyDelta(t *testing.T) {
+	provider := &fakeProvider{
+		streamEvents: []anthropic.StreamEvent{
+			{Type: "message_start", Message: &anthropic.MessageResponse{ID: "msg_1", Type: "message", Role: "assistant", Usage: anthropic.Usage{InputTokens: 574}}},
+			{Type: "content_block_start", Index: 0, ContentBlock: &anthropic.ContentBlock{Type: "text"}},
+			{Type: "content_block_delta", Index: 0, Delta: anthropic.StreamDelta{Type: "text_delta", Text: "Hi"}},
+			{Type: "content_block_stop", Index: 0},
+			{Type: "message_delta", Delta: anthropic.StreamDelta{StopReason: "end_turn"}, Usage: &anthropic.Usage{
+				OutputTokens:         145,
+				CacheReadInputTokens: 85248,
+			}},
+			{Type: "message_stop"},
+		},
+	}
+	capture := &captureCompletionPlugin{}
+	sessionStats := stats.NewSessionStats()
+	handler := server.New(server.Config{
+		Bridge: bridge.New(config.Config{
+			Routes: map[string]config.RouteEntry{"gpt-test": {Provider: "default", Model: "claude-test"}},
+			Cache:  config.CacheConfig{Mode: "off"},
+		}, cache.NewMemoryRegistry(), bridge.PluginHooks{}),
+		Provider:       provider,
+		Stats:          sessionStats,
+		PluginRegistry: registryWithCompletionCapture(t, capture),
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewBufferString(`{"model":"gpt-test","input":"Hello","stream":true}`))
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	usage := capture.result.Usage
+	if usage.RawInputTokens != 574 || usage.RawCacheRead != 85248 || usage.RawOutputTokens != 145 {
+		t.Fatalf("raw usage = %+v", usage)
+	}
+	if usage.NormalizedInputTokens != 85822 || capture.result.InputTokens != 85822 {
+		t.Fatalf("normalized usage = %+v result=%+v", usage, capture.result)
+	}
+	summary := sessionStats.Summary()
+	if summary.InputTokens != 85822 || summary.CacheRead != 85248 || summary.OutputTokens != 145 {
+		t.Fatalf("summary = %+v", summary)
 	}
 }
 
@@ -297,6 +490,7 @@ func TestResponsesHandlerRejectsUnsupportedToolType(t *testing.T) {
 	handler := server.New(server.Config{
 		Bridge: bridge.New(config.Config{
 			DefaultMaxTokens: 1024,
+			Routes:           map[string]config.RouteEntry{"gpt-test": {Provider: "default", Model: "claude-test"}},
 			Cache:            config.CacheConfig{Mode: "off"},
 		}, cache.NewMemoryRegistry(), bridge.PluginHooks{}),
 		Provider: &fakeProvider{},
@@ -330,6 +524,7 @@ func TestResponsesHandlerStreamsOpenAIEvents(t *testing.T) {
 	handler := server.New(server.Config{
 		Bridge: bridge.New(config.Config{
 			DefaultMaxTokens: 1024,
+			Routes:           map[string]config.RouteEntry{"gpt-test": {Provider: "default", Model: "claude-test"}},
 			Cache:            config.CacheConfig{Mode: "off"},
 		}, cache.NewMemoryRegistry(), bridge.PluginHooks{}),
 		Provider: provider,
@@ -487,6 +682,7 @@ func TestResponsesHandlerPassesOpenAIProtocolThroughWithUpstreamModel(t *testing
 		},
 	})
 	sessionStats.Record("image", "", stats.Usage{InputTokens: 1_000_000})
+	capture := &captureCompletionPlugin{}
 	handler := server.New(server.Config{
 		Bridge: bridge.New(config.Config{
 			Routes: map[string]config.RouteEntry{
@@ -497,6 +693,7 @@ func TestResponsesHandlerPassesOpenAIProtocolThroughWithUpstreamModel(t *testing
 		ProviderMgr:      providerMgr,
 		OpenAIHTTPClient: httpClient,
 		Stats:            sessionStats,
+		PluginRegistry:   registryWithCompletionCapture(t, capture),
 	})
 
 	requestBody := bytes.NewBufferString(`{"model":"image","input":"draw"}`)
@@ -521,16 +718,85 @@ func TestResponsesHandlerPassesOpenAIProtocolThroughWithUpstreamModel(t *testing
 	if summary.TotalCost < 3.039999 || summary.TotalCost > 3.040001 {
 		t.Fatalf("TotalCost = %f, want 3.04", summary.TotalCost)
 	}
+	if !capture.called {
+		t.Fatal("completion hook was not called")
+	}
+	if capture.result.Usage.Protocol != config.ProtocolOpenAIResponse || capture.result.Usage.UsageSource != "openai_response" {
+		t.Fatalf("usage source = %+v", capture.result.Usage)
+	}
+	if capture.result.Usage.RawInputTokens != 1_200_000 || capture.result.Usage.RawCacheRead != 200_000 || capture.result.Usage.RawCacheCreation != 0 {
+		t.Fatalf("raw usage = %+v", capture.result.Usage)
+	}
 	for _, want := range []string{
-		"模型: image ➡️ gpt-image-1.5",
-		"输出: 500.00K",
-		"累计 3.0400 元",
-		"全局平均成本:",
-		"总token 2.70M",
+		"request_model=image",
+		"actual_model=gpt-image-1.5",
 	} {
 		if !strings.Contains(logOutput.String(), want) {
 			t.Fatalf("log missing %q: %s", want, logOutput.String())
 		}
+	}
+}
+
+func TestResponsesHandlerPassesOpenAIStreamUsageToMetrics(t *testing.T) {
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: io.NopCloser(strings.NewReader(strings.Join([]string{
+				`event: response.created`,
+				`data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`,
+				``,
+				`event: response.completed`,
+				`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":90,"output_tokens":7,"input_tokens_details":{"cached_tokens":40}}}}`,
+				``,
+			}, "\n"))),
+		}, nil
+	})}
+
+	providerMgr, err := provider.NewProviderManager(map[string]provider.ProviderConfig{
+		"openai": {
+			BaseURL:  "https://openai.example.test",
+			APIKey:   "openai-key",
+			Protocol: config.ProtocolOpenAIResponse,
+		},
+	}, map[string]provider.ModelRoute{
+		"gpt-direct": {Provider: "openai", Name: "gpt-upstream"},
+	})
+	if err != nil {
+		t.Fatalf("NewProviderManager() error = %v", err)
+	}
+	capture := &captureCompletionPlugin{}
+	handler := server.New(server.Config{
+		Bridge: bridge.New(config.Config{
+			Routes: map[string]config.RouteEntry{
+				"gpt-direct": {Provider: "openai", Model: "gpt-upstream"},
+			},
+			Cache: config.CacheConfig{Mode: "off"},
+		}, cache.NewMemoryRegistry(), bridge.PluginHooks{}),
+		ProviderMgr:      providerMgr,
+		OpenAIHTTPClient: httpClient,
+		PluginRegistry:   registryWithCompletionCapture(t, capture),
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewBufferString(`{"model":"gpt-direct","input":"hello","stream":true}`))
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if !capture.called {
+		t.Fatal("completion hook was not called")
+	}
+	usage := capture.result.Usage
+	if usage.Protocol != config.ProtocolOpenAIResponse || usage.UsageSource != "openai_sse" {
+		t.Fatalf("usage source = %+v", usage)
+	}
+	if usage.RawInputTokens != 90 || usage.RawOutputTokens != 7 || usage.RawCacheRead != 40 || usage.RawCacheCreation != 0 {
+		t.Fatalf("raw usage = %+v", usage)
+	}
+	if usage.NormalizedInputTokens != 90 || capture.result.InputTokens != 90 || usage.NormalizedCacheCreation != 0 {
+		t.Fatalf("normalized usage = %+v result=%+v", usage, capture.result)
 	}
 }
 
@@ -835,7 +1101,9 @@ func TestOpenAIResponsePassthroughDoesNotDuplicateWebSearch(t *testing.T) {
 func TestAuthWithNoTokenConfiguredPassesAllRequests(t *testing.T) {
 	handler := server.New(server.Config{
 		Bridge: bridge.New(config.Config{
-			Cache: config.CacheConfig{Mode: "off"},
+			Cache:            config.CacheConfig{Mode: "off"},
+			DefaultMaxTokens: 1024,
+			Routes:           map[string]config.RouteEntry{"gpt-test": {Provider: "default", Model: "claude-test"}},
 		}, cache.NewMemoryRegistry(), bridge.PluginHooks{}),
 		Provider: &fakeProvider{},
 	})

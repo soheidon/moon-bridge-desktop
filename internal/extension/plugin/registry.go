@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 
 	"moonbridge/internal/foundation/config"
 	"moonbridge/internal/foundation/logger"
@@ -14,21 +15,25 @@ import (
 // Registry holds registered plugins and dispatches to their capabilities.
 // Capability lists are populated at registration time via type assertions.
 type Registry struct {
-	plugins            []Plugin
-	inputPreprocessors []InputPreprocessor
-	requestMutators    []RequestMutator
-	toolInjectors      []ToolInjector
-	messageRewriters   []MessageRewriter
-	providerWrappers   []ProviderWrapper
-	contentFilters     []ContentFilter
-	responsePostProcs  []ResponsePostProcessor
-	contentRememberers []ContentRememberer
-	streamInterceptors []StreamInterceptor
-	errorTransformers  []ErrorTransformer
-	sessionProviders   []SessionStateProvider
-	logConsumers       []LogConsumer
-	configSpecs        []config.ExtensionConfigSpec
-	logger             *slog.Logger
+	plugins                []Plugin
+	inputPreprocessors     []InputPreprocessor
+	requestMutators        []RequestMutator
+	toolInjectors          []ToolInjector
+	messageRewriters       []MessageRewriter
+	providerWrappers       []ProviderWrapper
+	contentFilters         []ContentFilter
+	responsePostProcs      []ResponsePostProcessor
+	contentRememberers     []ContentRememberer
+	streamInterceptors     []StreamInterceptor
+	errorTransformers      []ErrorTransformer
+	sessionProviders       []SessionStateProvider
+	logConsumers           []LogConsumer
+	dbProviders            []DBProvider
+	dbConsumers            []DBConsumer
+	requestCompletionHooks []RequestCompletionHook
+	routeRegistrars        []RouteRegistrar
+	configSpecs            []config.ExtensionConfigSpec
+	logger                 *slog.Logger
 }
 
 // NewRegistry creates an empty plugin registry.
@@ -86,6 +91,18 @@ func (r *Registry) Register(p Plugin) {
 	}
 	if v, ok := p.(LogConsumer); ok {
 		r.logConsumers = append(r.logConsumers, v)
+	}
+	if v, ok := p.(DBProvider); ok {
+		r.dbProviders = append(r.dbProviders, v)
+	}
+	if v, ok := p.(DBConsumer); ok {
+		r.dbConsumers = append(r.dbConsumers, v)
+	}
+	if v, ok := p.(RequestCompletionHook); ok {
+		r.requestCompletionHooks = append(r.requestCompletionHooks, v)
+	}
+	if v, ok := p.(RouteRegistrar); ok {
+		r.routeRegistrars = append(r.routeRegistrars, v)
 	}
 }
 
@@ -372,6 +389,34 @@ func (r *Registry) ConsumeGlobalLog(entries []logger.LogEntry) []logger.LogEntry
 	return result
 }
 
+// OnRequestCompleted notifies all enabled RequestCompletionHook plugins.
+func (r *Registry) OnRequestCompleted(ctx *RequestContext, result RequestResult) {
+	if r == nil {
+		return
+	}
+	// Use the model alias from the result when ctx is nil.
+	model := result.Model
+	if ctx != nil {
+		model = ctx.ModelAlias
+	}
+	for _, p := range r.requestCompletionHooks {
+		if p.(Plugin).EnabledForModel(model) {
+			p.OnRequestCompleted(ctx, result)
+		}
+	}
+}
+
+// RegisterRoutes calls RegisterRoutes on all RouteRegistrar plugins, giving
+// each plugin the opportunity to mount HTTP handlers via the provided register function.
+func (r *Registry) RegisterRoutes(register func(pattern string, handler http.Handler)) {
+	if r == nil {
+		return
+	}
+	for _, p := range r.routeRegistrars {
+		p.RegisterRoutes(register)
+	}
+}
+
 // HasEnabled reports whether any plugin is enabled for the given model.
 func (r *Registry) HasEnabled(model string) bool {
 	if r == nil {
@@ -383,4 +428,45 @@ func (r *Registry) HasEnabled(model string) bool {
 		}
 	}
 	return false
+}
+
+// Plugin returns the registered plugin with the given name, or nil if not found.
+func (r *Registry) Plugin(name string) Plugin {
+	if r == nil {
+		return nil
+	}
+	for _, p := range r.plugins {
+		if p.Name() == name {
+			return p
+		}
+	}
+	return nil
+}
+
+// DBProviders returns the list of enabled DB provider plugins (nil-filtered).
+func (r *Registry) DBProviders() []DBProvider {
+	if r == nil {
+		return nil
+	}
+	var result []DBProvider
+	for _, p := range r.dbProviders {
+		if prov := p.DBProvider(); prov != nil {
+			result = append(result, p)
+		}
+	}
+	return result
+}
+
+// DBConsumers returns the list of enabled DB consumer plugins (nil-filtered).
+func (r *Registry) DBConsumers() []DBConsumer {
+	if r == nil {
+		return nil
+	}
+	var result []DBConsumer
+	for _, p := range r.dbConsumers {
+		if c := p.DBConsumer(); c != nil {
+			result = append(result, p)
+		}
+	}
+	return result
 }

@@ -33,12 +33,12 @@ func TestRunWritesWelcomeMessage(t *testing.T) {
 
 func TestCaptureTraceDirectoriesUseSession(t *testing.T) {
 	responseTracer := mbtrace.New(captureResponseTraceConfig(true))
-	if got, want := responseTracer.Directory(), filepath.Join("trace", "Capture", "Response", responseTracer.SessionID()); got != want {
+	if got, want := responseTracer.Directory(), filepath.Join("data", "trace", "Capture", "Response", responseTracer.SessionID()); got != want {
 		t.Fatalf("response trace directory = %q, want %q", got, want)
 	}
 
 	anthropicTracer := mbtrace.New(captureAnthropicTraceConfig(true))
-	if got, want := anthropicTracer.Directory(), filepath.Join("trace", "Capture", "Anthropic", anthropicTracer.SessionID()); got != want {
+	if got, want := anthropicTracer.Directory(), filepath.Join("data", "trace", "Capture", "Anthropic", anthropicTracer.SessionID()); got != want {
 		t.Fatalf("anthropic trace directory = %q, want %q", got, want)
 	}
 }
