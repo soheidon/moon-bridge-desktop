@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 
 	"moonbridge/internal/foundation/logger"
@@ -396,7 +397,7 @@ func collectStream(stream anthropic.Stream) ([]anthropic.StreamEvent, error) {
 	for {
 		event, err := stream.Next()
 		if err != nil {
-			if err.Error() == "EOF" {
+			if err == io.EOF {
 				break
 			}
 			return events, err
@@ -557,7 +558,7 @@ type staticStream struct {
 
 func (s *staticStream) Next() (anthropic.StreamEvent, error) {
 	if s.pos >= len(s.events) {
-		return anthropic.StreamEvent{}, fmt.Errorf("EOF")
+		return anthropic.StreamEvent{}, io.EOF
 	}
 	event := s.events[s.pos]
 	s.pos++
