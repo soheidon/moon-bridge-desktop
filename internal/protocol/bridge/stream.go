@@ -17,32 +17,54 @@ type StreamOptions struct {
 }
 
 func (bridge *Bridge) ConvertStreamEventsWithContext(events []anthropic.StreamEvent, model string, context codex.ConversionContext, extData map[string]any, opts ...StreamOptions) []openai.StreamEvent {
+	converter := NewStreamConverter(bridge, model, context, opts...)
+	var converted []openai.StreamEvent
+	for _, event := range events {
+		converted = append(converted, converter.ProcessEvent(event)...)
+	}
+	converter.Finalize(extData)
+	return converted
+}
+
+// StreamConverter processes Anthropic stream events incrementally so callers
+// can flush OpenAI response SSE events as soon as they are produced.
+type StreamConverter struct {
+	c *streamConverter
+}
+
+// NewStreamConverter creates a StreamConverter for the given model and context.
+func NewStreamConverter(bridge *Bridge, model string, context codex.ConversionContext, opts ...StreamOptions) *StreamConverter {
 	var opt StreamOptions
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
-	converter := streamConverter{
-		bridge:               bridge,
-		model:                model,
-		persistTextReasoning: opt.PersistFinalTextReasoning,
-		contentText:          map[int]string{},
-		toolArguments:        map[int]string{},
-		itemIDs:              map[int]string{},
-		outputIndexes:        map[int]int{},
-		extStreamStates:      bridge.hooks.NewStreamStates(model),
-		codexStream:          codex.NewStreamAdapter(context),
+	return &StreamConverter{
+		c: &streamConverter{
+			bridge:               bridge,
+			model:                model,
+			persistTextReasoning: opt.PersistFinalTextReasoning,
+			contentText:          map[int]string{},
+			toolArguments:        map[int]string{},
+			itemIDs:              map[int]string{},
+			outputIndexes:        map[int]int{},
+			extStreamStates:      bridge.hooks.NewStreamStates(model),
+			codexStream:          codex.NewStreamAdapter(context),
+		},
 	}
-	var converted []openai.StreamEvent
-	for _, event := range events {
-		converted = append(converted, converter.convert(event)...)
-	}
+}
 
-	// Let extensions persist stream state back to the session.
+// ProcessEvent converts a single Anthropic stream event into zero or more
+// OpenAI Response stream events.
+func (sc *StreamConverter) ProcessEvent(event anthropic.StreamEvent) []openai.StreamEvent {
+	return sc.c.convert(event)
+}
+
+// Finalize persists extension stream state after all events have been
+// processed.
+func (sc *StreamConverter) Finalize(extData map[string]any) {
 	if extData != nil {
-		bridge.hooks.OnStreamComplete(model, converter.extStreamStates, converter.response.OutputText, extData)
+		sc.c.bridge.hooks.OnStreamComplete(sc.c.model, sc.c.extStreamStates, sc.c.response.OutputText, extData)
 	}
-
-	return converted
 }
 
 type streamConverter struct {

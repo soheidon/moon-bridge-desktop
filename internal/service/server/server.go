@@ -520,32 +520,46 @@ func (server *Server) handleStream(writer http.ResponseWriter, request *http.Req
 	writer.WriteHeader(http.StatusOK)
 
 	var events []anthropic.StreamEvent
+	var openAIEvents []openai.StreamEvent
 	var streamErr string
+	converter := bridge.NewStreamConverter(
+		server.bridge,
+		responsesRequest.Model,
+		context,
+		bridge.StreamOptions{
+			PersistFinalTextReasoning: hasToolHistory(anthropicRequest.Messages),
+		},
+	)
 	for {
 		event, err := stream.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			events = append(events, anthropic.StreamEvent{Type: "error", Error: &anthropic.ErrorObject{Type: "provider_stream_error", Message: err.Error()}})
+			errEvent := anthropic.StreamEvent{Type: "error", Error: &anthropic.ErrorObject{Type: "provider_stream_error", Message: err.Error()}}
+			events = append(events, errEvent)
 			record.Error = traceError("provider_stream_next", err)
 			log.Error("流式读取错误", "error", err)
 			streamErr = err.Error()
+			result := converter.ProcessEvent(errEvent)
+			openAIEvents = append(openAIEvents, result...)
+			for _, oe := range result {
+				writeSSE(writer, oe)
+			}
 			break
 		}
 		events = append(events, event)
+		result := converter.ProcessEvent(event)
+		openAIEvents = append(openAIEvents, result...)
+		for _, oe := range result {
+			writeSSE(writer, oe)
+		}
 	}
 
-	openAIEvents := server.bridge.ConvertStreamEventsWithContext(events, responsesRequest.Model, context, sess.ExtensionData, bridge.StreamOptions{
-		PersistFinalTextReasoning: hasToolHistory(anthropicRequest.Messages),
-	})
+	converter.Finalize(sess.ExtensionData)
 	record.AnthropicStreamEvents = events
 	record.OpenAIStreamEvents = openAIEvents
 	server.writeTrace(record)
-
-	for _, event := range openAIEvents {
-		writeSSE(writer, event)
-	}
 	usage, billingUsage, inputIncludesCache := anthropicUsageFromStreamEvents(events)
 	if server.stats != nil {
 		server.stats.RecordBilling(responsesRequest.Model, anthropicRequest.Model, billingUsage)
