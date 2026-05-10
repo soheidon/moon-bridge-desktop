@@ -1,11 +1,3 @@
-Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
-
-if ($MyInvocation.InvocationName -eq ".") {
-    Write-Error "Do not dot-source this script; run it as .\scripts\start_codex_with_moonbridge.ps1 to avoid polluting your shell."
-    return
-}
-
 param(
     [Parameter(Mandatory = $true)]
     [string]$ProjectDirectory,
@@ -13,6 +5,14 @@ param(
     [Parameter(Mandatory = $false)]
     [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" })
 )
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+if ($MyInvocation.InvocationName -eq ".") {
+    Write-Error "Do not dot-source this script; run it as .\scripts\start_codex_with_moonbridge.ps1 to avoid polluting your shell."
+    return
+}
 
 $RootDir = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $ConfigFile = if ($env:MOONBRIDGE_CONFIG) { $env:MOONBRIDGE_CONFIG } else { Join-Path $RootDir "config.yml" }
@@ -493,7 +493,7 @@ Write-Log "Press Ctrl+C in this terminal to stop Moon Bridge and the launched Co
 Push-Location $RootDir
 $MoonBridgeStatus = 0
 try {
-    & $ServerBin $ServerBin --config $ConfigFile
+    & $ServerBin --config $ConfigFile
     $MoonBridgeStatus = $LASTEXITCODE
 } finally {
     Stop-CodexTerminal
