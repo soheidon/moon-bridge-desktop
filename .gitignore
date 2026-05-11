@@ -7,6 +7,7 @@ __pycache__/
 .DS_Store
 
 # Agent / AI assistant local files
+.planning/
 helloagents/
 AGENTS.md
 CLAUDE.md
@@ -49,7 +50,9 @@ docker-compose.yml
 node_modules/
 build/
 .wrangler/
+# WebUI build artifacts (source in webui/)
 
 # Wrangler dev vars
 .dev.vars
-moonbridge
+/moonbridge
+logs/

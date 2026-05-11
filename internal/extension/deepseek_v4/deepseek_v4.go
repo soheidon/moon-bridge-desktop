@@ -5,8 +5,9 @@ import (
 	"encoding/json"
 	"strings"
 
-	"moonbridge/internal/foundation/openai"
+	"moonbridge/internal/protocol/openai"
 	"moonbridge/internal/protocol/anthropic"
+	"moonbridge/internal/format"
 )
 
 // StripReasoningContent removes the reasoning_content field from message
@@ -118,11 +119,11 @@ func StreamDeltaForReasoning(delta anthropic.StreamDelta) string {
 
 // IsReasoningContentBlock reports whether a content block start event
 // represents reasoning content rather than normal text.
-func IsReasoningContentBlock(block *anthropic.ContentBlock) bool {
+func IsReasoningContentBlock(block *format.CoreContentBlock) bool {
 	if block == nil {
 		return false
 	}
-	return block.Type == "thinking" || block.Type == "reasoning_content"
+	return block.Type == "reasoning" || block.Type == "reasoning_content"
 }
 
 func firstNonEmpty(values ...string) string {

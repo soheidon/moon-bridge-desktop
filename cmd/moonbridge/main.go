@@ -10,9 +10,10 @@ import (
 	"os/signal"
 	"syscall"
 
+	"log/slog"
 	"moonbridge/internal/extension/codex"
-	"moonbridge/internal/foundation/config"
-	"moonbridge/internal/foundation/logger"
+	"moonbridge/internal/config"
+	"moonbridge/internal/logger"
 	"moonbridge/internal/service/app"
 )
 
@@ -81,7 +82,7 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 			"检查 log.level 和 log.format 是否为支持的取值。")
 		return exitStartupErr
 	}
-	logger.Info("配置已加载", "path", resolvedConfigPath, "mode", cfg.Mode, "addr", cfg.Addr)
+	slog.Info("配置已加载", "path", resolvedConfigPath, "mode", cfg.Mode, "addr", cfg.Addr)
 	if *mode != "" {
 		cfg.Mode = config.Mode(*mode)
 		if err := cfg.Validate(); err != nil {
@@ -115,7 +116,8 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 		return exitOK
 	}
 	if *printCodexConfig != "" {
-		if err := codex.GenerateConfigToml(stdout, *printCodexConfig, *codexBaseURL, *codexHome, cfg); err != nil {
+		if err := codex.GenerateConfigToml(stdout, *printCodexConfig, *codexBaseURL, *codexHome,
+			config.ProviderFromGlobalConfig(&cfg), config.ServerFromGlobalConfig(&cfg)); err != nil {
 			writeStartupError(stderr, "生成 Codex 配置失败", resolvedConfigPath, err,
 				"确认 -codex-home 目录可写，或去掉 -codex-home 只打印 config.toml。")
 			return exitRuntimeErr

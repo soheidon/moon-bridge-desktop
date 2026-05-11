@@ -6,7 +6,7 @@ import (
 
 	dbsqlite "moonbridge/internal/extension/db/sqlite"
 	"moonbridge/internal/extension/plugin"
-	"moonbridge/internal/foundation/config"
+	"moonbridge/internal/config"
 )
 
 func TestName(t *testing.T) {

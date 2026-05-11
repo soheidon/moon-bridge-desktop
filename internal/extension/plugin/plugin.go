@@ -9,7 +9,7 @@ package plugin
 import (
 	"log/slog"
 
-	"moonbridge/internal/foundation/config"
+	"moonbridge/internal/config"
 )
 
 // Plugin is the base interface all plugins must implement.

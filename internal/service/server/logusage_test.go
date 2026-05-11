@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"moonbridge/internal/foundation/logger"
+	"moonbridge/internal/logger"
 	"moonbridge/internal/service/stats"
 )
 

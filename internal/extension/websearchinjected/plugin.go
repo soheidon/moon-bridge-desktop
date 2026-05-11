@@ -2,8 +2,10 @@ package websearchinjected
 
 import (
 	"moonbridge/internal/extension/plugin"
-	"moonbridge/internal/extension/websearch"
 	"moonbridge/internal/protocol/anthropic"
+	"moonbridge/internal/service/provider"
+	"moonbridge/internal/extension/websearch"
+	"moonbridge/internal/format"
 )
 
 const PluginName = "web_search_injected"
@@ -26,23 +28,33 @@ func (p *WSInjectedPlugin) EnabledForModel(model string) bool { return p.isEnabl
 
 // --- ToolInjector ---
 
-func (p *WSInjectedPlugin) InjectTools(ctx *plugin.RequestContext) []anthropic.Tool {
-	return InjectTools(ctx.WebSearch.FirecrawlKey)
+func (p *WSInjectedPlugin) InjectTools(ctx *plugin.RequestContext) []format.CoreTool {
+	return CoreTools(ctx.WebSearch.FirecrawlKey)
 }
 
 // --- ProviderWrapper ---
 
-func (p *WSInjectedPlugin) WrapProvider(ctx *plugin.RequestContext, provider any) any {
-	client, ok := provider.(*anthropic.Client)
-	if !ok {
-		return provider
+func (p *WSInjectedPlugin) WrapProvider(ctx *plugin.RequestContext, wrapped any) any {
+	// Try AnthropicClientAccessor first (for ProviderClient-wrapped clients).
+	if acc, ok := wrapped.(provider.AnthropicClientAccessor); ok {
+		client := acc.AnthropicClient()
+		return websearch.NewInjectedOrchestrator(websearch.OrchestratorConfig{
+			Anthropic:       client,
+			TavilyKey:       "", // resolved from config at call site
+			FirecrawlKey:    ctx.WebSearch.FirecrawlKey,
+			SearchMaxRounds: 5,
+		})
 	}
-	return websearch.NewInjectedOrchestrator(websearch.OrchestratorConfig{
-		Anthropic:       client,
-		TavilyKey:       "", // resolved from config at call site
-		FirecrawlKey:    ctx.WebSearch.FirecrawlKey,
-		SearchMaxRounds: 5,
-	})
+	// Fall back to direct *anthropic.Client assertion.
+	if client, ok := wrapped.(*anthropic.Client); ok {
+		return websearch.NewInjectedOrchestrator(websearch.OrchestratorConfig{
+			Anthropic:       client,
+			TavilyKey:       "", // resolved from config at call site
+			FirecrawlKey:    ctx.WebSearch.FirecrawlKey,
+			SearchMaxRounds: 5,
+		})
+	}
+	return wrapped
 }
 
 // Compile-time interface checks.

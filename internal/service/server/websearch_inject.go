@@ -1,0 +1,645 @@
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"log/slog"
+	"moonbridge/internal/extension/websearch"
+	"moonbridge/internal/protocol/chat"
+	"moonbridge/internal/protocol/google"
+	openai "moonbridge/internal/protocol/openai"
+)
+
+// ============================================================================
+// Injected Web Search Orchestration (shared by chat + google protocols)
+// ============================================================================
+
+// hasWebSearchTool checks whether the OpenAI request includes web_search tools.
+func hasWebSearchTool(req openai.ResponsesRequest) bool {
+	for _, t := range req.Tools {
+		if t.Type == "web_search" || t.Type == "web_search_preview" {
+			return true
+		}
+	}
+	return false
+}
+
+// maxSearchRounds returns the configured max search rounds from the server config.
+func (s *Server) maxSearchRounds() int {
+	rounds := 5
+	if s.runtime != nil {
+		rounds = s.runtime.Current().Config.SearchMaxRounds
+	}
+	if rounds <= 0 {
+		rounds = 5
+	}
+	return rounds
+}
+
+// ============================================================================
+// Chat (openai-chat) protocol injected search
+// ============================================================================
+
+// injectChatSearchTools adds tavily_search / firecrawl_fetch function tools
+// to the Chat request when the original request requested web_search.
+func injectChatSearchTools(req *chat.ChatRequest, firecrawlKey string) {
+	// Remove existing web_search tools (they'll be replaced with injected ones).
+	filtered := make([]chat.ChatTool, 0, len(req.Tools))
+	for _, t := range req.Tools {
+		if t.Function.Name == "web_search" || t.Function.Name == "web_search_preview" {
+			continue
+		}
+		filtered = append(filtered, t)
+	}
+	req.Tools = filtered
+
+	tools := make([]chat.ChatTool, 0, 2)
+	tools = append(tools, chat.ChatTool{
+		Type: "function",
+		Function: chat.FunctionDef{
+			Name:        "tavily_search",
+			Description: "Search the web using Tavily. Returns search results with titles, URLs, and content snippets. Call this when you need up-to-date information from the internet.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"query":       map[string]any{"type": "string", "description": "Search query (required)."},
+					"max_results": map[string]any{"type": "integer", "description": "Maximum number of results.", "default": 5},
+				},
+				"required": []string{"query"},
+			},
+		},
+	})
+	if firecrawlKey != "" {
+		tools = append(tools, chat.ChatTool{
+			Type: "function",
+			Function: chat.FunctionDef{
+				Name:        "firecrawl_fetch",
+				Description: "Fetch and extract the full content of a web page as clean markdown using Firecrawl.",
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"url": map[string]any{"type": "string", "description": "URL of the web page to fetch."},
+					},
+					"required": []string{"url"},
+				},
+			},
+		})
+	}
+		req.Tools = append(req.Tools, tools...)
+}
+
+// executeChatSearchLoop implements the multi-round search loop for Chat protocol.
+func (s *Server) executeChatSearchLoop(
+	ctx context.Context,
+	client *chat.Client,
+	req *chat.ChatRequest,
+	tavilyKey, firecrawlKey string,
+	maxRounds int,
+) (*chat.ChatResponse, error) {
+	log := slog.Default()
+	tavily := websearch.NewTavilyClient(tavilyKey)
+	var firecrawl *websearch.FirecrawlClient
+	if firecrawlKey != "" {
+		firecrawl = websearch.NewFirecrawlClient(firecrawlKey)
+	}
+
+	for round := 0; round <= maxRounds; round++ {
+		resp, err := client.CreateChat(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		if len(resp.Choices) == 0 {
+			return resp, nil
+		}
+
+		msg := resp.Choices[0].Message
+		if len(msg.ToolCalls) == 0 {
+			return resp, nil
+		}
+
+		// Filter search vs non-search tool calls.
+		var searchCalls, nonSearchCalls []chat.ToolCall
+		for _, tc := range msg.ToolCalls {
+			switch tc.Function.Name {
+			case "tavily_search", "firecrawl_fetch":
+				searchCalls = append(searchCalls, tc)
+			case "web_search", "web_search_preview":
+				searchCalls = append(searchCalls, tc)
+			default:
+				nonSearchCalls = append(nonSearchCalls, tc)
+			}
+		}
+		if len(searchCalls) == 0 {
+			return resp, nil
+		}
+		if len(nonSearchCalls) > 0 {
+			return resp, nil
+		}
+
+		// Execute search/fetch calls.
+		var toolResultMsgs []chat.ChatMessage
+		for _, tc := range searchCalls {
+			result, execErr := executeChatSearchCall(ctx, tavily, firecrawl, tc)
+			if execErr != nil {
+				log.Warn("搜索执行失败", "tool", tc.Function.Name, "error", execErr)
+				result = fmt.Sprintf("Search error: %s", execErr.Error())
+			}
+			toolResultMsgs = append(toolResultMsgs, chat.ChatMessage{
+				Role:       "tool",
+				ToolCallID: tc.ID,
+				Content:    result,
+			})
+		}
+
+		// Append original assistant message (preserving reasoning_content etc.)
+		// and tool results for next round.
+		req.Messages = append(req.Messages, msg)
+		req.Messages = append(req.Messages, toolResultMsgs...)
+
+		log.Debug("Chat 搜索循环轮次", "round", round+1, "tools_executed", len(searchCalls))
+	}
+	return nil, fmt.Errorf("chat search loop exceeded max rounds (%d)", maxRounds)
+}
+
+func executeChatSearchCall(
+	ctx context.Context,
+	tavily *websearch.TavilyClient,
+	firecrawl *websearch.FirecrawlClient,
+	tc chat.ToolCall,
+) (string, error) {
+	// Chat API returns function.arguments as a JSON string. When decoded as
+	// json.RawMessage, the outer quotes are preserved. Unquote before parsing.
+	args := unquoteRawJSON(tc.Function.Arguments)
+
+	switch tc.Function.Name {
+	case "tavily_search", "web_search", "web_search_preview":
+		var params struct {
+			Query      string `json:"query"`
+			MaxResults int    `json:"max_results"`
+		}
+		if err := json.Unmarshal(args, &params); err != nil {
+			return "", fmt.Errorf("parse search params: %w", err)
+		}
+		if params.Query == "" {
+			return "", fmt.Errorf("search: query is required")
+		}
+		result, err := tavily.Search(ctx, websearch.SearchRequest{
+			Query:      params.Query,
+			MaxResults: params.MaxResults,
+		})
+		if err != nil {
+			return "", err
+		}
+		return formatTavilyResults(result), nil
+
+	case "firecrawl_fetch":
+		if firecrawl == nil {
+			return "", fmt.Errorf("firecrawl not configured")
+		}
+		var params struct {
+			URL string `json:"url"`
+		}
+		if err := json.Unmarshal(args, &params); err != nil {
+			return "", fmt.Errorf("parse fetch params: %w", err)
+		}
+		if params.URL == "" {
+			return "", fmt.Errorf("fetch: url is required")
+		}
+		result, err := firecrawl.Fetch(ctx, websearch.FetchRequest{
+			URL:             params.URL,
+			Formats:         []string{"markdown"},
+			OnlyMainContent: true,
+		})
+		if err != nil {
+			return "", err
+		}
+		return formatFirecrawlResult(result), nil
+
+	default:
+		return "", fmt.Errorf("unknown search tool: %s", tc.Function.Name)
+	}
+}
+
+// ============================================================================
+// Google GenAI protocol injected search
+// ============================================================================
+
+// injectGoogleSearchTools adds tavily_search / firecrawl_fetch function
+// declarations to the Google GenerateContent request.
+func injectGoogleSearchTools(req *google.GenerateContentRequest, firecrawlKey string) {
+	// Remove any existing tool that has a "web_search" function declaration.
+	filtered := make([]google.Tool, 0, len(req.Tools))
+	for _, t := range req.Tools {
+		hasWebSearch := false
+		for _, fd := range t.FunctionDeclarations {
+			if fd.Name == "web_search" || fd.Name == "web_search_preview" {
+				hasWebSearch = true
+				break
+			}
+		}
+		if !hasWebSearch {
+			filtered = append(filtered, t)
+		}
+	}
+	req.Tools = filtered
+
+	fds := []google.FunctionDeclaration{
+		{
+			Name:        "tavily_search",
+			Description: "Search the web using Tavily. Returns search results with titles, URLs, and content snippets.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"query":       map[string]any{"type": "string", "description": "Search query."},
+					"max_results": map[string]any{"type": "integer", "description": "Max results.", "default": 5},
+				},
+				"required": []string{"query"},
+			},
+		},
+	}
+	if firecrawlKey != "" {
+		fds = append(fds, google.FunctionDeclaration{
+			Name:        "firecrawl_fetch",
+			Description: "Fetch a web page content as markdown using Firecrawl.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"url": map[string]any{"type": "string", "description": "Page URL."},
+				},
+				"required": []string{"url"},
+			},
+		})
+	}
+	req.Tools = append(req.Tools, google.Tool{
+		FunctionDeclarations: fds,
+	})
+}
+
+// executeGoogleSearchLoop implements the multi-round search loop for Google GenAI.
+func (s *Server) executeGoogleSearchLoop(
+	ctx context.Context,
+	client *google.Client,
+	model string,
+	req *google.GenerateContentRequest,
+	tavilyKey, firecrawlKey string,
+	maxRounds int,
+) (*google.GenerateContentResponse, error) {
+	log := slog.Default()
+	tavily := websearch.NewTavilyClient(tavilyKey)
+	var firecrawl *websearch.FirecrawlClient
+	if firecrawlKey != "" {
+		firecrawl = websearch.NewFirecrawlClient(firecrawlKey)
+	}
+
+	for round := 0; round <= maxRounds; round++ {
+		resp, err := client.GenerateContent(ctx, model, req)
+		if err != nil {
+			return nil, err
+		}
+		if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
+			return resp, nil
+		}
+
+		// Check for function call parts.
+		funcCalls := googleFuncCalls(resp.Candidates[0].Content.Parts)
+		if len(funcCalls) == 0 {
+			return resp, nil
+		}
+		searchCalls := filterGoogleSearchCalls(funcCalls)
+		nonSearchCalls := filterGoogleNonSearchCalls(funcCalls)
+		if len(searchCalls) == 0 {
+			return resp, nil
+		}
+		if len(nonSearchCalls) > 0 {
+			return resp, nil
+		}
+
+		// Execute search calls and build function responses.
+		responseParts := make([]google.Part, 0, len(searchCalls))
+		for _, fc := range searchCalls {
+			result, execErr := executeGoogleSearchCall(ctx, tavily, firecrawl, fc)
+			if execErr != nil {
+				log.Warn("Google 搜索执行失败", "tool", fc.Name, "error", execErr)
+				result = fmt.Sprintf("Search error: %s", execErr.Error())
+			}
+			respJSON, _ := json.Marshal(map[string]any{"result": result})
+			responseParts = append(responseParts, google.Part{
+				FunctionResponse: &google.FunctionResponse{
+					Name:     fc.Name,
+					Response: respJSON,
+				},
+			})
+		}
+
+		// Append model response + function response for next round.
+		req.Contents = append(req.Contents, google.Content{
+			Role:  "model",
+			Parts: resp.Candidates[0].Content.Parts,
+		})
+		req.Contents = append(req.Contents, google.Content{
+			Role:  "function",
+			Parts: responseParts,
+		})
+
+		log.Debug("Google 搜索循环轮次", "round", round+1, "tools_executed", len(searchCalls))
+	}
+	return nil, fmt.Errorf("google search loop exceeded max rounds (%d)", maxRounds)
+}
+
+func googleFuncCalls(parts []google.Part) []google.FunctionCall {
+	var calls []google.FunctionCall
+	for _, p := range parts {
+		if p.FunctionCall != nil {
+			calls = append(calls, *p.FunctionCall)
+		}
+	}
+	return calls
+}
+
+func filterGoogleSearchCalls(calls []google.FunctionCall) []google.FunctionCall {
+	var result []google.FunctionCall
+	for _, c := range calls {
+		if c.Name == "tavily_search" || c.Name == "firecrawl_fetch" {
+			result = append(result, c)
+		}
+	}
+	return result
+}
+
+func filterGoogleNonSearchCalls(calls []google.FunctionCall) []google.FunctionCall {
+	var result []google.FunctionCall
+	for _, c := range calls {
+		if c.Name != "tavily_search" && c.Name != "firecrawl_fetch" {
+			result = append(result, c)
+		}
+	}
+	return result
+}
+
+func executeGoogleSearchCall(
+	ctx context.Context,
+	tavily *websearch.TavilyClient,
+	firecrawl *websearch.FirecrawlClient,
+	fc google.FunctionCall,
+) (string, error) {
+	switch fc.Name {
+	case "tavily_search", "web_search", "web_search_preview":
+		var params struct {
+			Query      string `json:"query"`
+			MaxResults int    `json:"max_results"`
+		}
+		argsJSON, _ := json.Marshal(fc.Args)
+		if err := json.Unmarshal(argsJSON, &params); err != nil {
+			return "", fmt.Errorf("parse search params: %w", err)
+		}
+		if params.Query == "" {
+			return "", fmt.Errorf("search: query is required")
+		}
+		result, err := tavily.Search(ctx, websearch.SearchRequest{
+			Query:      params.Query,
+			MaxResults: params.MaxResults,
+		})
+		if err != nil {
+			return "", err
+		}
+		return formatTavilyResults(result), nil
+
+	case "firecrawl_fetch":
+		if firecrawl == nil {
+			return "", fmt.Errorf("firecrawl not configured")
+		}
+		var params struct {
+			URL string `json:"url"`
+		}
+		argsJSON, _ := json.Marshal(fc.Args)
+		if err := json.Unmarshal(argsJSON, &params); err != nil {
+			return "", fmt.Errorf("parse fetch params: %w", err)
+		}
+		if params.URL == "" {
+			return "", fmt.Errorf("fetch: url is required")
+		}
+		result, err := firecrawl.Fetch(ctx, websearch.FetchRequest{
+			URL:             params.URL,
+			Formats:         []string{"markdown"},
+			OnlyMainContent: true,
+		})
+		if err != nil {
+			return "", err
+		}
+		return formatFirecrawlResult(result), nil
+
+	default:
+		return "", fmt.Errorf("unknown search tool: %s", fc.Name)
+	}
+}
+
+// ============================================================================
+// Formatting helpers (duplicated from websearch package for encapsulation)
+// ============================================================================
+
+func formatTavilyResults(result *websearch.SearchResult) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("Search results for %q:\n\n", result.Query))
+	if result.Answer != "" {
+		b.WriteString("Answer: ")
+		b.WriteString(truncate(result.Answer, 2000))
+		b.WriteString("\n\n")
+	}
+	for i, item := range result.Results {
+		if i >= 10 {
+			break
+		}
+		b.WriteString(fmt.Sprintf("%d. [%s](%s)\n", i+1, item.Title, item.URL))
+		b.WriteString(fmt.Sprintf("   Score: %.2f\n", item.Score))
+		b.WriteString(fmt.Sprintf("   %s\n\n", truncate(item.Content, 500)))
+	}
+	return b.String()
+}
+
+func formatFirecrawlResult(result *websearch.FetchResult) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("Content from %s:\n\n", result.Data.Metadata.SourceURL))
+	if result.Data.Metadata.Title != "" {
+		b.WriteString(fmt.Sprintf("Title: %s\n\n", result.Data.Metadata.Title))
+	}
+	b.WriteString(truncate(result.Data.Markdown, 8000))
+	return b.String()
+}
+
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+// ============================================================================
+// Chat streaming search loop
+// ============================================================================
+
+// chatSearchBufferedStream implements a streaming search loop by buffering
+// ChatStreamChunk events, detecting search tool calls, executing them, and
+// continuing the conversation until no more search tools are called.
+// Returns a channel that replays all events from all rounds as a single stream.
+func (s *Server) chatSearchBufferedStream(
+	ctx context.Context,
+	client *chat.Client,
+	req *chat.ChatRequest,
+	tavilyKey, firecrawlKey string,
+	maxRounds int,
+) (<-chan chat.ChatStreamChunk, error) {
+	log := slog.Default()
+	tavily := websearch.NewTavilyClient(tavilyKey)
+	var firecrawl *websearch.FirecrawlClient
+	if firecrawlKey != "" {
+		firecrawl = websearch.NewFirecrawlClient(firecrawlKey)
+	}
+
+	allEvents := make([]chat.ChatStreamChunk, 0, 128)
+	for round := 0; round <= maxRounds; round++ {
+		stream, err := client.StreamChat(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+
+		events, roundErr := collectChatStream(ctx, stream)
+		if roundErr != nil {
+			return nil, roundErr
+		}
+
+		// Check for tool calls in the last chunk with choices.
+		toolCalls := lastChunkToolCalls(events)
+		if len(toolCalls) == 0 {
+			allEvents = append(allEvents, events...)
+			break
+		}
+
+		// Filter search vs non-search tool calls.
+		var searchCalls, nonSearchCalls []chat.ToolCall
+		for _, tc := range toolCalls {
+			switch tc.Function.Name {
+			case "tavily_search", "firecrawl_fetch":
+				searchCalls = append(searchCalls, tc)
+			case "web_search", "web_search_preview":
+				searchCalls = append(searchCalls, tc)
+			default:
+				nonSearchCalls = append(nonSearchCalls, tc)
+			}
+		}
+		if len(searchCalls) == 0 {
+			allEvents = append(allEvents, events...)
+			break
+		}
+		if len(nonSearchCalls) > 0 {
+			allEvents = append(allEvents, events...)
+			break
+		}
+
+		// Execute search calls.
+		var toolResultMsgs []chat.ChatMessage
+		for _, tc := range searchCalls {
+			result, execErr := executeChatSearchCall(ctx, tavily, firecrawl, tc)
+			if execErr != nil {
+				log.Warn("搜索执行失败", "tool", tc.Function.Name, "error", execErr)
+				result = fmt.Sprintf("Search error: %s", execErr.Error())
+			}
+			toolResultMsgs = append(toolResultMsgs, chat.ChatMessage{
+				Role:       "tool",
+				ToolCallID: tc.ID,
+				Content:    result,
+			})
+		}
+
+		// Build assistant message from the streaming response.
+		asstContent := collectChatStreamContent(events)
+		reasoningContent := collectChatStreamReasoning(events)
+		req.Messages = append(req.Messages, chat.ChatMessage{
+			Role:      "assistant",
+			Content:   asstContent,
+			ToolCalls: toolCalls,
+			ReasoningContent: reasoningContent,
+		})
+		req.Messages = append(req.Messages, toolResultMsgs...)
+
+		log.Debug("Chat 流式搜索轮次", "round", round+1, "tools_executed", len(searchCalls))
+	}
+
+	// Return all events as a single channel.
+	ch := make(chan chat.ChatStreamChunk, len(allEvents))
+	for _, ev := range allEvents {
+		ch <- ev
+	}
+	close(ch)
+	return ch, nil
+}
+
+// collectChatStream collects all events from a Chat stream channel.
+func collectChatStream(ctx context.Context, stream <-chan chat.ChatStreamChunk) ([]chat.ChatStreamChunk, error) {
+	var events []chat.ChatStreamChunk
+	for {
+		select {
+		case <-ctx.Done():
+			return events, ctx.Err()
+		case chunk, ok := <-stream:
+			if !ok {
+				return events, nil
+			}
+			events = append(events, chunk)
+		}
+	}
+}
+
+// lastChunkToolCalls extracts tool calls from the final chunk that has choices.
+func lastChunkToolCalls(events []chat.ChatStreamChunk) []chat.ToolCall {
+	// Look in reverse for the last chunk with tool calls.
+	for i := len(events) - 1; i >= 0; i-- {
+		for _, sc := range events[i].Choices {
+			if len(sc.Delta.ToolCalls) > 0 {
+				return sc.Delta.ToolCalls
+			}
+		}
+	}
+	return nil
+}
+
+// collectChatStreamContent builds the assistant's full text content from all chunks.
+func collectChatStreamContent(events []chat.ChatStreamChunk) string {
+	var sb strings.Builder
+	for _, ev := range events {
+		for _, sc := range ev.Choices {
+			sb.WriteString(sc.Delta.Content)
+		}
+	}
+	return sb.String()
+}
+
+// collectChatStreamReasoning collects reasoning_content from all streaming chunks.
+// Reasoning content is concatenated (DeepSeek streams it in pieces).
+func collectChatStreamReasoning(events []chat.ChatStreamChunk) string {
+	var sb strings.Builder
+	for _, ev := range events {
+		for _, sc := range ev.Choices {
+			sb.WriteString(sc.Delta.ReasoningContent)
+		}
+	}
+	return sb.String()
+}
+
+
+// unquoteRawJSON unwraps a JSON-string-encoded value.
+// Chat API returns function.arguments as a quoted JSON string. When stored as
+// json.RawMessage, the outer quotes are preserved. This function strips them
+// so the result is a raw JSON object ready for json.Unmarshal.
+func unquoteRawJSON(raw json.RawMessage) json.RawMessage {
+	if len(raw) < 2 || raw[0] != '"' {
+		return raw
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return raw
+	}
+	return json.RawMessage(s)
+}

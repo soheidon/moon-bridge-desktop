@@ -8,7 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"moonbridge/internal/foundation/logger"
+	"log/slog"
 	"net/http"
 	"strings"
 )
@@ -64,7 +64,7 @@ func NewClient(cfg ClientConfig) *Client {
 
 func (client *Client) CreateMessage(ctx context.Context, request MessageRequest) (MessageResponse, error) {
 	request.Stream = false
-	log := logger.L().With("model", request.Model)
+	log := slog.Default().With("model", request.Model)
 	log.Debug("正在创建消息", "max_tokens", request.MaxTokens, "messages", len(request.Messages), "tools", len(request.Tools))
 
 	httpRequest, err := client.newRequest(ctx, request)
@@ -82,7 +82,13 @@ func (client *Client) CreateMessage(ctx context.Context, request MessageRequest)
 
 	if response.StatusCode < 200 || response.StatusCode > 299 {
 		err := decodeProviderError(response)
-		log.Error("提供商错误", "status", response.StatusCode, "error", err)
+		log.Error("提供商错误",
+			"status", response.StatusCode,
+			"error", err,
+			"req_messages", len(request.Messages),
+			"req_tools", len(request.Tools),
+			"req_max_tokens", request.MaxTokens,
+		)
 		return MessageResponse{}, err
 	}
 
@@ -97,7 +103,7 @@ func (client *Client) CreateMessage(ctx context.Context, request MessageRequest)
 
 func (client *Client) StreamMessage(ctx context.Context, request MessageRequest) (Stream, error) {
 	request.Stream = true
-	log := logger.L().With("model", request.Model)
+	log := slog.Default().With("model", request.Model)
 	log.Debug("开始流式传输", "max_tokens", request.MaxTokens, "messages", len(request.Messages), "tools", len(request.Tools))
 
 	httpRequest, err := client.newRequest(ctx, request)
@@ -114,12 +120,20 @@ func (client *Client) StreamMessage(ctx context.Context, request MessageRequest)
 	if response.StatusCode < 200 || response.StatusCode > 299 {
 		defer response.Body.Close()
 		err := decodeProviderError(response)
-		log.Error("提供商错误", "status", response.StatusCode, "error", err)
+		log.Error("提供商错误",
+			"status", response.StatusCode,
+			"error", err,
+			"req_messages", len(request.Messages),
+			"req_tools", len(request.Tools),
+			"req_max_tokens", request.MaxTokens,
+		)
 		return nil, err
 	}
 
 	log.Debug("流已连接")
-	return &sseStream{body: response.Body, scanner: bufio.NewScanner(response.Body)}, nil
+	scanner := bufio.NewScanner(response.Body)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	return &sseStream{body: response.Body, scanner: scanner}, nil
 }
 
 func (client *Client) ProbeWebSearch(ctx context.Context, model string) (bool, error) {
@@ -135,7 +149,7 @@ func (client *Client) ProbeWebSearch(ctx context.Context, model string) (bool, e
 			Type:    "web_search_20250305",
 			MaxUses: 1,
 		}},
-		ToolChoice: ToolChoice{Type: "auto"},
+		ToolChoice: &ToolChoice{Type: "auto"},
 	})
 	if err != nil {
 		if IsUnsupportedWebSearchError(err) {
@@ -259,6 +273,9 @@ func (stream *sseStream) Next() (StreamEvent, error) {
 		}
 	}
 	if err := stream.scanner.Err(); err != nil {
+		if errors.Is(err, io.EOF) || err.Error() == "EOF" {
+			return StreamEvent{}, io.EOF
+		}
 		return StreamEvent{}, err
 	}
 	if stream.data.Len() > 0 {

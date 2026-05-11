@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 
+	"moonbridge/internal/format"
 	"moonbridge/internal/protocol/anthropic"
 )
 
@@ -20,8 +21,8 @@ type persistedThinkingSummary struct {
 
 type State struct {
 	mu          sync.Mutex
-	records     map[string]anthropic.ContentBlock
-	textRecords map[string]anthropic.ContentBlock
+	records     map[string]format.CoreContentBlock
+	textRecords map[string]format.CoreContentBlock
 	order       []string
 	textOrder   []string
 	limit       int
@@ -30,14 +31,14 @@ type State struct {
 type StreamState struct {
 	thinkingText      map[int]string
 	thinkingSignature map[int]string
-	completedThinking anthropic.ContentBlock
+	completedThinking format.CoreContentBlock
 	toolCallIDs       []string
 }
 
 func NewState() *State {
 	return &State{
-		records:     map[string]anthropic.ContentBlock{},
-		textRecords: map[string]anthropic.ContentBlock{},
+		records:     map[string]format.CoreContentBlock{},
+		textRecords: map[string]format.CoreContentBlock{},
 		limit:       1024,
 	}
 }
@@ -57,7 +58,7 @@ func (stream *StreamState) Reset(index int) {
 	delete(stream.thinkingSignature, index)
 }
 
-func (state *State) RememberForToolCalls(toolCallIDs []string, block anthropic.ContentBlock) {
+func (state *State) RememberForToolCalls(toolCallIDs []string, block format.CoreContentBlock) {
 	if state == nil || !hasThinkingPayload(block) || len(toolCallIDs) == 0 {
 		return
 	}
@@ -76,7 +77,7 @@ func (state *State) RememberForToolCalls(toolCallIDs []string, block anthropic.C
 	state.pruneLocked()
 }
 
-func (state *State) RememberForAssistantText(text string, block anthropic.ContentBlock) {
+func (state *State) RememberForAssistantText(text string, block format.CoreContentBlock) {
 	if state == nil || text == "" || !hasThinkingPayload(block) {
 		return
 	}
@@ -90,18 +91,18 @@ func (state *State) RememberForAssistantText(text string, block anthropic.Conten
 	state.pruneLocked()
 }
 
-func (state *State) RememberFromContent(blocks []anthropic.ContentBlock) {
-	var thinkingBlock anthropic.ContentBlock
+func (state *State) RememberFromContent(blocks []format.CoreContentBlock) {
+	var thinkingBlock format.CoreContentBlock
 	var toolCallIDs []string
 	var assistantText string
 	for _, block := range blocks {
 		switch block.Type {
-		case "thinking":
+		case "reasoning":
 			thinkingBlock = block
 		case "reasoning_content":
-			thinkingBlock = anthropic.ContentBlock{Type: "thinking", Thinking: block.Text}
+			thinkingBlock = format.CoreContentBlock{Type: "reasoning", ReasoningText: block.Text}
 		case "tool_use":
-			toolCallIDs = append(toolCallIDs, block.ID)
+			toolCallIDs = append(toolCallIDs, block.ToolUseID)
 		case "text":
 			assistantText += block.Text
 		}
@@ -122,7 +123,7 @@ func (state *State) RememberStreamResult(stream *StreamState, outputText string)
 }
 
 func (state *State) PrependCachedForToolUse(messages *[]anthropic.Message, toolCallID string) {
-	block, ok := state.cachedForToolCall(toolCallID)
+	block, ok := state.CachedForToolCall(toolCallID)
 	if !ok {
 		return
 	}
@@ -133,22 +134,20 @@ func PrependRequiredThinkingForToolUse(messages *[]anthropic.Message) bool {
 	return PrependThinkingBlockForToolUse(messages, RequiredThinkingBlock())
 }
 
-func PrependThinkingBlockForToolUse(messages *[]anthropic.Message, block anthropic.ContentBlock) bool {
+func PrependThinkingBlockForToolUse(messages *[]anthropic.Message, block format.CoreContentBlock) bool {
 	block = normalizeThinkingBlock(block)
 	lastIndex := len(*messages) - 1
 	if lastIndex < 0 || (*messages)[lastIndex].Role != "assistant" {
-		// Don't append a bare assistant message; that would break
-		// the user/assistant role alternation expected by providers.
 		return false
 	}
-	if HasThinkingBlock((*messages)[lastIndex].Content) {
+	if HasThinkingBlock(anthropicBlocksToCore((*messages)[lastIndex].Content)) {
 		return false
 	}
-	(*messages)[lastIndex].Content = append([]anthropic.ContentBlock{block}, (*messages)[lastIndex].Content...)
+	(*messages)[lastIndex].Content = append([]anthropic.ContentBlock{coreBlockToAnthropic(block)}, (*messages)[lastIndex].Content...)
 	return true
 }
 
-func (state *State) PrependCachedForAssistantText(blocks []anthropic.ContentBlock) []anthropic.ContentBlock {
+func (state *State) PrependCachedForAssistantText(blocks []format.CoreContentBlock) []format.CoreContentBlock {
 	if HasThinkingBlock(blocks) {
 		return blocks
 	}
@@ -156,26 +155,26 @@ func (state *State) PrependCachedForAssistantText(blocks []anthropic.ContentBloc
 	if !ok {
 		return blocks
 	}
-	return append([]anthropic.ContentBlock{block}, blocks...)
+	return append([]format.CoreContentBlock{block}, blocks...)
 }
 
-func PrependRequiredThinkingForAssistantText(blocks []anthropic.ContentBlock) ([]anthropic.ContentBlock, bool) {
+func PrependRequiredThinkingForAssistantText(blocks []format.CoreContentBlock) ([]format.CoreContentBlock, bool) {
 	return PrependThinkingBlockForAssistantText(blocks, RequiredThinkingBlock())
 }
 
-func PrependThinkingBlockForAssistantText(blocks []anthropic.ContentBlock, block anthropic.ContentBlock) ([]anthropic.ContentBlock, bool) {
+func PrependThinkingBlockForAssistantText(blocks []format.CoreContentBlock, block format.CoreContentBlock) ([]format.CoreContentBlock, bool) {
 	if HasThinkingBlock(blocks) {
 		return blocks, false
 	}
-	return append([]anthropic.ContentBlock{normalizeThinkingBlock(block)}, blocks...), true
+	return append([]format.CoreContentBlock{normalizeThinkingBlock(block)}, blocks...), true
 }
 
-func (stream *StreamState) Start(index int, block *anthropic.ContentBlock) bool {
+func (stream *StreamState) Start(index int, block *format.CoreContentBlock) bool {
 	if stream == nil || block == nil || !IsReasoningContentBlock(block) {
 		return false
 	}
-	stream.thinkingText[index] = firstNonEmpty(block.Thinking, block.Text)
-	stream.thinkingSignature[index] = block.Signature
+	stream.thinkingText[index] = firstNonEmpty(block.ReasoningText, block.Text)
+	stream.thinkingSignature[index] = block.ReasoningSignature
 	return true
 }
 
@@ -210,10 +209,10 @@ func (stream *StreamState) Stop(index int) bool {
 	if !ok {
 		return false
 	}
-	stream.completedThinking = anthropic.ContentBlock{
-		Type:      "thinking",
-		Thinking:  text,
-		Signature: stream.thinkingSignature[index],
+	stream.completedThinking = format.CoreContentBlock{
+		Type:               "reasoning",
+		ReasoningText:      text,
+		ReasoningSignature: stream.thinkingSignature[index],
 	}
 	return true
 }
@@ -225,9 +224,9 @@ func (stream *StreamState) RecordToolCall(toolCallID string) {
 	stream.toolCallIDs = append(stream.toolCallIDs, toolCallID)
 }
 
-func (state *State) cachedForToolCall(toolCallID string) (anthropic.ContentBlock, bool) {
+func (state *State) CachedForToolCall(toolCallID string) (format.CoreContentBlock, bool) {
 	if state == nil || toolCallID == "" {
-		return anthropic.ContentBlock{}, false
+		return format.CoreContentBlock{}, false
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
@@ -235,9 +234,9 @@ func (state *State) cachedForToolCall(toolCallID string) (anthropic.ContentBlock
 	return block, ok
 }
 
-func (state *State) cachedForAssistantText(text string) (anthropic.ContentBlock, bool) {
+func (state *State) cachedForAssistantText(text string) (format.CoreContentBlock, bool) {
 	if state == nil || text == "" {
-		return anthropic.ContentBlock{}, false
+		return format.CoreContentBlock{}, false
 	}
 	key := thinkingTextKey(text)
 	state.mu.Lock()
@@ -259,30 +258,30 @@ func (state *State) pruneLocked() {
 	}
 }
 
-func HasThinkingBlock(blocks []anthropic.ContentBlock) bool {
+func HasThinkingBlock(blocks []format.CoreContentBlock) bool {
 	for _, block := range blocks {
-		if block.Type == "thinking" {
+		if block.Type == "reasoning" {
 			return true
 		}
 	}
 	return false
 }
 
-func RequiredThinkingBlock() anthropic.ContentBlock {
-	return anthropic.ContentBlock{Type: "thinking", Thinking: ""}
+func RequiredThinkingBlock() format.CoreContentBlock {
+	return format.CoreContentBlock{Type: "reasoning", ReasoningText: ""}
 }
 
-func EncodeThinkingSummary(block anthropic.ContentBlock) string {
+func EncodeThinkingSummary(block format.CoreContentBlock) string {
 	block = normalizeThinkingBlock(block)
-	if block.Thinking != "" {
-		return block.Thinking
+	if block.ReasoningText != "" {
+		return block.ReasoningText
 	}
-	if block.Signature == "" {
+	if block.ReasoningSignature == "" {
 		return ""
 	}
 	payload, err := json.Marshal(persistedThinkingSummary{
-		Thinking:  block.Thinking,
-		Signature: block.Signature,
+		Thinking:  block.ReasoningText,
+		Signature: block.ReasoningSignature,
 	})
 	if err != nil {
 		return ""
@@ -290,46 +289,46 @@ func EncodeThinkingSummary(block anthropic.ContentBlock) string {
 	return persistedThinkingSummaryPrefix + base64.RawURLEncoding.EncodeToString(payload)
 }
 
-func DecodeThinkingSummary(text string) (anthropic.ContentBlock, bool) {
+func DecodeThinkingSummary(text string) (format.CoreContentBlock, bool) {
 	if text == "" {
-		return anthropic.ContentBlock{}, false
+		return format.CoreContentBlock{}, false
 	}
 	if !strings.HasPrefix(text, persistedThinkingSummaryPrefix) {
-		return anthropic.ContentBlock{Type: "thinking", Thinking: text}, true
+		return format.CoreContentBlock{Type: "reasoning", ReasoningText: text}, true
 	}
 	encoded := strings.TrimPrefix(text, persistedThinkingSummaryPrefix)
 	payload, err := base64.RawURLEncoding.DecodeString(encoded)
 	if err != nil {
-		return anthropic.ContentBlock{Type: "thinking", Thinking: text}, true
+		return format.CoreContentBlock{Type: "reasoning", ReasoningText: text}, true
 	}
 	var decoded persistedThinkingSummary
 	if err := json.Unmarshal(payload, &decoded); err != nil {
-		return anthropic.ContentBlock{Type: "thinking", Thinking: text}, true
+		return format.CoreContentBlock{Type: "reasoning", ReasoningText: text}, true
 	}
-	block := anthropic.ContentBlock{
-		Type:      "thinking",
-		Thinking:  decoded.Thinking,
-		Signature: decoded.Signature,
+	block := format.CoreContentBlock{
+		Type:               "reasoning",
+		ReasoningText:      decoded.Thinking,
+		ReasoningSignature: decoded.Signature,
 	}
 	if !hasThinkingPayload(block) {
-		return anthropic.ContentBlock{}, false
+		return format.CoreContentBlock{}, false
 	}
 	return block, true
 }
 
-func hasThinkingPayload(block anthropic.ContentBlock) bool {
-	return block.Type == "thinking" && (block.Thinking != "" || block.Signature != "")
+func hasThinkingPayload(block format.CoreContentBlock) bool {
+	return block.Type == "reasoning" && (block.ReasoningText != "" || block.ReasoningSignature != "")
 }
 
-func normalizeThinkingBlock(block anthropic.ContentBlock) anthropic.ContentBlock {
-	return anthropic.ContentBlock{
-		Type:      "thinking",
-		Thinking:  block.Thinking,
-		Signature: block.Signature,
+func normalizeThinkingBlock(block format.CoreContentBlock) format.CoreContentBlock {
+	return format.CoreContentBlock{
+		Type:               "reasoning",
+		ReasoningText:      block.ReasoningText,
+		ReasoningSignature: block.ReasoningSignature,
 	}
 }
 
-func textFromBlocks(blocks []anthropic.ContentBlock) string {
+func textFromBlocks(blocks []format.CoreContentBlock) string {
 	var builder strings.Builder
 	for _, block := range blocks {
 		if block.Type == "text" {

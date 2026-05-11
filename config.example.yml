@@ -13,11 +13,6 @@ server:
   # must include an Authorization: Bearer <token> header. If empty, auth is disabled.
   # auth_token: "replace-with-your-secret-token"
 
-trace_requests: false
-
-
-# Persistence layer: select active provider when multiple are enabled.
-# Leave empty to auto-select when only one is registered.
 persistence:
   active_provider: db_sqlite
 
@@ -27,13 +22,35 @@ extensions:
       # Injects a reminder before user input to reinforce system prompt adherence.
       reinforce_instructions: true
       # Custom prompt text (default used if omitted). Set to empty string to disable.
-      reinforce_prompt: "[System Reminder]: Please pay close attention to the system instructions, AGENTS.md files, and any other context provided. Follow them carefully and completely in your response.\n[User]:"
+      reinforce_prompt: "[System Reminder]: Please pay close attention to the system
+        instructions, AGENTS.md files, and any other context provided. Follow them
+        carefully and completely in your response.\n[User]:"
   visual:
     config:
       provider: "kimi"
       model: "kimi-for-coding"
       max_rounds: 4
       max_tokens: 2048
+  # Kimi model tool call round limiter: injects progress/limit prompts
+  # after each tool_result batch to prevent runaway information gathering.
+  #
+  # Enable at model level to activate:
+  #   models:
+  #     my-kimi-model:
+  #       extensions:
+  #         kimi_workaround:
+  #           enabled: true
+  kimi_workaround:
+    config:
+      max_tool_rounds: 50
+      convergence_margin: 0.8
+  # Example model with kimi_workaround enabled:
+  # my-kimi-model:
+  #   context_window: 128000
+  #   extensions:
+  #     kimi_workaround:
+  #       enabled: true
+
   # Database provider: SQLite
   db_sqlite:
     enabled: true
@@ -57,138 +74,6 @@ extensions:
       max_limit: 1000
 
 
-provider:
-  providers:
-    deepseek:
-      base_url: "https://api.deepseek.com/anthropic"
-      api_key: "replace-with-deepseek-api-key"
-      version: "2023-06-01"
-      user_agent: "moonbridge/1.0"
-      web_search:
-        support: "auto"
-      models:
-        deepseek-v4-pro:
-          context_window: 1000000
-          max_output_tokens: 384000
-          display_name: "DeepSeek V4 Pro"
-          description: "DeepSeek V4 with selectable high/xhigh reasoning effort."
-          extensions:
-            deepseek_v4:
-              enabled: true
-            visual:
-              enabled: true
-          default_reasoning_level: "high"
-          supported_reasoning_levels:
-            - effort: "high"
-              description: "High reasoning effort"
-            - effort: "xhigh"
-              description: "Extra high reasoning effort (maps to DeepSeek max)"
-          supports_reasoning_summaries: true
-          default_reasoning_summary: "auto"
-          web_search:
-            support: "auto"  # model-level override (auto / enabled / disabled / injected)
-          pricing:
-            input_price: 2
-            output_price: 8
-            cache_write_price: 1
-            cache_read_price: 0.2
-        deepseek-v4-flash:
-          context_window: 1000000
-          max_output_tokens: 384000
-          display_name: "DeepSeek V4 Flash"
-          description: "DeepSeek V4 Flash with selectable high/xhigh reasoning effort."
-          extensions:
-            deepseek_v4:
-              enabled: true
-            visual:
-              enabled: true
-          default_reasoning_level: "high"
-          supported_reasoning_levels:
-            - effort: "high"
-              description: "High reasoning effort"
-            - effort: "xhigh"
-              description: "Extra high reasoning effort (maps to DeepSeek max)"
-          supports_reasoning_summaries: true
-          default_reasoning_summary: "auto"
-          web_search:
-            support: "auto"  # model-level override (auto / enabled / disabled / injected)
-          pricing:
-            input_price: 1
-            output_price: 2
-            cache_write_price: 1
-            cache_read_price: 0.02
-    kimi:
-      # Anthropic-compatible base URL for Kimi/Moonshot.
-      base_url: "https://api.kimi.com/coding/"
-      api_key: "replace-with-kimi-api-key"
-      version: "2023-06-01"
-      user_agent: "moonbridge/1.0"
-      models:
-        kimi-for-coding: {}
-    openai:
-      base_url: "https://api.openai.com"
-      api_key: "replace-with-openai-api-key"
-      protocol: "openai-response"
-      user_agent: "moonbridge/1.0"
-      models:
-        gpt-image-1.5: {}
-        gpt-4o-mini-tts: {}
-    anthropic:
-      base_url: "https://api.anthropic.com"
-      api_key: "replace-with-anthropic-api-key"
-      version: "2023-06-01"
-      user_agent: "moonbridge/1.0"
-      web_search:
-        support: "enabled"
-      models:
-        claude-sonnet-4-20250514:
-          context_window: 200000
-          max_output_tokens: 64000
-          display_name: "Claude Sonnet 4"
-          description: "Frontier model for everyday coding."
-          default_reasoning_level: "medium"
-          supported_reasoning_levels:
-            - effort: "low"
-              description: "Fast responses with lighter reasoning"
-            - effort: "medium"
-              description: "Balances speed and reasoning depth for everyday tasks"
-            - effort: "high"
-              description: "Greater reasoning depth for complex problems"
-            - effort: "xhigh"
-              description: "Extra high reasoning depth for complex problems"
-          # Declare this model as multimodal (supports image input).
-          # Codex reads these from models_catalog.json to decide whether
-          # image attachments can be included in user turns.
-          input_modalities:
-            - "text"
-            - "image"
-          supports_image_detail_original: true
-          pricing:
-            input_price: 3
-            output_price: 15
-            cache_write_price: 3.75
-            cache_read_price: 0.30
-
-  routes:
-    # Optional aliases. Provider models are listed directly in the Codex catalog
-    # as model(provider) format; routes only add friendly fallback names.
-    moonbridge:
-      to: "deepseek/deepseek-v4-pro"
-    gpt-image:
-      to: "openai/gpt-image-1.5"
-    gpt-tts:
-      to: "openai/gpt-4o-mini-tts"
-
-  # web_search:
-  #   support: "disabled" # auto / enabled / disabled / injected
-  #   max_uses: 8
-  #   tavily_api_key: "replace-with-tavily-api-key"
-  #   firecrawl_api_key: "replace-with-firecrawl-api-key"
-  #   search_max_rounds: 5
-
-  default_max_tokens: 65536
-  default_model: "moonbridge"
-
 cache:
   mode: "explicit"  # off / automatic / explicit / hybrid
   ttl: "5m"         # 5m / 1h
@@ -202,16 +87,144 @@ cache:
   minimum_value_score: 2048
   min_breakpoint_tokens: 1024
 
-developer:
-  proxy:
-    response:
-      model: "gpt-5.4"
-      provider:
-        base_url: "https://api.openai.com"
-        api_key: "replace-with-real-openai-responses-api-key"
-    anthropic:
-      model: ""
-      provider:
-        base_url: "https://provider.example.com"
-        api_key: "replace-with-real-anthropic-compatible-api-key"
-        version: "2023-06-01"
+defaults:
+  model: "moonbridge"
+  max_tokens: 65536
+trace:
+  enabled: false
+proxy:
+  response:
+    base_url: "https://api.openai.com"
+    api_key: "replace-with-real-openai-responses-api-key"
+    model: "gpt-5.4"
+  anthropic:
+    base_url: "https://provider.example.com"
+    api_key: "replace-with-real-anthropic-compatible-api-key"
+    version: "2023-06-01"
+models:
+  deepseek-v4-pro:
+    context_window: 1000000
+    max_output_tokens: 384000
+    display_name: "DeepSeek V4 Pro"
+    description: "DeepSeek V4 with selectable high/xhigh reasoning effort."
+    default_reasoning_level: "high"
+    supported_reasoning_levels:
+      - effort: "high"
+        description: "High reasoning effort"
+      - effort: "xhigh"
+        description: "Extra high reasoning effort (maps to DeepSeek max)"
+    supports_reasoning_summaries: true
+    default_reasoning_summary: "auto"
+    web_search:
+      support: "auto"        # model-level override (auto / enabled / disabled / injected)
+    extensions:
+      deepseek_v4:
+        enabled: true
+      visual:
+        enabled: true
+  deepseek-v4-flash:
+    context_window: 1000000
+    max_output_tokens: 384000
+    display_name: "DeepSeek V4 Flash"
+    description: "DeepSeek V4 Flash with selectable high/xhigh reasoning effort."
+    default_reasoning_level: "high"
+    supported_reasoning_levels:
+      - effort: "high"
+        description: "High reasoning effort"
+      - effort: "xhigh"
+        description: "Extra high reasoning effort (maps to DeepSeek max)"
+    supports_reasoning_summaries: true
+    default_reasoning_summary: "auto"
+    web_search:
+      support: "auto"        # model-level override (auto / enabled / disabled / injected)
+    extensions:
+      deepseek_v4:
+        enabled: true
+      visual:
+        enabled: true
+  claude-sonnet-4-20250514:
+    context_window: 200000
+    max_output_tokens: 64000
+    display_name: "Claude Sonnet 4"
+    description: "Frontier model for everyday coding."
+    default_reasoning_level: "medium"
+    supported_reasoning_levels:
+      - effort: "low"
+        description: "Fast responses with lighter reasoning"
+      - effort: "medium"
+        description: "Balances speed and reasoning depth for everyday tasks"
+      - effort: "high"
+        description: "Greater reasoning depth for complex problems"
+      - effort: "xhigh"
+        description: "Extra high reasoning depth for complex problems"
+          # Declare this model as multimodal (supports image input).
+          # Codex reads these from models_catalog.json to decide whether
+          # image attachments can be included in user turns.
+    input_modalities:
+      - "text"
+      - "image"
+    supports_image_detail_original: true
+providers:
+  deepseek:
+    base_url: "https://api.deepseek.com/anthropic"
+    api_key: "replace-with-deepseek-api-key"
+    version: "2023-06-01"
+    user_agent: "moonbridge/1.0"
+    web_search:
+      support: "auto"
+    offers:
+      - model: deepseek-v4-pro
+        pricing:
+          input_price: 2
+          output_price: 8
+          cache_write_price: 1
+          cache_read_price: 0.2
+      - model: deepseek-v4-flash
+        pricing:
+          input_price: 1
+          output_price: 2
+          cache_write_price: 1
+          cache_read_price: 0.02
+  kimi:
+      # Anthropic-compatible base URL for Kimi/Moonshot.
+    base_url: "https://api.kimi.com/coding/"
+    api_key: "replace-with-kimi-api-key"
+    version: "2023-06-01"
+    user_agent: "moonbridge/1.0"
+    offers:
+      - model: kimi-for-coding
+  openai:
+    base_url: "https://api.openai.com"
+    api_key: "replace-with-openai-api-key"
+    protocol: "openai-response"
+    user_agent: "moonbridge/1.0"
+    offers:
+      - model: gpt-image-1.5
+      - model: gpt-4o-mini-tts
+  anthropic:
+    base_url: "https://api.anthropic.com"
+    api_key: "replace-with-anthropic-api-key"
+    version: "2023-06-01"
+    user_agent: "moonbridge/1.0"
+    web_search:
+      support: "enabled"
+    offers:
+      - model: claude-sonnet-4-20250514
+        pricing:
+          input_price: 3
+          output_price: 15
+          cache_write_price: 3.75
+          cache_read_price: 0.30
+
+routes:
+    # Optional aliases. Provider models are listed directly in the Codex catalog
+    # as model(provider) format; routes only add friendly fallback names.
+  moonbridge:
+    model: deepseek-v4-pro
+    provider: deepseek
+  gpt-image:
+    model: gpt-image-1.5
+    provider: openai
+  gpt-tts:
+    model: gpt-4o-mini-tts
+    provider: openai

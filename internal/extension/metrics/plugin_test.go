@@ -9,8 +9,8 @@ import (
 
 	mbtrics "moonbridge/internal/extension/metrics"
 	"moonbridge/internal/extension/plugin"
-	"moonbridge/internal/foundation/config"
-	"moonbridge/internal/foundation/db"
+	"moonbridge/internal/config"
+	"moonbridge/internal/db"
 
 	_ "modernc.org/sqlite"
 )
@@ -48,10 +48,10 @@ func TestConfigSpecs(t *testing.T) {
 	}
 }
 
-func TestDBConsumerNilWhenDisabled(t *testing.T) {
+func TestDBConsumerAlwaysNonNil(t *testing.T) {
 	p := mbtrics.NewPlugin()
-	if p.DBConsumer() != nil {
-		t.Fatal("DBConsumer() should be nil when extension is not enabled in config")
+	if p.DBConsumer() == nil {
+		t.Fatal("DBConsumer() should always return a consumer; DB registry handles availability")
 	}
 }
 
@@ -120,6 +120,7 @@ func TestOnRequestCompletedRecordsRawTelemetry(t *testing.T) {
 	p.OnRequestCompleted(nil, plugin.RequestResult{
 		Model:         "kimi",
 		ActualModel:   "kimi-for-coding",
+		ProviderKey:   "deepseek",
 		InputTokens:   85822,
 		OutputTokens:  145,
 		CacheRead:     85248,
@@ -149,7 +150,7 @@ func TestOnRequestCompletedRecordsRawTelemetry(t *testing.T) {
 		t.Fatalf("records len = %d", len(records))
 	}
 	got := records[0]
-	if got.UsageSource != "anthropic_stream" || got.RawCacheRead != 85248 || got.NormalizedInputTokens != 85822 {
+	if got.UsageSource != "anthropic_stream" || got.RawCacheRead != 85248 || got.NormalizedInputTokens != 85822 || got.ProviderKey != "deepseek" {
 		t.Fatalf("record = %+v", got)
 	}
 }

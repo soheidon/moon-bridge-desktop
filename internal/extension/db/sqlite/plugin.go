@@ -20,8 +20,8 @@ import (
 	"path/filepath"
 
 	"moonbridge/internal/extension/plugin"
-	"moonbridge/internal/foundation/config"
-	"moonbridge/internal/foundation/db"
+	"moonbridge/internal/config"
+	"moonbridge/internal/db"
 )
 
 const PluginName = "db_sqlite"
@@ -108,9 +108,10 @@ func (p *sqliteProvider) Features() db.Features {
 // Plugin is the SQLite provider plugin.
 type Plugin struct {
 	plugin.BasePlugin
-	provider *sqliteProvider
-	appCfg   config.Config
-	enabled  bool
+	provider  *sqliteProvider
+	pluginCfg config.PluginConfig
+	addr      string
+	enabled   bool
 }
 
 func NewPlugin() *Plugin {
@@ -133,7 +134,8 @@ func ConfigSpecs() []config.ExtensionConfigSpec {
 }
 
 func (p *Plugin) Init(ctx plugin.PluginContext) error {
-	p.appCfg = ctx.AppConfig
+	p.pluginCfg = config.PluginFromGlobalConfig(&ctx.AppConfig)
+	p.addr = ctx.AppConfig.Addr
 	cfg := plugin.Config[Config](ctx)
 	if cfg == nil || cfg.Path == "" {
 		return nil
@@ -151,7 +153,7 @@ func (p *Plugin) Shutdown() error {
 }
 
 func (p *Plugin) EnabledForModel(string) bool {
-	return p.enabled && p.appCfg.ExtensionEnabled(PluginName, "")
+	return p.enabled && pluginExtensionEnabled(p.pluginCfg, PluginName)
 }
 
 func (p *Plugin) DBProvider() db.Provider {
@@ -159,10 +161,17 @@ func (p *Plugin) DBProvider() db.Provider {
 		return nil
 	}
 	// Respect extensions.db_sqlite.enabled flag.
-	if p.appCfg.Addr != "" && !p.appCfg.ExtensionEnabled(PluginName, "") {
+	if p.addr != "" && !pluginExtensionEnabled(p.pluginCfg, PluginName) {
 		return nil
 	}
 	return p.provider
+}
+
+func pluginExtensionEnabled(pluginCfg config.PluginConfig, name string) bool {
+	if setting, ok := pluginCfg.Extensions[name]; ok && setting.Enabled != nil {
+		return *setting.Enabled
+	}
+	return false
 }
 
 var (

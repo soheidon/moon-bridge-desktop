@@ -7,7 +7,7 @@ import (
 	"time"
 
 	mbtrics "moonbridge/internal/extension/metrics"
-	"moonbridge/internal/foundation/db"
+	"moonbridge/internal/db"
 
 	_ "modernc.org/sqlite"
 )
@@ -56,6 +56,7 @@ func TestStoreRecordsRawAndNormalizedUsage(t *testing.T) {
 		Timestamp:               time.Unix(10, 0),
 		Model:                   "kimi",
 		ActualModel:             "kimi-for-coding",
+		ProviderKey:             "deepseek",
 		InputTokens:             130,
 		OutputTokens:            12,
 		CacheCreation:           30,
@@ -86,7 +87,7 @@ func TestStoreRecordsRawAndNormalizedUsage(t *testing.T) {
 		t.Fatalf("records len = %d", len(records))
 	}
 	got := records[0]
-	if got.RawInputTokens != 10 || got.NormalizedInputTokens != 130 || got.Protocol != "anthropic" || got.UsageSource != "anthropic_response" {
+	if got.RawInputTokens != 10 || got.NormalizedInputTokens != 130 || got.Protocol != "anthropic" || got.UsageSource != "anthropic_response" || got.ProviderKey != "deepseek" {
 		t.Fatalf("record = %+v", got)
 	}
 	if got.RawUsageJSON != `{"input_tokens":10}` {

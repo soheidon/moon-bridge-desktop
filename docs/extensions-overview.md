@@ -90,23 +90,11 @@ var (
 在模型配置中设置 `extensions.deepseek_v4.enabled: true`：
 
 ```yaml
-provider:
-  providers:
-    deepseek:
-      models:
-        deepseek-v4-pro:
-          extensions:
-            deepseek_v4:
-              enabled: true
 ```
 
 或通过 routes 启用：
 
 ```yaml
-provider:
-  routes:
-    moonbridge:
-      to: "deepseek/deepseek-v4-pro"
     # routes 自动继承模型配置中的 deepseek_v4 extension 设置
 ```
 
@@ -162,40 +150,75 @@ var (
 ### 配置方式
 
 ```yaml
-provider:
-  providers:
-    my-provider:
-      base_url: "https://..."
-      api_key: "..."
-      web_search:
-        support: "injected"
-        tavily_api_key: "tvly-..."
-        firecrawl_api_key: "fc-..."
-        search_max_rounds: 5
+providers:
+  my-provider:
+    base_url: "https://..."
+    api_key: "..."
+    web_search:
+      support: "injected"
+      tavily_api_key: "tvly-..."
+      firecrawl_api_key: "fc-..."
+      search_max_rounds: 5
 ```
 
 或全局配置：
 
 ```yaml
-provider:
-  web_search:
-    support: "injected"
-    tavily_api_key: "tvly-..."
-    firecrawl_api_key: "fc-..."
-    search_max_rounds: 5
+web_search:
+  support: "injected"
+  tavily_api_key: "tvly-..."
+  firecrawl_api_key: "fc-..."
+  search_max_rounds: 5
 ```
 
 模型级别覆盖：
 
 ```yaml
-provider:
-  providers:
-    my-provider:
-      models:
-        my-model:
-          web_search:
-            support: "enabled"  # 覆盖提供商级别的 injected
 ```
+
+## kimi_workaround（Kimi 模型 Tool Call 轮次限制）
+
+Kimi 模型在工具调用场景下有时会陷入无限信息收集循环。`kimi_workaround` 插件通过注入进度提示和限制提示，在接近最大 tool call 轮次时提醒模型尽快总结并停止调用工具。
+
+**位置**：`internal/extension/kimi_workaround/`
+
+**文件清单**：
+
+| 文件 | 用途 |
+|------|------|
+| `plugin.go` | Plugin 实现，注册所有能力 |
+
+**实现的能力**：
+
+- `InputPreprocessor` — 预处理输入消息
+- `ContentFilter` — 过滤响应内容
+- `ContentRememberer` — 记忆内容块用于轮次跟踪
+- `StreamInterceptor` — 流事件拦截与轮次跟踪
+- `SessionStateProvider` — 提供跨请求的轮次状态
+
+### 启用方式
+
+在模型配置中设置 `extensions.kimi_workaround.enabled: true`：
+
+```yaml
+models:
+  my-kimi-model:
+    extensions:
+      kimi_workaround:
+        enabled: true
+```
+
+全局配置：
+
+```yaml
+extensions:
+  kimi_workaround:
+    config:
+      max_tool_rounds: 50
+      convergence_margin: 0.8
+```
+
+
 
 ---
 
@@ -210,31 +233,19 @@ provider:
 | 文件 | 用途 |
 |------|------|
 | `catalog.go` | 模型目录 DTO 生成、Codex config.toml 生成 |
-| `convert.go` | Codex 特有 tool 类型转换（local_shell/custom/namespace） |
-| `input.go` | 输入项类型定义和转换（InputItemConversion） |
-| `response.go` | 输出项转换（tool_use → OutputItem） |
-| `tools.go` | 工具编解码（apply_patch、exec、custom tool 的输入输出代理） |
-| `tool_context.go` | 转换上下文（CustomToolSpec、FunctionToolSpec） |
-| `stream_adapter.go` | 流式适配器（管理流状态中的自定义工具、Web Search） |
-| `customtool.go` | apply_patch / exec 代理工具的 JSON schema 和输入输出编解码 |
 | `default_instructions.go` | 默认模型指令模板（嵌入 default_instructions.txt） |
 
 ### 核心职责
 
-1. **工具编解码**：在 OpenAI `custom` / `local_shell` / `function` 和 Anthropic `tool_use` 之间双向转换
-2. **apply_patch 代理**：将 Codex 的 apply_patch grammar（`*** Begin Patch` / `*** End Patch` 格式）拆分为结构化 JSON 操作，方便 Anthropic 模型理解
-3. **模型目录**：从配置生成 Codex CLI 可用的 `models_catalog.json`
-4. **输入过滤**：检测并跳过 Web Search 预置空文本
+1. **模型目录**：从配置生成 Codex CLI 可用的 `models_catalog.json` 和 `config.toml`
+2. **默认指令注入**：为模型提供 Codex 适配的默认系统指令
 
-### ConversionContext
+### CLI 集成
 
-`ConversionContext` 携带工具定义上下文，用于工具名称和输入的双向映射：
+通过 moonbridge 命令行生成 Codex 配置：
 
-```go
-type ConversionContext struct {
-    CustomTools   map[string]CustomToolSpec    // 自定义工具规格
-    FunctionTools map[string]FunctionToolSpec  // 命名空间函数规格
-}
+```bash
+moonbridge -config config.yml -print-codex-config my-model
 ```
 
 ---
@@ -242,7 +253,7 @@ type ConversionContext struct {
 ## visual（视觉扩展）
 
 
-当主模型本身不具备多模态视觉能力时，Moon Bridge 可以将图片分析任务委派给一个专门的视觉 Provider。`visual` 扩展是一个 `ProviderWrapper`，它在主模型的对话中注入 `visual_brief` 和 `visual_qa` 两个工具，在主模型调用这些工具时，自动将图片发往视觉 Provider 分析并返回结果。
+当主模型本身不具备多模态视觉能力时，Moon Bridge 可以将图片分析任务委派给一个专门的视觉 Provider。`visual` 扩展作为 `ToolInjector` 插件工作，在主模型的对话中注入 `visual_brief` 和 `visual_qa` 两个工具；Server 层通过 `wrapWithVisual()` 将上游 Provider 包装为 `CoreProvider`，在 Core 层拦截视觉工具调用并委派给配置的视觉 Provider。
 
 **位置**：`internal/extension/visual/`
 
@@ -250,10 +261,13 @@ type ConversionContext struct {
 
 | 文件 | 用途 |
 |------|------|
-| `plugin.go` | Plugin 实现，注入 `visual_brief` / `visual_qa` 工具 |
-| `orchestrator.go` | 视觉编排器，拦截视觉工具调用并委派给视觉 Provider |
-| `client.go` | 视觉客户端接口及 BridgeClient 实现，通过 Anthropic 协议发送图片请求 |
+| `plugin.go` | Plugin 实现，注入 `visual_brief` / `visual_qa` 工具，暴露 ConfigForModel |
+| `orchestrator.go` | 视觉编排器（旧 Anthropic Provider 包装模式） |
+| `core_orchestrator.go` | Core 层编排器（当前使用） |
+| `client.go` | CoreProvider 接口定义及 BridgeClient 实现 |
 | `tools.go` | 工具定义和 schema 生成 |
+| `types.go` | 类型定义 |
+| `legacy.go` | 遗留代码 |
 
 **实现的能力**：
 
@@ -297,19 +311,16 @@ extensions:
       model: "kimi-vision-model"
       max_tokens: 4096
 
-provider:
-  providers:
-    main:
-      models:
-        my-model:
-          extensions:
-            visual:
-              enabled: true
+models:
+  my-model:
+    extensions:
+      visual:
+        enabled: true
 ```
 
 ### 与 Provider 的交互
 
-Visual orchestrator 包装上游 Anthropic Provider，与注入式 Web Search 的包装模式相同。在 server 层通过 `resolveProvider()` → `maybeWrapProvider()` → `maybeWrapVisual()` 来组合视觉 orchestrator 包装器。
+Visual orchestrator 在 Core 层工作——通过 `wrapWithVisual()`（定义在 `internal/service/server/adapter_dispatch.go`）将上游 Provider 包装为 `CoreProvider`，对 Core format 的请求/响应进行拦截。当主模型不支持图片而调用视觉工具时，orchestrator 自动将图片请求发送到配置的视觉 Provider 并返回分析结果。
 
 ---
 
@@ -396,3 +407,16 @@ extensions:
 ```
 
 当 metrics 成功绑定数据库 store 后，会注册 `GET /v1/admin/metrics`。支持 `limit`、`offset`、`model`、`status`、`since`、`until`、`order=asc` 查询参数。
+models:
+  deepseek-v4-pro:
+    extensions:
+      deepseek_v4:
+        enabled: true
+routes:
+  moonbridge:
+    model: deepseek-v4-pro
+    provider: deepseek
+models:
+  my-model:
+    web_search:
+      support: "enabled"  # 覆盖提供商级别的 injected

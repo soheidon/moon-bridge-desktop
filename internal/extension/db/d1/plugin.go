@@ -21,8 +21,8 @@ import (
 	"fmt"
 
 	"moonbridge/internal/extension/plugin"
-	"moonbridge/internal/foundation/config"
-	"moonbridge/internal/foundation/db"
+	"moonbridge/internal/config"
+	"moonbridge/internal/db"
 )
 
 const PluginName = "db_d1"

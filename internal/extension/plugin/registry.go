@@ -6,10 +6,12 @@ import (
 	"log/slog"
 	"net/http"
 
-	"moonbridge/internal/foundation/config"
-	"moonbridge/internal/foundation/logger"
-	"moonbridge/internal/foundation/openai"
-	"moonbridge/internal/protocol/anthropic"
+	"context"
+
+	"moonbridge/internal/config"
+	"moonbridge/internal/logger"
+	"moonbridge/internal/format"
+	"moonbridge/internal/protocol/openai"
 )
 
 // Registry holds registered plugins and dispatches to their capabilities.
@@ -172,7 +174,7 @@ func (r *Registry) PreprocessInput(model string, raw json.RawMessage) json.RawMe
 }
 
 // MutateRequest chains RequestMutator across enabled plugins.
-func (r *Registry) MutateRequest(ctx *RequestContext, req *anthropic.MessageRequest) {
+func (r *Registry) MutateRequest(ctx *RequestContext, req *format.CoreRequest) {
 	if r == nil {
 		return
 	}
@@ -184,11 +186,11 @@ func (r *Registry) MutateRequest(ctx *RequestContext, req *anthropic.MessageRequ
 }
 
 // InjectTools collects tools from all enabled ToolInjectors.
-func (r *Registry) InjectTools(ctx *RequestContext) []anthropic.Tool {
+func (r *Registry) InjectTools(ctx *RequestContext) []format.CoreTool {
 	if r == nil {
 		return nil
 	}
-	var tools []anthropic.Tool
+	var tools []format.CoreTool
 	for _, p := range r.toolInjectors {
 		if p.(Plugin).EnabledForModel(ctx.ModelAlias) {
 			tools = append(tools, p.InjectTools(ctx)...)
@@ -198,7 +200,7 @@ func (r *Registry) InjectTools(ctx *RequestContext) []anthropic.Tool {
 }
 
 // RewriteMessages chains MessageRewriter across enabled plugins.
-func (r *Registry) RewriteMessages(ctx *RequestContext, messages []anthropic.Message) []anthropic.Message {
+func (r *Registry) RewriteMessages(ctx *RequestContext, messages []format.CoreMessage) []format.CoreMessage {
 	if r == nil {
 		return messages
 	}
@@ -224,21 +226,19 @@ func (r *Registry) WrapProvider(ctx *RequestContext, provider any) any {
 }
 
 // FilterContent calls each enabled ContentFilter. Returns skip=true if any
-// filter says skip, and collects all extra output items.
-func (r *Registry) FilterContent(ctx *RequestContext, block anthropic.ContentBlock) (skip bool, extra []openai.OutputItem) {
+// filter says skip.
+func (r *Registry) FilterContent(ctx *RequestContext, block format.CoreContentBlock) bool {
 	if r == nil {
-		return false, nil
+		return false
 	}
 	for _, p := range r.contentFilters {
 		if p.(Plugin).EnabledForModel(ctx.ModelAlias) {
-			s, e := p.FilterContent(ctx, block)
-			if s {
-				skip = true
+			if p.FilterContent(ctx, block) {
+				return true
 			}
-			extra = append(extra, e...)
 		}
 	}
-	return
+	return false
 }
 
 // PostProcessResponse chains ResponsePostProcessor across enabled plugins.
@@ -254,7 +254,7 @@ func (r *Registry) PostProcessResponse(ctx *RequestContext, resp *openai.Respons
 }
 
 // RememberContent chains ContentRememberer across enabled plugins.
-func (r *Registry) RememberContent(ctx *RequestContext, content []anthropic.ContentBlock) {
+func (r *Registry) RememberContent(ctx *RequestContext, content []format.CoreContentBlock) {
 	if r == nil {
 		return
 	}
@@ -469,4 +469,61 @@ func (r *Registry) DBConsumers() []DBConsumer {
 		}
 	}
 	return result
+}
+
+// Plugins returns the names of all registered plugins.
+func (r *Registry) Plugins() []string {
+	if r == nil {
+		return nil
+	}
+	names := make([]string, 0, len(r.plugins))
+	for _, p := range r.plugins {
+		names = append(names, p.Name())
+	}
+	return names
+}
+
+// CorePluginHooks builds a format.CorePluginHooks from all registered plugins.
+// Each hook chains all plugins that implement the corresponding capability.
+func (r *Registry) CorePluginHooks() format.CorePluginHooks {
+	hooks := format.CorePluginHooks{}.WithDefaults()
+	for _, p := range r.plugins {
+		// MutateCoreRequest
+		if m, ok := p.(CoreRequestMutator); ok {
+			prev := hooks.MutateCoreRequest
+			hooks.MutateCoreRequest = func(ctx context.Context, req *format.CoreRequest) {
+				if prev != nil { prev(ctx, req) }
+				m.MutateCoreRequest(ctx, req)
+			}
+		}
+		// FilterCoreContent
+		if f, ok := p.(CoreContentFilter); ok {
+			prev := hooks.FilterContent
+			hooks.FilterContent = func(ctx context.Context, block *format.CoreContentBlock) bool {
+				if prev != nil && prev(ctx, block) { return true }
+				return f.FilterCoreContent(ctx, block)
+			}
+		}
+		// RewriteMessages — only chain plugins enabled for this model.
+		if mw, ok := p.(MessageRewriter); ok {
+			prev := hooks.RewriteMessages
+			plugin := p.(Plugin) // for EnabledForModel check
+			hooks.RewriteMessages = func(ctx context.Context, req *format.CoreRequest) {
+				if prev != nil { prev(ctx, req) }
+				pluginCtx := &RequestContext{ModelAlias: req.Model}
+				if plugin.EnabledForModel(req.Model) {
+					req.Messages = mw.RewriteMessages(pluginCtx, req.Messages)
+				}
+			}
+		}
+		// RememberCoreContent
+		if rmem, ok := p.(CoreContentRememberer); ok {
+			prev := hooks.RememberContent
+			hooks.RememberContent = func(ctx context.Context, content []format.CoreContentBlock) {
+				if prev != nil { prev(ctx, content) }
+				rmem.RememberCoreContent(ctx, content)
+			}
+		}
+	}
+	return hooks
 }

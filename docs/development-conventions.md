@@ -4,72 +4,72 @@
 
 ### 目录布局
 
-```mermaid
-flowchart LR
-  subgraph internal["internal/"]
-    direction LR
-    subgraph ext_c["extension/\n可插拔扩展"]
-        direction TB
-        ext_c1["codex/\nCodex 兼容性"]
-        ext_c2["deepseek_v4/\nDeepSeek V4 扩展"]
-        ext_c3["plugin/\nPlugin 接口+注册表"]
-        ext_c4["pluginhooks/\n适配器"]
-        ext_c5["websearch/\nWeb Search 核心"]
-        ext_c6["websearchinjected/\n注入式搜索插件"]
-        ext_c7["visual/\n视觉扩展"]
-    end
-
-    subgraph fnd_c["foundation/\n基础组件"]
-        direction TB
-        fnd_c1["config/\n配置加载/校验"]
-        fnd_c2["logger/\n结构化日志"]
-        fnd_c3["modelref/\n模型引用解析"]
-        fnd_c4["openai/\n共享 DTO"]
-        fnd_c5["session/\n会话管理"]
-    end
-
-    subgraph proto_c["protocol/\n协议层"]
-        direction TB
-        proto_c1["anthropic/\nAnthropic 客户端"]
-        proto_c2["bridge/\n协议转换核心"]
-        proto_c3["cache/\n缓存规划引擎"]
-    end
-
-    subgraph svc_c["service/\n服务层"]
-        direction TB
-        svc_c1["app/\n应用入口"]
-        svc_c2["e2e/\n端到端测试"]
-        svc_c3["provider/\n多提供商管理"]
-        svc_c4["proxy/\n代理模式"]
-        svc_c5["server/\nHTTP 服务器"]
-        svc_c6["stats/\n用量统计"]
-        svc_c7["trace/\n请求跟踪"]
-    end
-  end
+```
+internal/
+├── config/          # 配置加载/校验/Schema
+├── logger/          # 结构化日志（slog 封装）
+├── openai_dto/      # 共享 OpenAI DTO
+├── modelref/        # 模型引用解析
+├── session/         # 会话管理
+├── db/              # 数据库抽象与注册表
+├── format/          # Core 类型（CoreRequest/CoreResponse/Registry/Adapter 接口）
+├── protocol/        # 协议转换层
+│   ├── anthropic/   # Anthropic Messages Adapter
+│   ├── cache/       # Prompt 缓存规划
+│   ├── chat/        # OpenAI Chat Adapter
+│   ├── format/      # （遗留层，功能已迁移到 internal/format）
+│   ├── google/      # Google Gemini Adapter
+│   └── openai/      # OpenAI Responses Adapter
+├── service/         # 业务编排层
+│   ├── api/         # 管理 REST API（路由在 router.go）
+│   ├── app/         # 应用生命周期管理、Extension 目录
+│   ├── bridge/      # （空目录，保留以备将来使用）
+│   ├── e2e/         # 服务层 E2E 测试
+│   ├── provider/    # Provider 管理器
+│   ├── proxy/       # Capture 模式代理
+│   ├── runtime/     # 运行时上下文
+│   ├── server/      # HTTP 服务器 + 路由 + 认证 + Adapter 分发
+│   │   ├── session/ # 会话管理
+│   │   ├── trace/   # 请求跟踪写入
+│   │   └── usage/   # 用量跟踪
+│   ├── stats/       # 用量统计
+│   └── trace/       # 请求跟踪记录
+├── extension/       # 可插拔扩展
+│   ├── codex/       # Codex 模型目录（catalog.go、default_instructions.go）
+│   ├── db/          # 数据库 Provider（sqlite/、d1/）
+│   ├── deepseek_v4/ # DeepSeek V4 推理优化
+│   ├── kimi_workaround/  # Kimi 模型 tool call 轮次限制
+│   ├── metrics/     # 用量指标采集与查询
+│   ├── plugin/      # Plugin 接口 + 能力接口 + 注册表
+│   ├── visual/      # 视觉模型分发（CoreProvider 模式）
+│   ├── websearch/   # Web Search 编排器
+│   └── websearchinjected/  # 注入式搜索插件
+└── e2e/             # 端到端集成测试（协议转换）
 ```
 
 ### 依赖方向
 
 ```
-extension → foundation, protocol
-service → foundation, protocol, extension
-protocol → foundation
-foundation → （无内部依赖）
+extension → config, format, protocol
+service → config, format, protocol, extension
+protocol → config, format
+format → config, openai_dto
+config, logger, modelref, session, db → （无内部依赖）
 ```
 
 禁止反向依赖。特别是：
 
 - `extension` 包不能依赖 `service` 包
-- `protocol` 包不能依赖 `extension` 包（通过 `PluginHooks` 函数结构体解耦）
-- `foundation` 包不能依赖 `protocol` 或 `service`
+- `protocol` 包不能依赖 `extension` 包（通过 `format.CorePluginHooks` 函数结构体解耦）
+- 基础组件（`config`、`logger`、`modelref`、`session`、`db`）不能依赖 `protocol`、`service` 或 `extension`
 
 ### 循环依赖预防策略
 
-当 `protocol/bridge` 需要调用 `extension/plugin` 的功能时，不直接引用 plugin 包，而是：
+插件与协议层通过 `internal/format/adapter.go` 中定义的 `CorePluginHooks` 函数结构体解耦：
 
-1. `bridge` 包定义 `PluginHooks` 函数结构体（见 `internal/protocol/bridge/hooks.go`）
-2. `pluginhooks` 包实现 `PluginHooksFromRegistry()` 适配函数
-3. Server 层在初始化时调用适配函数，将 `*plugin.Registry` 转换为 `bridge.PluginHooks`
+1. `extension/plugin/Registry.CorePluginHooks()` 方法串联已注册插件的所有能力，返回 `format.CorePluginHooks`
+2. Adapter 和 Server 层接收 `CorePluginHooks` 作为依赖，在请求处理过程中调用对应的 hook 函数
+3. 插件通过 `extension/plugin/capabilities.go` 中定义的能力接口（`CoreRequestMutator`、`CoreContentFilter` 等）实现功能，无需直接引用 protocol 或 service 层
 
 ## 编码规范
 
@@ -79,8 +79,8 @@ foundation → （无内部依赖）
 
 ### 命名规则
 
-- **包名**：全小写，单数形式（`plugin`、`config`、`bridge`）
-- **接口名**：行为驱动（`InputPreprocessor`、`ContentFilter`、`ProviderWrapper`）
+- **包名**：全小写，单数形式（`plugin`、`config`）
+- **接口名**：行为驱动（`InputPreprocessor`、`ContentFilter`、`DBProvider`）
 - **错误变量**：以 `Err` 前缀（`ErrNotFound`）
 - **常量**：CamelCase（`ProtocolAnthropic`、`ModeTransform`）
 
@@ -96,9 +96,9 @@ foundation → （无内部依赖）
 
 ### 日志
 
-- 使用 `internal/foundation/logger` 包，基于 `slog`
-- 调用 `logger.Info()`, `logger.Warn()`, `logger.Error()`, `logger.Debug()`
-- 使用 `With("key", value)` 添加结构化字段
+- 使用 `internal/logger` 包，基于 `slog`
+- 调用 `slog.Info()`, `slog.Warn()`, `slog.Error()`, `slog.Debug()` 或 `slog.Default().With(...)`
+- 使用 `With("key", value)` 添加结构化字段，对相关属性群使用 `WithGroup` 或 `slog.Group`
 - 日志级别支持：`debug`、`info`、`warn`、`error`
 
 ### 配置演进
@@ -106,7 +106,7 @@ foundation → （无内部依赖）
 项目仍在开发中，不需要保留旧配置兼容性。配置结构变更时直接：
 
 1. 更新 `config.example.yml`
-2. 更新 `internal/foundation/config/config_loader.go` 的 `FileConfig` 和 `FromFileConfigWithOptions()`
+2. 更新 `internal/config/config_loader.go` 的 `FileConfig` 和 `LoadFromFileWithOptions()`
 3. 更新相关脚本（`scripts/` 目录）
 4. 更新 README、`docs/config-migration.md` 和本文档
 
@@ -126,13 +126,14 @@ Extension 专属配置不得再直接加到 core config struct。新增 extensio
 ### 覆盖目标
 
 - `internal/extension/plugin` 强制覆盖率 ≥95%
-- 核心协议层（`bridge`、`cache`）应保持高覆盖率
+- 核心协议层应保持高覆盖率
 - 新功能应伴随测试
 
 ### 测试模式
 
 - 单元测试：测试单个包，mock 外部依赖
-- 端到端测试（`internal/service/e2e/`）：测试完整请求-响应链路
+- 端到端测试（`internal/e2e/`）：测试完整请求-响应链路
+- 服务层 E2E 测试（`internal/service/e2e/`）：完整 HTTP 请求/响应链路测试
 
 ### 测试数据
 
@@ -143,7 +144,7 @@ Extension 专属配置不得再直接加到 core config struct。新增 extensio
 
 - 每个插件放在 `internal/extension/<name>/` 目录
 - 插件必须实现 `plugin.Plugin` 接口（Name + Init + Shutdown + EnabledForModel）
-- 可按需实现零个或多个能力接口（ToolInjector、ContentFilter 等）
+- 可按需实现零个或多个能力接口（`CoreRequestMutator`、`CoreContentFilter` 等，定义在 `internal/extension/plugin/capabilities.go`）
 - 在 `plugin.go` 的末尾用编译期断言验证接口实现
 - 需要配置的 extension 实现 `plugin.ConfigSpecProvider`，配置来自 `extensions.<name>.config`，启用状态通过 `extensions.<name>.enabled` 按 global/provider/model/route 继承解析
 - `PluginContext.Config` 接收 typed config，`PluginContext.AppConfig` 提供只读全局配置和 per-model resolver

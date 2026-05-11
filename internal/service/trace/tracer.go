@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"moonbridge/internal/foundation/logger"
+	"log/slog"
 )
 
 const DefaultRoot = "data" + "/" + "trace"
@@ -41,6 +41,9 @@ type Record struct {
 	ProxyRequest          any         `json:"proxy_request,omitempty"`
 	UpstreamRequest       any         `json:"upstream_request,omitempty"`
 	UpstreamResponse      any         `json:"upstream_response,omitempty"`
+	ChatRequest           any         `json:"chat_request,omitempty"`
+	ChatResponse          any         `json:"chat_response,omitempty"`
+	ChatStreamEvents      any         `json:"chat_stream_events,omitempty"`
 	OpenAIRequest         any         `json:"openai_request,omitempty"`
 	AnthropicRequest      any         `json:"anthropic_request,omitempty"`
 	AnthropicResponse     any         `json:"anthropic_response,omitempty"`
@@ -145,7 +148,7 @@ func (tracer *Tracer) WriteNumbered(category string, requestNumber uint64, recor
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		return "", err
 	}
-	logger.Debug("跟踪已写入", "path", path, "category", category, "request_number", requestNumber)
+	slog.Debug("跟踪已写入", "path", path, "category", category, "request_number", requestNumber)
 	return path, nil
 }
 

@@ -17,16 +17,14 @@ import (
 	"testing"
 	"time"
 
-	"moonbridge/internal/foundation/config"
-	"moonbridge/internal/protocol/anthropic"
-	"moonbridge/internal/protocol/bridge"
-	"moonbridge/internal/protocol/cache"
+	"moonbridge/internal/config"
+	"moonbridge/internal/service/provider"
 	"moonbridge/internal/service/server"
 )
 
 func TestResponsesTextE2E(t *testing.T) {
 	e2eConfig := loadE2EConfig(t)
-	handler := newE2EHandler(e2eConfig.Config)
+	handler := newE2EHandler(t, e2eConfig.Config)
 
 	response := postResponses(t, handler, map[string]any{
 		"model":             e2eConfig.ModelAlias,
@@ -49,7 +47,7 @@ func TestResponsesTextE2E(t *testing.T) {
 
 func TestResponsesFunctionToolE2E(t *testing.T) {
 	e2eConfig := loadE2EConfig(t)
-	handler := newE2EHandler(e2eConfig.Config)
+	handler := newE2EHandler(t, e2eConfig.Config)
 
 	response := postResponses(t, handler, map[string]any{
 		"model": e2eConfig.ModelAlias,
@@ -90,7 +88,7 @@ func TestResponsesPromptCacheE2E(t *testing.T) {
 	if os.Getenv("MOONBRIDGE_E2E_CACHE") != "1" {
 		t.Skip("set MOONBRIDGE_E2E_CACHE=1 to run cache-costing e2e")
 	}
-	handler := newE2EHandlerWithCache(e2eConfig.Config, config.CacheConfig{
+	handler := newE2EHandlerWithCache(t, e2eConfig.Config, config.CacheConfig{
 		Mode:                     "explicit",
 		TTL:                      "5m",
 		PromptCaching:            true,
@@ -124,21 +122,67 @@ type e2eConfig struct {
 	ModelAlias string
 }
 
-func newE2EHandler(cfg config.Config) http.Handler {
-	return newE2EHandlerWithCache(cfg, config.CacheConfig{Mode: "off"})
+func newE2EHandler(t *testing.T, cfg config.Config) http.Handler {
+	t.Helper()
+	return newE2EHandlerWithCache(t, cfg, config.CacheConfig{Mode: "off"})
 }
 
-func newE2EHandlerWithCache(cfg config.Config, cacheConfig config.CacheConfig) http.Handler {
+func newE2EHandlerWithCache(t *testing.T, cfg config.Config, cacheConfig config.CacheConfig) http.Handler {
+	t.Helper()
 	cfg.Cache = cacheConfig
+
+	providerDefs := buildProviderDefsForTest(cfg)
+	modelRoutes := buildModelRoutesForTest(cfg)
+	providerMgr, err := provider.NewProviderManager(providerDefs, modelRoutes)
+	if err != nil {
+		t.Fatalf("failed to create provider manager: %v", err)
+	}
+
 	return server.New(server.Config{
-		Bridge: bridge.New(cfg, cache.NewMemoryRegistry(), bridge.PluginHooks{}),
-		Provider: anthropic.NewClient(anthropic.ClientConfig{
-			BaseURL:   cfg.ProviderBaseURL,
-			APIKey:    cfg.ProviderAPIKey,
-			Version:   cfg.ProviderVersion,
-			UserAgent: cfg.ProviderUserAgent,
-		}),
+		ProviderMgr: providerMgr,
+		AppConfig:   cfg,
 	})
+}
+
+// buildProviderDefsForTest converts config.ProviderDefs into the provider.ProviderConfig
+// map needed by provider.NewProviderManager.
+func buildProviderDefsForTest(cfg config.Config) map[string]provider.ProviderConfig {
+	defs := make(map[string]provider.ProviderConfig, len(cfg.ProviderDefs))
+	for key, def := range cfg.ProviderDefs {
+		modelNames := make([]string, 0, len(def.Models))
+		for name := range def.Models {
+			modelNames = append(modelNames, name)
+		}
+		models := make(map[string]provider.ModelMeta, len(def.Models))
+		for name, meta := range def.Models {
+			models[name] = provider.ModelMeta(meta)
+		}
+		defs[key] = provider.ProviderConfig{
+			BaseURL:          def.BaseURL,
+			APIKey:           def.APIKey,
+			Version:          def.Version,
+			UserAgent:        def.UserAgent,
+			Protocol:         def.Protocol,
+			WebSearchSupport: string(def.WebSearchSupport),
+			ModelNames:       modelNames,
+			Models:           models,
+			Offers:           def.Offers,
+		}
+	}
+	return defs
+}
+
+// buildModelRoutesForTest converts config.Routes into the provider.ModelRoute map
+// needed by provider.NewProviderManager.
+func buildModelRoutesForTest(cfg config.Config) map[string]provider.ModelRoute {
+	routes := make(map[string]provider.ModelRoute, len(cfg.Routes))
+	for alias, route := range cfg.Routes {
+		routes[alias] = provider.ModelRoute{
+			Provider: route.Provider,
+			Name:     route.Model,
+		}
+	}
+	return routes
 }
 
 func postResponses(t *testing.T, handler http.Handler, payload map[string]any) map[string]any {
@@ -230,14 +274,14 @@ func e2eModelAlias(routes map[string]config.RouteEntry) (string, error) {
 		return "moonbridge", nil
 	}
 
-	aliases := make([]string, 0, len(models))
-	for alias, mapped := range models {
-		if strings.TrimSpace(alias) != "" && strings.TrimSpace(mapped) != "" {
+	aliases := make([]string, 0, len(routes))
+	for alias, route := range routes {
+		if strings.TrimSpace(alias) != "" && strings.TrimSpace(route.Model) != "" {
 			aliases = append(aliases, alias)
 		}
 	}
 	if len(aliases) == 0 {
-		return "", fmt.Errorf("provider.providers.<key>.models must contain at least one non-empty model mapping")
+		return "", fmt.Errorf("routes must contain at least one valid model mapping")
 	}
 	slices.Sort(aliases)
 	return aliases[0], nil

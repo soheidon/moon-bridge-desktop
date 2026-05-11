@@ -7,8 +7,9 @@ import (
 	"strings"
 	"testing"
 
+	"moonbridge/internal/format"
 	pluginpkg "moonbridge/internal/extension/plugin"
-	"moonbridge/internal/foundation/openai"
+	"moonbridge/internal/protocol/openai"
 	"moonbridge/internal/protocol/anthropic"
 )
 
@@ -104,7 +105,7 @@ func TestToAnthropicRequestIgnoresUnsupportedReasoningEffort(t *testing.T) {
 }
 
 func TestEncodeDecodeThinkingSummaryPreservesSignatureOnlyBlock(t *testing.T) {
-	encoded := EncodeThinkingSummary(anthropic.ContentBlock{Type: "thinking", Signature: "sig_only"})
+	encoded := EncodeThinkingSummary(format.CoreContentBlock{Type: "reasoning", ReasoningSignature: "sig_only"})
 	if encoded == "" {
 		t.Fatal("encoded summary is empty")
 	}
@@ -112,7 +113,7 @@ func TestEncodeDecodeThinkingSummaryPreservesSignatureOnlyBlock(t *testing.T) {
 	if !ok {
 		t.Fatal("expected encoded summary to decode")
 	}
-	if decoded.Type != "thinking" || decoded.Thinking != "" || decoded.Signature != "sig_only" {
+	if decoded.Type != "reasoning" || decoded.ReasoningText != "" || decoded.ReasoningSignature != "sig_only" {
 		t.Fatalf("decoded block = %+v", decoded)
 	}
 }
@@ -127,13 +128,13 @@ func TestPrependThinkingWarnsWhenUsingRequiredFallback(t *testing.T) {
 		t.Fatalf("Init() error = %v", err)
 	}
 
-	messages := []anthropic.Message{{
+	messages := []format.CoreMessage{{
 		Role:    "assistant",
-		Content: []anthropic.ContentBlock{{Type: "tool_use", ID: "call_missing"}},
+		Content: []format.CoreContentBlock{{Type: "tool_use", ToolUseID: "call_missing"}},
 	}}
 	got := p.PrependThinkingForToolUse(messages, "call_missing", nil, NewState())
 
-	if got[0].Content[0].Type != "thinking" || got[0].Content[0].Thinking != "" {
+	if got[0].Content[0].Type != "reasoning" || got[0].Content[0].ReasoningText != "" {
 		t.Fatalf("fallback thinking block = %+v", got[0].Content)
 	}
 	logText := logs.String()
@@ -143,15 +144,15 @@ func TestPrependThinkingWarnsWhenUsingRequiredFallback(t *testing.T) {
 
 	logs.Reset()
 	summary := []openai.ReasoningItemSummary{{
-		Type: "summary_text",
-		Text: EncodeThinkingSummary(anthropic.ContentBlock{Type: "thinking", Signature: "sig_summary"}),
+			Type: "summary_text",
+			Text: EncodeThinkingSummary(format.CoreContentBlock{Type: "reasoning", ReasoningSignature: "sig_summary"}),
 	}}
-	got = p.PrependThinkingForToolUse([]anthropic.Message{{
+	got = p.PrependThinkingForToolUse([]format.CoreMessage{{
 		Role:    "assistant",
-		Content: []anthropic.ContentBlock{{Type: "tool_use", ID: "call_summary"}},
+		Content: []format.CoreContentBlock{{Type: "tool_use", ToolUseID: "call_summary"}},
 	}}, "call_summary", summary, NewState())
 
-	if got[0].Content[0].Type != "thinking" || got[0].Content[0].Signature != "sig_summary" {
+	if got[0].Content[0].Type != "reasoning" || got[0].Content[0].ReasoningSignature != "sig_summary" {
 		t.Fatalf("summary thinking block = %+v", got[0].Content)
 	}
 	if logs.Len() != 0 {
@@ -160,13 +161,13 @@ func TestPrependThinkingWarnsWhenUsingRequiredFallback(t *testing.T) {
 
 	logs.Reset()
 	state := NewState()
-	state.RememberForToolCalls([]string{"call_cached"}, anthropic.ContentBlock{Type: "thinking", Signature: "sig_cached"})
-	got = p.PrependThinkingForToolUse([]anthropic.Message{{
+	state.RememberForToolCalls([]string{"call_cached"}, format.CoreContentBlock{Type: "reasoning", ReasoningSignature: "sig_cached"})
+	got = p.PrependThinkingForToolUse([]format.CoreMessage{{
 		Role:    "assistant",
-		Content: []anthropic.ContentBlock{{Type: "tool_use", ID: "call_cached"}},
+		Content: []format.CoreContentBlock{{Type: "tool_use", ToolUseID: "call_cached"}},
 	}}, "call_cached", nil, state)
 
-	if got[0].Content[0].Type != "thinking" || got[0].Content[0].Signature != "sig_cached" {
+	if got[0].Content[0].Type != "reasoning" || got[0].Content[0].ReasoningSignature != "sig_cached" {
 		t.Fatalf("cached thinking block = %+v", got[0].Content)
 	}
 	if logs.Len() != 0 {

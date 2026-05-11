@@ -6,18 +6,27 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"time"
 
-	"moonbridge/internal/extension/pluginhooks"
-	"moonbridge/internal/foundation/config"
-	"moonbridge/internal/foundation/db"
-	"moonbridge/internal/foundation/logger"
+	"log/slog"
+	"moonbridge/internal/config"
+	"moonbridge/internal/db"
+	"moonbridge/internal/service/store"
+	"moonbridge/internal/logger"
 	"moonbridge/internal/protocol/anthropic"
-	"moonbridge/internal/protocol/bridge"
+	"moonbridge/internal/protocol/google"
+	"moonbridge/internal/protocol/chat"
 	"moonbridge/internal/protocol/cache"
+	"moonbridge/internal/format"
+	"moonbridge/internal/protocol/openai"
 	"moonbridge/internal/service/provider"
 	"moonbridge/internal/service/proxy"
+	"moonbridge/internal/service/runtime"
 	"moonbridge/internal/service/server"
+	"moonbridge/internal/service/server/session"
+	"moonbridge/internal/service/server/trace"
+	"moonbridge/internal/service/server/usage"
 	"moonbridge/internal/service/stats"
 	mbtrace "moonbridge/internal/service/trace"
 )
@@ -35,13 +44,13 @@ func WelcomeMessage() string {
 func RunServer(ctx context.Context, cfg config.Config, errors io.Writer) error {
 	switch cfg.Mode {
 	case config.ModeTransform:
-		logger.Info("启动服务器", "mode", cfg.Mode, "addr", cfg.Addr)
+		slog.Info("启动服务器", "mode", cfg.Mode, "addr", cfg.Addr)
 		return runTransform(ctx, cfg, errors)
 	case config.ModeCaptureResponse:
-		logger.Info("启动服务器", "mode", cfg.Mode, "addr", cfg.Addr)
+		slog.Info("启动服务器", "mode", cfg.Mode, "addr", cfg.Addr)
 		return runCaptureResponse(ctx, cfg, errors)
 	case config.ModeCaptureAnthropic:
-		logger.Info("启动服务器", "mode", cfg.Mode, "addr", cfg.Addr)
+		slog.Info("启动服务器", "mode", cfg.Mode, "addr", cfg.Addr)
 		return runCaptureAnthropic(ctx, cfg, errors)
 	default:
 		return fmt.Errorf("unsupported mode %q", cfg.Mode)
@@ -49,60 +58,37 @@ func RunServer(ctx context.Context, cfg config.Config, errors io.Writer) error {
 }
 
 func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) error {
-	// Build multi-provider infrastructure.
-	providerDefs := buildProviderDefsFromConfig(cfg)
-	modelRoutes := buildModelRoutesFromConfig(cfg)
+	// Construct domain configs from global config.
+	serverCfg := config.ServerFromGlobalConfig(&cfg)
+	cacheCfg := config.CacheFromGlobalConfig(&cfg)
+	proxyCfg := config.ProxyFromGlobalConfig(&cfg)
+	storeCfg := config.StoreFromGlobalConfig(&cfg)
+	persistCfg := config.PersistenceFromGlobalConfig(&cfg)
+	providerCfg := config.ProviderFromGlobalConfig(&cfg)
+	_ = persistCfg   // used in db init
+	_ = storeCfg     // used in config store
+	_ = proxyCfg     // used in proxy mode
+
+		// === Phase 1: Bootstrap from YAML ===
+
+	// Build multi-provider infrastructure from YAML config.
+	providerDefs := provider.BuildProviderDefsFromConfig(providerCfg)
+	modelRoutes := provider.BuildModelRoutesFromConfig(providerCfg)
 	providerMgr, err := provider.NewProviderManager(providerDefs, modelRoutes)
 	if err != nil {
 		return fmt.Errorf("init provider manager: %w", err)
 	}
 
 	// Resolve a fallback client for web search probing and server fallback.
-	// When no "default" provider is configured, probe and fallback are skipped.
 	defaultClient := resolveDefaultClient(providerMgr, errors)
 	resolvePerProviderWebSearch(ctx, cfg, providerMgr, errors)
 
 	sessionStats := stats.NewSessionStats()
-	// Set per-model pricing from routes and provider/model direct references
-	pricing := make(map[string]stats.ModelPricing)
-	for alias, route := range cfg.Routes {
-		if route.InputPrice > 0 || route.OutputPrice > 0 || route.CacheWritePrice > 0 || route.CacheReadPrice > 0 {
-			pricing[alias] = stats.ModelPricing{
-				InputPrice:      route.InputPrice,
-				OutputPrice:     route.OutputPrice,
-				CacheWritePrice: route.CacheWritePrice,
-				CacheReadPrice:  route.CacheReadPrice,
-			}
-		}
-	}
-	// Also index pricing by provider/model or model(provider) slug for direct references.
-	for providerKey, def := range cfg.ProviderDefs {
-		for modelName, meta := range def.Models {
-			slug := providerKey + "/" + modelName
-			newSlug := modelName + "(" + providerKey + ")"
-			if _, exists := pricing[slug]; exists {
-				// route alias already has pricing (may differ from model meta);
-				// still index the new format key if not already set.
-				if _, exists := pricing[newSlug]; !exists {
-					pricing[newSlug] = pricing[slug]
-				}
-				continue
-			}
-			if meta.InputPrice > 0 || meta.OutputPrice > 0 || meta.CacheWritePrice > 0 || meta.CacheReadPrice > 0 {
-				p := stats.ModelPricing{
-					InputPrice:      meta.InputPrice,
-					OutputPrice:     meta.OutputPrice,
-					CacheWritePrice: meta.CacheWritePrice,
-					CacheReadPrice:  meta.CacheReadPrice,
-				}
-				pricing[slug] = p
-				pricing[newSlug] = p
-			}
-		}
-	}
+	pricing := provider.BuildPricingFromConfig(providerCfg)
 	if len(pricing) > 0 {
 		sessionStats.SetPricing(pricing)
 	}
+
 	tracer := mbtrace.New(mbtrace.Config{
 		Enabled: cfg.TraceRequests,
 		Root:    transformTraceRoot(),
@@ -110,14 +96,13 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) erro
 	logTrace(errors, "transform", tracer)
 
 	// Determine the default provider to use as the fallback Provider.
-	// *anthropic.Client directly implements server.Provider.
-	var fallbackProvider server.Provider
+	var fallbackProvider provider.ProviderClient
 	if defaultClient != nil {
-		fallbackProvider = defaultClient
+		fallbackProvider = provider.NewAnthropicClientAdapter(defaultClient)
 	}
 
 	// Register plugins.
-	plugins := BuiltinExtensions().NewRegistry(logger.L(), cfg)
+	plugins := BuiltinExtensions().NewRegistry(slog.Default(), cfg)
 	if err := plugins.InitAll(&cfg); err != nil {
 		return fmt.Errorf("init plugins: %w", err)
 	}
@@ -129,7 +114,7 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) erro
 	})
 
 	// Initialize persistence layer (db.Registry).
-	dbRegistry := db.NewRegistry(logger.L())
+	dbRegistry := db.NewRegistry(slog.Default())
 	for _, p := range plugins.DBProviders() {
 		if prov := p.DBProvider(); prov != nil {
 			dbRegistry.RegisterProvider(prov)
@@ -140,88 +125,185 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) erro
 			dbRegistry.RegisterConsumer(cons)
 		}
 	}
+	// Register the config_store consumer for configuration persistence.
+	configStoreConsumer := store.NewConfigStoreConsumer(logger.L())
+	configStoreConsumer.SetExtensionSpecs(BuiltinExtensions().ConfigSpecs())
+	dbRegistry.RegisterConsumer(configStoreConsumer)
 	if err := dbRegistry.Init(ctx, cfg.Persistence.ActiveProvider); err != nil {
 		return fmt.Errorf("init persistence: %w", err)
 	}
 	defer dbRegistry.Shutdown()
+
+	// === Phase 2: ConfigStore bootstrap ===
+	// Check if the store is available and has existing data.
+	cs := configStoreConsumer.Store()
+	if cs != nil {
+		if dbCfg, loadErr := cs.LoadAll(); loadErr == nil {
+			if len(dbCfg.ProviderDefs) > 0 || len(dbCfg.Routes) > 0 {
+				// DB has existing configuration: use it as the active config.
+				logger.Info("从持久化存储加载配置",
+					"providers", len(dbCfg.ProviderDefs),
+					"routes", len(dbCfg.Routes))
+				cfg = *dbCfg
+				dbProviderCfg := config.ProviderFromGlobalConfig(&cfg)
+
+				// Rebuild provider manager and pricing from DB-loaded config.
+				providerDefs = provider.BuildProviderDefsFromConfig(dbProviderCfg)
+				modelRoutes = provider.BuildModelRoutesFromConfig(dbProviderCfg)
+				providerMgr, err = provider.NewProviderManager(providerDefs, modelRoutes)
+				if err != nil {
+					return fmt.Errorf("rebuild provider manager from DB: %w", err)
+				}
+				_ = resolveDefaultClient(providerMgr, errors)
+				resolvePerProviderWebSearch(ctx, cfg, providerMgr, errors)
+
+				pricing = provider.BuildPricingFromConfig(dbProviderCfg)
+				if len(pricing) > 0 {
+					sessionStats.SetPricing(pricing)
+				}
+			} else {
+				// DB is empty: seed from YAML config.
+				logger.Info("持久化存储为空，从 YAML 导入种子配置")
+				if err := cs.SeedFromConfig(&cfg); err != nil {
+					logger.Warn("config store 种子导入失败", "error", err)
+				}
+			}
+		} else if loadErr != nil {
+			if strings.Contains(loadErr.Error(), "config not seeded") {
+				logger.Info("persistence store is empty, skipping DB config load")
+			} else {
+				logger.Warn("config store 加载失败", "error", loadErr)
+			}
+		}
+	} else {
+		logger.Warn("config store 不可用，跳过持久化引导")
+	}
+
+		// === Phase 3: Build Runtime ===
+	rt := runtime.NewRuntime(cfg, providerMgr, pricing)
+
+	// === Phase 4: Build Server with Runtime ===
+	// Create shared cache registry (used by both Bridge and Adapter paths).
+	cacheReg := cache.NewMemoryRegistry()
+
+	// Optionally create the experimental adapter registry.
+	// Create the adapter registry for Core format dispatch.
+	adapterReg := format.NewRegistry()
+	coreHooks := plugins.CorePluginHooks()
+
+	// Inbound: OpenAI Responses client adapter.
+	oaiAdapter := openai.NewOpenAIAdapter(coreHooks)
+	_ = adapterReg.RegisterClient(oaiAdapter)
+	_ = adapterReg.RegisterClientStream(oaiAdapter)
+
+	// Upstream: Anthropic provider adapter with cache manager.
+	cacheMgr := anthropic.NewCacheManager(&cfg.Cache, cacheReg)
+	anthAdapter := anthropic.NewAnthropicProviderAdapter(cfg.DefaultMaxTokens, cacheMgr, coreHooks)
+	_ = adapterReg.RegisterProvider(anthAdapter)
+	_ = adapterReg.RegisterProviderStream(anthAdapter)
+
+	// Upstream: Google GenAI provider adapter.
+		googleCfg := &cache.PlanCacheConfig{
+			Mode:                     cacheCfg.Mode,
+			TTL:                      cacheCfg.TTL,
+			PromptCaching:            cacheCfg.PromptCaching,
+			AutomaticPromptCache:     cacheCfg.AutomaticPromptCache,
+			ExplicitCacheBreakpoints: cacheCfg.ExplicitCacheBreakpoints,
+			AllowRetentionDowngrade:  cacheCfg.AllowRetentionDowngrade,
+			MaxBreakpoints:           cacheCfg.MaxBreakpoints,
+			MinCacheTokens:           cacheCfg.MinCacheTokens,
+			ExpectedReuse:            cacheCfg.ExpectedReuse,
+			MinimumValueScore:        cacheCfg.MinimumValueScore,
+			MinBreakpointTokens:      cacheCfg.MinBreakpointTokens,
+		}
+	googleAdapter := google.NewGeminiProviderAdapter(cfg.DefaultMaxTokens, nil, coreHooks, googleCfg, cacheReg)
+	_ = adapterReg.RegisterProvider(googleAdapter)
+	_ = adapterReg.RegisterProviderStream(googleAdapter)
+
+	// Upstream: OpenAI Chat provider adapter.
+	chatAdapter := chat.NewChatProviderAdapter(cfg.DefaultMaxTokens, nil, coreHooks)
+	_ = adapterReg.RegisterProvider(chatAdapter)
+	_ = adapterReg.RegisterProviderStream(chatAdapter)
+
+	slog.Info("Adapter dispatch path enabled", "registry", "format.Registry")
+
+	// Build protocol-specific HTTP clients from provider configs.
+	chatClients := make(map[string]any, len(cfg.ProviderDefs))
+	googleClients := make(map[string]any, len(cfg.ProviderDefs))
+	for key, def := range cfg.ProviderDefs {
+		switch def.Protocol {
+		case config.ProtocolOpenAIChat:
+			chatClients[key] = chat.NewClient(chat.ClientConfig{
+				BaseURL:   def.BaseURL,
+				APIKey:    def.APIKey,
+				UserAgent: def.UserAgent,
+			})
+			slog.Debug("chat client created", "provider", key)
+		case config.ProtocolGoogleGenAI:
+			googleClients[key] = google.NewClient(google.ClientConfig{
+				BaseURL:   def.BaseURL,
+				APIKey:    def.APIKey,
+				Project:   def.Project,
+				Location:  def.Location,
+				Version:   def.APIVersion,
+				UserAgent: def.UserAgent,
+			})
+			slog.Debug("google client created", "provider", key)
+		}
+	}
+
+
+	// Create sub-package managers for session, usage, and trace.
+	sessMgr := session.NewInMemoryManager(server.NewSessionConfigAdapter(serverCfg), plugins)
+	usageTrk := usage.NewStatsTracker(sessionStats)
+	traceWtr := trace.NewFileWriter(tracer, errors)
+
 	handler := server.New(server.Config{
-		Bridge:         bridge.New(cfg, cache.NewMemoryRegistry(), pluginhooks.PluginHooksFromRegistry(plugins)),
-		Provider:       fallbackProvider,
-		ProviderMgr:    providerMgr,
-		Tracer:         tracer,
-		TraceErrors:    errors,
-		Stats:          sessionStats,
-		PluginRegistry: plugins,
-		AppConfig:      cfg,
+		ServerCfg:      serverCfg,
+		Provider:        fallbackProvider,
+		ProviderMgr:     providerMgr,
+		ChatClients:     chatClients,
+		GoogleClients:   googleClients,
+		Tracer:          tracer,
+		TraceErrors:     errors,
+		Stats:           sessionStats,
+		PluginRegistry:  plugins,
+		AppConfig:       serverCfg,
+		Runtime:         rt,
+		AdapterRegistry: adapterReg,
+		SessionManager:  sessMgr,
+		UsageTracker:    usageTrk,
+		TraceWriter:     traceWtr,
 	})
 
-	return runHTTPServer(ctx, cfg.Addr, handler, errors, sessionStats)
+	wrapped := handler
+	return runHTTPServer(ctx, cfg.Addr, wrapped, errors, sessionStats)
 }
 
 // resolveDefaultClient returns the provider client for the default key.
 // Returns nil when no default provider is configured (all models use explicit routing).
 func resolveDefaultClient(pm *provider.ProviderManager, errors io.Writer) *anthropic.Client {
 	if pm.DefaultKey() == "" {
-		logger.Warn("未配置默认提供商，跳过网页搜索探测和服务器回退")
+		slog.Warn("未配置默认提供商，跳过网页搜索探测和服务器回退")
 		return nil
 	}
 	client, err := pm.ClientForKey(pm.DefaultKey())
 	if err != nil {
-		logger.Warn("默认提供商客户端不可用", "error", err)
+		slog.Warn("默认提供商客户端不可用", "error", err)
 		return nil
 	}
-	return client
-}
-
-// buildProviderDefsFromConfig converts config into provider definition map.
-func buildProviderDefsFromConfig(cfg config.Config) map[string]provider.ProviderConfig {
-	if len(cfg.ProviderDefs) > 0 {
-		defs := make(map[string]provider.ProviderConfig, len(cfg.ProviderDefs))
-		for key, def := range cfg.ProviderDefs {
-			modelNames := make([]string, 0, len(def.Models))
-			for name := range def.Models {
-				modelNames = append(modelNames, name)
-			}
-			defs[key] = provider.ProviderConfig{
-				BaseURL:          def.BaseURL,
-				APIKey:           def.APIKey,
-				Version:          def.Version,
-				UserAgent:        def.UserAgent,
-				Protocol:         def.Protocol,
-				WebSearchSupport: string(def.WebSearchSupport),
-				ModelNames:       modelNames,
-			}
-		}
-		return defs
+	if acc, ok := client.(provider.AnthropicClientAccessor); ok {
+		return acc.AnthropicClient()
 	}
-	// Legacy single-provider mode.
-	return provider.BuildProviderConfigs(
-		cfg.ProviderBaseURL,
-		cfg.ProviderAPIKey,
-		cfg.ProviderVersion,
-		cfg.ProviderUserAgent,
-		nil,
-	)
+	slog.Warn("默认提供商客户端不支持访问底层客户端")
+	return nil
 }
 
-// buildModelRoutesFromConfig converts config model entries into route definitions.
-func buildModelRoutesFromConfig(cfg config.Config) map[string]provider.ModelRoute {
-	routes := make(map[string]provider.ModelRoute, len(cfg.Routes))
-	for alias, route := range cfg.Routes {
-		routes[alias] = provider.ModelRoute{
-			Provider: route.Provider,
-			Name:     route.Model,
-		}
-	}
-	return routes
-}
-
+// webSearchProber interface and following functions are unchanged.
 type webSearchProber interface {
 	ProbeWebSearch(context.Context, string) (bool, error)
 }
 
-// resolvePerProviderWebSearch resolves web_search support for each provider and
-// each model that has a model-level override.
 // resolvePerProviderWebSearch resolves web_search support for each provider and
 // each model that has a model-level override.
 func resolvePerProviderWebSearch(ctx context.Context, cfg config.Config, pm *provider.ProviderManager, errors io.Writer) {
@@ -237,32 +319,39 @@ func resolvePerProviderWebSearch(ctx context.Context, cfg config.Config, pm *pro
 			switch support {
 			case config.WebSearchSupportDisabled:
 				pm.SetResolvedWebSearch(key, "disabled")
-				logger.Info("配置禁用网页搜索", "provider", key)
+				slog.Info("配置禁用网页搜索", "provider", key)
 			case config.WebSearchSupportEnabled:
 				pm.SetResolvedWebSearch(key, "enabled")
-				logger.Info("配置强制启用网页搜索", "provider", key)
+				slog.Info("配置强制启用网页搜索", "provider", key)
 			case config.WebSearchSupportInjected:
 				pm.SetResolvedWebSearch(key, "injected")
-				logger.Info("网页搜索注入模式已启用", "provider", key)
+				slog.Info("网页搜索注入模式已启用", "provider", key)
 			default:
 				resolved := probeProviderWebSearch(ctx, key, pm, errors)
+				if resolved == "disabled" && cfg.TavilyAPIKey != "" {
+					resolved = "injected"
+					slog.Info("网页搜索自动探测失败，回退到注入模式", "provider", key)
+				}
 				pm.SetResolvedWebSearch(key, resolved)
 			}
 		case config.ProtocolOpenAIResponse:
-			// OpenAI Responses API natively supports the web_search tool type.
-			// Auto-discovery is unnecessary: "auto"/"enabled"/empty all enable it.
-			// "injected" mode (Tavily/Firecrawl) is Anthropic-only; map to "disabled".
 			switch support {
 			case config.WebSearchSupportDisabled, config.WebSearchSupportInjected:
 				pm.SetResolvedWebSearch(key, "disabled")
-				logger.Info("响应端网页搜索已禁用", "provider", key, "protocol", protocol, "config", support)
+				slog.Info("响应端网页搜索已禁用", "provider", key, "protocol", protocol, "config", support)
 			default:
 				pm.SetResolvedWebSearch(key, "enabled")
-				logger.Info("已启用响应端网页搜索", "provider", key, "protocol", protocol)
+				slog.Info("已启用响应端网页搜索", "provider", key, "protocol", protocol)
 			}
 		default:
-			pm.SetResolvedWebSearch(key, "disabled")
-			logger.Info("跳过网页搜索：不支持的协议", "provider", key, "protocol", protocol)
+			// openai-chat 和 google-genai 无原生 web_search，有 API key 时启用注入模式
+			if cfg.TavilyAPIKey != "" {
+				pm.SetResolvedWebSearch(key, "injected")
+				slog.Info("注入式网页搜索已启用", "provider", key, "protocol", protocol)
+			} else {
+				pm.SetResolvedWebSearch(key, "disabled")
+				slog.Info("跳过网页搜索：无 Tavily API key", "provider", key, "protocol", protocol)
+			}
 		}
 	}
 	// 2. Resolve model-level overrides for provider catalog slugs and route aliases.
@@ -274,6 +363,8 @@ func resolvePerProviderWebSearch(ctx context.Context, cfg config.Config, pm *pro
 			modelWS := cfg.WebSearchForModel(alias)
 			resolveModelWebSearch(ctx, alias, modelWS, providerWS, pm, errors)
 			resolveModelWebSearch(ctx, newAlias, modelWS, providerWS, pm, errors)
+			pureWS := cfg.WebSearchForModel(modelName)
+			resolveModelWebSearch(ctx, modelName, pureWS, providerWS, pm, errors)
 		}
 	}
 	for alias, route := range cfg.Routes {
@@ -285,100 +376,109 @@ func resolvePerProviderWebSearch(ctx context.Context, cfg config.Config, pm *pro
 
 func resolveModelWebSearch(ctx context.Context, alias string, modelWS config.WebSearchSupport, providerWS config.WebSearchSupport, pm *provider.ProviderManager, errors io.Writer) {
 	if modelWS == providerWS {
-		return // no model-level override, provider resolution applies
+		return
 	}
 	modelKey := "model:" + alias
 	protocol := pm.ProtocolForModel(alias)
 	switch protocol {
 	case config.ProtocolAnthropic:
-		// Continue to Anthropic-specific handling below.
 	case config.ProtocolOpenAIResponse:
-		// OpenAI Responses API natively supports web_search.
-		// "injected" mode (Tavily/Firecrawl) is Anthropic-only; map to "disabled".
 		switch modelWS {
 		case config.WebSearchSupportDisabled, config.WebSearchSupportInjected:
 			pm.SetResolvedWebSearch(modelKey, "disabled")
-			logger.Info("模型禁用响应端网页搜索", "model", alias, "config", modelWS)
+			slog.Info("模型禁用响应端网页搜索", "model", alias, "config", modelWS)
 		default:
 			pm.SetResolvedWebSearch(modelKey, "enabled")
-			logger.Info("模型启用响应端网页搜索", "model", alias)
+			slog.Info("模型启用响应端网页搜索", "model", alias)
 		}
 		return
 	default:
 		pm.SetResolvedWebSearch(modelKey, "disabled")
-		logger.Info("跳过模型级网页搜索：不支持的协议", "model", alias, "protocol", protocol)
+		slog.Info("跳过模型级网页搜索：不支持的协议", "model", alias, "protocol", protocol)
 		return
 	}
 	switch modelWS {
 	case config.WebSearchSupportDisabled:
 		pm.SetResolvedWebSearch(modelKey, "disabled")
-		logger.Info("模型配置禁用网页搜索", "model", alias)
+		slog.Info("模型配置禁用网页搜索", "model", alias)
 	case config.WebSearchSupportEnabled:
 		pm.SetResolvedWebSearch(modelKey, "enabled")
-		logger.Info("模型配置强制启用网页搜索", "model", alias)
+		slog.Info("模型配置强制启用网页搜索", "model", alias)
 	case config.WebSearchSupportInjected:
 		pm.SetResolvedWebSearch(modelKey, "injected")
-		logger.Info("模型配置启用网页搜索注入模式", "model", alias)
+		slog.Info("模型配置启用网页搜索注入模式", "model", alias)
 	default:
-		// Auto: probe using this model's upstream name.
 		resolved := probeModelWebSearch(ctx, alias, pm, errors)
 		pm.SetResolvedWebSearch(modelKey, resolved)
 	}
 }
 
-// probeProviderWebSearch probes a single provider for web_search support.
-// Returns "enabled" or "disabled".
 func probeProviderWebSearch(ctx context.Context, key string, pm *provider.ProviderManager, errors io.Writer) string {
-	client, err := pm.ClientForKey(key)
+	pc, err := pm.ClientForKey(key)
 	if err != nil {
-		logger.Warn("网页搜索探测跳过：客户端不可用", "provider", key, "error", err)
+		slog.Warn("网页搜索探测跳过：客户端不可用", "provider", key, "error", err)
 		return "disabled"
 	}
 
 	upstreamModel := pm.FirstUpstreamModelForKey(key)
 	if upstreamModel == "" {
-		logger.Warn("网页搜索自动探测跳过：无模型路由到提供商", "provider", key)
+		slog.Warn("网页搜索自动探测跳过：无模型路由到提供商", "provider", key)
 		return "disabled"
 	}
 
+	acc, ok := pc.(provider.AnthropicClientAccessor)
+	if !ok {
+		slog.Warn("网页搜索探测跳过：客户端不支持访问", "provider", key)
+		return "disabled"
+	}
+	client := acc.AnthropicClient()
 	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	supported, err := client.ProbeWebSearch(probeCtx, upstreamModel)
 	if err != nil {
-		logger.Warn("网页搜索自动探测失败", "provider", key, "error", err)
+		slog.Warn("网页搜索自动探测失败", "provider", key, "error", err)
 		fmt.Fprintf(errors, "网页搜索自动探测失败（提供商 %s）: %v\n", key, err)
 		return "disabled"
 	}
 	if !supported {
-		logger.Warn("提供商不支持网页搜索", "provider", key, "model", upstreamModel)
+		slog.Warn("提供商不支持网页搜索", "provider", key, "model", upstreamModel)
 		fmt.Fprintf(errors, "提供商 %s 不支持网页搜索\n", key)
 		return "disabled"
 	}
-	logger.Info("提供商支持网页搜索", "provider", key, "model", upstreamModel)
+	slog.Info("提供商支持网页搜索", "provider", key, "model", upstreamModel)
 	return "enabled"
 }
 
-// probeModelWebSearch probes a specific model alias for web_search support.
 func probeModelWebSearch(ctx context.Context, modelAlias string, pm *provider.ProviderManager, errors io.Writer) string {
-	upstreamModel, client, err := pm.ClientFor(modelAlias)
+	upstreamModel, pc, err := pm.ClientFor(modelAlias)
 	if err != nil {
-		logger.Warn("网页搜索模型探测跳过：客户端不可用", "model", modelAlias, "error", err)
+		slog.Warn("网页搜索模型探测跳过：客户端不可用", "model", modelAlias, "error", err)
+		return "disabled"
+	}
+	acc, ok := pc.(provider.AnthropicClientAccessor)
+	if !ok {
+		slog.Warn("网页搜索模型探测跳过：客户端不支持访问", "model", modelAlias)
+		return "disabled"
+	}
+	client := acc.AnthropicClient()
+	if err != nil {
+		slog.Warn("网页搜索模型探测跳过：客户端不可用", "model", modelAlias, "error", err)
 		return "disabled"
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	supported, err := client.ProbeWebSearch(probeCtx, upstreamModel)
 	if err != nil {
-		logger.Warn("网页搜索模型探测失败", "model", modelAlias, "error", err)
+		slog.Warn("网页搜索模型探测失败", "model", modelAlias, "error", err)
 		fmt.Fprintf(errors, "网页搜索模型探测失败（%s）: %v\n", modelAlias, err)
 		return "disabled"
 	}
 	if !supported {
-		logger.Warn("模型不支持网页搜索", "model", modelAlias)
+		slog.Warn("模型不支持网页搜索", "model", modelAlias)
 		fmt.Fprintf(errors, "模型 %s 不支持网页搜索\n", modelAlias)
 		return "disabled"
 	}
-	logger.Info("模型支持网页搜索", "model", modelAlias)
+	slog.Info("模型支持网页搜索", "model", modelAlias)
 	return "enabled"
 }
 
@@ -394,7 +494,7 @@ func runCaptureResponse(ctx context.Context, cfg config.Config, errors io.Writer
 	if err != nil {
 		return err
 	}
-	logger.Info("响应代理已初始化", "upstream", cfg.ResponseProxy.ProviderBaseURL)
+	slog.Info("响应代理已初始化", "upstream", cfg.ResponseProxy.ProviderBaseURL)
 	return runHTTPServer(ctx, cfg.Addr, handler, errors, nil)
 }
 
@@ -411,7 +511,7 @@ func runCaptureAnthropic(ctx context.Context, cfg config.Config, errors io.Write
 	if err != nil {
 		return err
 	}
-	logger.Info("Anthropic 代理已初始化", "upstream", cfg.AnthropicProxy.ProviderBaseURL)
+	slog.Info("Anthropic 代理已初始化", "upstream", cfg.AnthropicProxy.ProviderBaseURL)
 	return runHTTPServer(ctx, cfg.Addr, handler, errors, nil)
 }
 
@@ -420,7 +520,7 @@ func logTrace(errors io.Writer, label string, tracer *mbtrace.Tracer) {
 		fmt.Fprintf(errors, "%s 跟踪已禁用\n", label)
 		return
 	}
-	logger.Info("跟踪已启用", "label", label, "dir", tracer.Directory())
+	slog.Info("跟踪已启用", "label", label, "dir", tracer.Directory())
 	fmt.Fprintf(errors, "%s 跟踪已启用于 %s\n", label, tracer.Directory())
 }
 
@@ -452,7 +552,7 @@ func runHTTPServer(ctx context.Context, addr string, handler http.Handler, error
 	errCh := make(chan error, 1)
 	go func() {
 		fmt.Fprintf(errors, "%s 监听于 %s\n", Name, addr)
-		logger.Info("HTTP 服务器监听中", "addr", addr)
+		slog.Info("HTTP 服务器监听中", "addr", addr)
 		errCh <- httpServer.ListenAndServe()
 	}()
 
@@ -460,7 +560,7 @@ func runHTTPServer(ctx context.Context, addr string, handler http.Handler, error
 	case <-ctx.Done():
 		if sessionStats != nil {
 			summary := sessionStats.Summary()
-			logger.Info(stats.FormatSummaryLine(summary))
+			slog.Info(stats.FormatSummaryLine(summary))
 			fmt.Fprintln(errors)
 			stats.WriteSummary(errors, summary)
 		}
@@ -471,7 +571,7 @@ func runHTTPServer(ctx context.Context, addr string, handler http.Handler, error
 		if err == http.ErrServerClosed {
 			return nil
 		}
-		logger.Error("HTTP 服务器错误", "error", err)
+		slog.Error("HTTP 服务器错误", "error", err)
 		return err
 	}
 }

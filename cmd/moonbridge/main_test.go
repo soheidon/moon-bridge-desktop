@@ -8,12 +8,12 @@ import (
 	"testing"
 
 	"moonbridge/internal/extension/codex"
-	"moonbridge/internal/foundation/config"
+	"moonbridge/internal/config"
 )
 
 func TestPrintCodexConfigTomlDoesNotSetServiceTier(t *testing.T) {
 	var output bytes.Buffer
-	err := codex.GenerateConfigToml(&output, "moonbridge", "http://127.0.0.1:38440/v1", "", config.Config{
+	cfg := config.Config{
 		Routes: map[string]config.RouteEntry{
 			"moonbridge": {
 				Provider:      "openai",
@@ -21,7 +21,9 @@ func TestPrintCodexConfigTomlDoesNotSetServiceTier(t *testing.T) {
 				ContextWindow: 200000,
 			},
 		},
-	})
+	}
+	err := codex.GenerateConfigToml(&output, "moonbridge", "http://127.0.0.1:38440/v1", "",
+		config.ProviderFromGlobalConfig(&cfg), config.ServerFromGlobalConfig(&cfg))
 	if err != nil {
 		t.Fatalf("codex.GenerateConfigToml() error = %v", err)
 	}
@@ -48,16 +50,19 @@ func TestRunReturnsStartupErrorWithConfigDetails(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.yml")
 	err := os.WriteFile(configPath, []byte(`
 mode: Transform
-provider:
-  providers:
-    openai:
-      base_url: https://openai.example.test
-      api_key: openai-key
-      protocol: openai
-      models:
-        gpt-image-1.5: {}
-  routes:
-    image: "openai/gpt-image-1.5"
+models:
+  gpt-image-1.5: {}
+providers:
+  openai:
+    base_url: https://openai.example.test
+    api_key: openai-key
+    protocol: openai
+    offers:
+      - model: gpt-image-1.5
+routes:
+  image:
+    model: gpt-image-1.5
+    provider: openai
 `), 0644)
 	if err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
@@ -78,7 +83,7 @@ provider:
 	for _, want := range []string{
 		"Moon Bridge 启动失败：配置文件加载失败",
 		"配置文件: " + configPath,
-		"providers.openai.protocol must be \"anthropic\" or \"openai-response\"",
+"providers.openai.protocol must be \"anthropic\", \"openai-response\", \"google-genai\", or \"openai-chat\"",
 		"Responses 直通请使用 openai-response",
 	} {
 		if !strings.Contains(output, want) {
@@ -97,13 +102,11 @@ func TestRunUsesXDGDefaultConfigPath(t *testing.T) {
 	configPath := filepath.Join(configDir, "config.yml")
 	err := os.WriteFile(configPath, []byte(`
 mode: CaptureResponse
-developer:
-  proxy:
-    response:
-      model: gpt-capture
-      provider:
-        base_url: https://api.openai.example.test
-        api_key: upstream-openai-key
+proxy:
+  response:
+    model: gpt-capture
+    base_url: https://api.openai.example.test
+    api_key: upstream-openai-key
 `), 0644)
 	if err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
