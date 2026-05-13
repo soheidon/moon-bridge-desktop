@@ -16,6 +16,7 @@ import (
 	"sync"
 
 	"moonbridge/internal/format"
+	"moonbridge/internal/extension/codextool"
 )
 
 // ============================================================================
@@ -108,10 +109,7 @@ func (a *OpenAIAdapter) ToCoreRequest(ctx context.Context, req any) (*format.Cor
 
 	// 5. Convert tools.
 	if len(openaiReq.Tools) > 0 {
-		coreReq.Tools = make([]format.CoreTool, 0, len(openaiReq.Tools))
-		for _, tool := range openaiReq.Tools {
-			coreReq.Tools = append(coreReq.Tools, convertTool(tool))
-		}
+		coreReq.Tools = flattenToolsWithNamespace(openaiReq.Tools, "")
 	}
 
 	// 6. Convert tool choice.
@@ -124,7 +122,11 @@ func (a *OpenAIAdapter) ToCoreRequest(ctx context.Context, req any) (*format.Cor
 	}
 
 	// 7. Cache metadata passthrough.
-	coreReq.Extensions = make(map[string]any)
+	if coreReq.Extensions == nil {
+		coreReq.Extensions = make(map[string]any)
+	}
+	// 5b. Store tool map for response-side reverse mapping.
+	coreReq.Extensions["codex_tool_map"] = codextool.BuildToolMapFromCore(coreReq.Tools).Encode()
 	if openaiReq.PromptCacheKey != "" || openaiReq.PromptCacheRetention != "" {
 		cacheMeta := make(map[string]string)
 		if openaiReq.PromptCacheKey != "" {
@@ -226,14 +228,7 @@ func (a *OpenAIAdapter) FromCoreResponse(ctx context.Context, resp *format.CoreR
 					})
 					textParts = textParts[:0]
 				}
-				output = append(output, OutputItem{
-					Type:      "function_call",
-					ID:        block.ToolUseID,
-					CallID:    block.ToolUseID,
-					Name:      block.ToolName,
-					Arguments: toolInputString(block.ToolInput),
-					Status:    "completed",
-				})
+				output = append(output, buildToolOutputItem(block, resp.Extensions))
 
 			case "tool_result":
 				// Tool results don't translate to output items in the response.
@@ -370,6 +365,7 @@ func (a *OpenAIAdapter) streamLoop(ctx context.Context, coreReq *format.CoreRequ
 	}
 	contentText := make(map[int]string)
 	toolCallArgs := make(map[int]string)
+	toolBlockNames := make(map[int]string)
 	outputIndexes := make(map[int]int)
 	itemIDs := make(map[int]string)
 	reasonIndexes := make(map[int]bool)
@@ -468,14 +464,8 @@ func (a *OpenAIAdapter) streamLoop(ctx context.Context, coreReq *format.CoreRequ
 					toolUseID = fmt.Sprintf("call_%d", index)
 				}
 				itemIDs[index] = fmt.Sprintf("fc_item_%d", index)
-				item := OutputItem{
-					Type:      "function_call",
-					ID:        toolUseID,
-					CallID:    toolUseID,
-					Name:      event.ContentBlock.ToolName,
-					Arguments: toolInputString(event.ContentBlock.ToolInput),
-					Status:    "in_progress",
-				}
+				toolBlockNames[index] = event.ContentBlock.ToolName
+				item := buildToolOutputItemStreaming(event.ContentBlock, coreReq.Extensions, toolUseID)
 				outputIndexes[index] = len(response.Output)
 				response.Output = append(response.Output, item)
 				send(StreamEvent{
@@ -645,6 +635,11 @@ func (a *OpenAIAdapter) streamLoop(ctx context.Context, coreReq *format.CoreRequ
 			if idx, ok := outputIndexes[index]; ok && idx < len(response.Output) {
 				response.Output[idx].Arguments = event.Delta
 				response.Output[idx].Status = "completed"
+				if response.Output[idx].Type == "custom_tool_call" {
+					if bn, ok := toolBlockNames[index]; ok && event.Delta != "" {
+						response.Output[idx].Input = codextool.RebuildGrammar(bn, json.RawMessage(event.Delta))
+					}
+				}
 			}
 			send(StreamEvent{
 				Event: "response.function_call_arguments.done",
@@ -855,6 +850,12 @@ func (a *OpenAIAdapter) streamLoop(ctx context.Context, coreReq *format.CoreRequ
 						response.Output[idx].Arguments = finalArgs
 					}
 					response.Output[idx].Status = "completed"
+					// Rebuild raw grammar for custom_tool_call items from accumulated args.
+					if response.Output[idx].Type == "custom_tool_call" {
+						if bn, ok := toolBlockNames[index]; ok && finalArgs != "" {
+							response.Output[idx].Input = codextool.RebuildGrammar(bn, json.RawMessage(finalArgs))
+						}
+					}
 				}
 
 				// function_call_arguments.done
@@ -882,6 +883,7 @@ func (a *OpenAIAdapter) streamLoop(ctx context.Context, coreReq *format.CoreRequ
 
 				// Clean up state.
 				delete(toolCallArgs, index)
+				delete(toolBlockNames, index)
 			}
 
 		case format.CoreItemAdded:
@@ -918,6 +920,8 @@ type inputItem struct {
 	Name      string          `json:"name"`
 	Arguments string          `json:"arguments"`
 	Output    json.RawMessage `json:"output"`
+	Input     string          `json:"input"`
+	Action    *ToolAction     `json:"action,omitempty"`
 	ID        string          `json:"id"`
 	Status    string          `json:"status"`
 }
@@ -1009,7 +1013,7 @@ func convertInput(raw json.RawMessage) ([]format.CoreMessage, []format.CoreConte
 		// Flush pending function_calls before non-function-call items.
 		// Don't flush between consecutive function_call items — they should
 		// be batched into a single assistant message.
-		if item.Type != "function_call" && len(pendingFCBlocks) > 0 {
+		if item.Type != "function_call" && item.Type != "custom_tool_call" && item.Type != "local_shell_call" && len(pendingFCBlocks) > 0 {
 			flushed := make([]format.CoreContentBlock, len(pendingFCBlocks))
 			copy(flushed, pendingFCBlocks)
 			messages = append(messages, format.CoreMessage{
@@ -1050,6 +1054,30 @@ func convertInput(raw json.RawMessage) ([]format.CoreMessage, []format.CoreConte
 			toolInput := json.RawMessage(item.Arguments)
 			if !json.Valid([]byte(item.Arguments)) {
 				toolInput = json.RawMessage(`{}`)
+			}
+			pendingFCBlocks = append(pendingFCBlocks, format.CoreContentBlock{
+				Type:      "tool_use",
+				ToolUseID: firstNonEmpty(item.CallID, item.ID),
+				ToolName:  item.Name,
+				ToolInput: toolInput,
+			})
+
+		case item.Type == "custom_tool_call" || item.Type == "local_shell_call":
+			if len(pendingReasoning) > 0 {
+				pendingFCBlocks = append(pendingFCBlocks, pendingReasoning...)
+				pendingReasoning = pendingReasoning[:0]
+			}
+			toolInput := json.RawMessage(item.Arguments)
+			if !json.Valid([]byte(item.Arguments)) {
+				if item.Input != "" {
+					toolInput, _ = json.Marshal(map[string]string{"input": item.Input})
+				} else {
+					toolInput = json.RawMessage(`{}`)
+				}
+			}
+			if item.Type == "local_shell_call" && item.Action != nil {
+				data, _ := json.Marshal(item.Action)
+				toolInput = data
 			}
 			pendingFCBlocks = append(pendingFCBlocks, format.CoreContentBlock{
 				Type:      "tool_use",
@@ -1207,114 +1235,8 @@ func imageSourceFromRaw(raw json.RawMessage) string {
 // ============================================================================
 
 // convertTool converts an OpenAI Tool to a CoreTool.
-func convertTool(tool Tool) format.CoreTool {
-	ext := make(map[string]any)
-
-	switch tool.Type {
-	case "function":
-		return format.CoreTool{
-			Name:        tool.Name,
-			Description: tool.Description,
-			InputSchema: tool.Parameters,
-		}
-
-	case "web_search", "web_search_preview":
-		ext["source_type"] = tool.Type
-		return format.CoreTool{
-			Name:        tool.Type,
-			Description: "Search the web for up-to-date information.",
-			Extensions:  ext,
-		}
-	case "file_search":
-		ext["source_type"] = tool.Type
-		ext["max_num_results"] = tool.MaxNumResults
-		return format.CoreTool{
-			Name:        tool.Type,
-			Description: "Search files in the user's file system.",
-			Extensions:  ext,
-		}
-
-	case "code_interpreter":
-		ext["source_type"] = tool.Type
-		return format.CoreTool{
-			Name:        tool.Type,
-			Description: "Execute code in a sandboxed interpreter.",
-			Extensions:  ext,
-		}
-
-	case "computer_use_preview":
-		ext["source_type"] = tool.Type
-		ext["display_width"] = tool.DisplayWidth
-		ext["display_height"] = tool.DisplayHeight
-		return format.CoreTool{
-			Name:        tool.Type,
-			Description: "Use a computer to perform actions.",
-			Extensions:  ext,
-		}
-
-
-	default:
-		ext["source_type"] = tool.Type
-		return format.CoreTool{
-			Name:        tool.Name,
-			Description: tool.Description,
-			InputSchema: adaptSchema(tool.Parameters, tool.Name),
-			Extensions:  ext,
-		}
-	}
-}
-
-// adaptSchema ensures custom Codex CLI tools have a proper input schema,
-// since models like DeepSeek/Claude don't natively understand the Codex
-// custom tool format (type: "custom").
-func adaptSchema(params map[string]any, toolName string) map[string]any {
-	if params != nil && len(params) > 0 {
-		// Has existing schema, just clean it
-		return params
-	}
-	// Generate schemas for known Codex custom tools
-	switch toolName {
-	case "apply_patch", "patch":
-		return map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"input": map[string]any{"type": "string", "description": "The patch content or operation to apply"},
-			},
-			"required": []string{"input"},
-		}
-	case "exec", "exec_command", "local_shell", "shell":
-		return map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"command": map[string]any{
-					"type": "array", "items": map[string]any{"type": "string"},
-					"description": "Command and arguments to execute",
-				},
-				"description": map[string]any{"type": "string"},
-			},
-			"required": []string{"command"},
-		}
-	case "read", "view", "view_image":
-		return map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"file_path": map[string]any{"type": "string"},
-			},
-			"required": []string{"file_path"},
-		}
-	default:
-		return map[string]any{"type": "object"}
-	}
-}
-
 // convertToolChoice parses an OpenAI tool_choice JSON value into a CoreToolChoice.
-//
-// Accepts:
-//   - string: "auto" / "none" / "required"
-//   - object: {type: "...", name: "..."} or {type: "function", function: {name: "..."}}
-//
-// On parse failure, the raw JSON is preserved in CoreToolChoice.Raw for
-// round-tripping; no error is returned for best-effort parsing.
+
 func convertToolChoice(raw json.RawMessage) (*format.CoreToolChoice, error) {
 	tc := &format.CoreToolChoice{
 		Raw: raw,
@@ -1442,4 +1364,232 @@ func outputToString(raw json.RawMessage) string {
 	}
 	// Fallback: return the raw JSON as a string (array/object).
 	return string(raw)
+}
+
+
+// localShellActionFromRaw parses tool input JSON into a ToolAction for local_shell.
+func localShellActionFromRaw(raw json.RawMessage) *ToolAction {
+	var input struct {
+		Command          []string          `json:"command"`
+		WorkingDirectory string            `json:"working_directory"`
+		TimeoutMS        int               `json:"timeout_ms"`
+		Env              map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(raw, &input); err != nil {
+		return &ToolAction{Type: "exec"}
+	}
+	return &ToolAction{
+		Type:             "exec",
+		Command:          input.Command,
+		WorkingDirectory: input.WorkingDirectory,
+		TimeoutMS:        input.TimeoutMS,
+		Env:              input.Env,
+	}
+}
+
+// ============================================================================
+// Response-side Tool Output Item Builder
+// ============================================================================
+
+// buildToolOutputItem constructs an OutputItem using the codex_tool_map
+// to determine the correct output item type (function_call, custom_tool_call, local_shell_call).
+func buildToolOutputItem(block format.CoreContentBlock, extensions map[string]any) OutputItem {
+	toolMap := codextool.DecodeToolMapFromExtensions(extensions)
+	itemT, itemN, itemNS, itemInput, isLS, actionJSON := codextool.OutputItemFromBlock(block.ToolName, block.ToolInput, toolMap)
+	if isLS {
+		return OutputItem{
+			Type:   "local_shell_call",
+			ID:     block.ToolUseID,
+			CallID: block.ToolUseID,
+			Status: "completed",
+			Action: localShellActionFromRaw(actionJSON),
+		}
+	}
+	return OutputItem{
+		Type:      itemT,
+		ID:        block.ToolUseID,
+		CallID:    block.ToolUseID,
+		Name:      itemN,
+		Namespace: itemNS,
+		Arguments: toolInputString(block.ToolInput),
+		Input:     itemInput,
+		Status:    "completed",
+	}
+}
+
+// buildToolOutputItemStreaming constructs a streaming OutputItem for a tool_use content block start.
+// The item is created with "in_progress" status.
+func buildToolOutputItemStreaming(block *format.CoreContentBlock, extensions map[string]any, toolUseID string) OutputItem {
+	toolMap := codextool.DecodeToolMapFromExtensions(extensions)
+	itemT, itemN, itemNS, itemInput, isLS, actionJSON := codextool.OutputItemFromBlock(block.ToolName, block.ToolInput, toolMap)
+	_ = itemInput
+	if isLS {
+		return OutputItem{
+			Type:   "local_shell_call",
+			ID:     toolUseID,
+			CallID: toolUseID,
+			Status: "in_progress",
+			Action: localShellActionFromRaw(actionJSON),
+		}
+	}
+	return OutputItem{
+		Type:      itemT,
+		ID:        toolUseID,
+		CallID:    toolUseID,
+		Name:      itemN,
+		Namespace: itemNS,
+		Arguments: toolInputString(block.ToolInput),
+		Status:    "in_progress",
+	}
+}
+
+// ============================================================================
+// Tool Conversion — custom/namespace/apply_patch
+// ============================================================================
+
+// convertToolWithNamespace converts a single OpenAI Tool to one or more CoreTools.
+// Function/web_search/file_search/code_interpreter/computer_use_preview pass through.
+// Custom tools are expanded using codex package helpers.
+// Namespace tools are recursively flattened.
+func convertToolWithNamespace(tool Tool, namespace string) []format.CoreTool {
+	name := namespacedToolName(namespace, tool.Name)
+	ext := make(map[string]any)
+
+	switch tool.Type {
+case "function":
+		ct := format.CoreTool{
+			Name:        name,
+			Description: tool.Description,
+			InputSchema: tool.Parameters,
+		}
+		codextool.AnnotateCoreTool(&ct, codextool.ToolFunction, name, namespace)
+		return []format.CoreTool{ct}
+
+	case "web_search", "web_search_preview":
+		ext["source_type"] = tool.Type
+		return []format.CoreTool{{
+			Name:        tool.Type,
+			Description: "Search the web for up-to-date information.",
+			Extensions:  ext,
+		}}
+	case "file_search":
+		ext["source_type"] = tool.Type
+		ext["max_num_results"] = tool.MaxNumResults
+		return []format.CoreTool{{
+			Name:        tool.Type,
+			Description: "Search files in the user's file system.",
+			Extensions:  ext,
+		}}
+
+	case "code_interpreter":
+		ext["source_type"] = tool.Type
+		return []format.CoreTool{{
+			Name:        tool.Type,
+			Description: "Execute code in a sandboxed interpreter.",
+			Extensions:  ext,
+		}}
+
+	case "computer_use_preview":
+		ext["source_type"] = tool.Type
+		ext["display_width"] = tool.DisplayWidth
+		ext["display_height"] = tool.DisplayHeight
+		return []format.CoreTool{{
+			Name:        tool.Type,
+			Description: "Use a computer to perform actions.",
+			Extensions:  ext,
+		}}
+
+	case "namespace":
+		ns := namespacedToolName(namespace, tool.Name)
+		return flattenToolsWithNamespace(tool.Tools, ns)
+
+	case "custom":
+		grammar := codextool.CustomToolGrammar(tool.Format)
+		if tool.Name == "local_shell" {
+			ct := format.CoreTool{
+				Name:        name,
+				Description: tool.Description,
+				InputSchema: codextool.LocalShellSchema(),
+			}
+			codextool.AnnotateCoreTool(&ct, codextool.ToolLocalShell, name, "")
+			return []format.CoreTool{ct}
+		}
+		if codextool.IsApplyPatchGrammar(grammar) {
+			proxyTools := codextool.ApplyPatchProxyCoreTools(name)
+			for i := range proxyTools {
+				codextool.AnnotateCoreTool(&proxyTools[i], codextool.ToolApplyPatch, name, "")
+			}
+			return proxyTools
+		}
+		if codextool.IsExecGrammar(grammar) {
+			ct := format.CoreTool{
+				Name:        name,
+				Description: codextool.ExecProxyDescription(),
+				InputSchema: codextool.ExecProxySchema(),
+			}
+			codextool.AnnotateCoreTool(&ct, codextool.ToolExec, name, "")
+			return []format.CoreTool{ct}
+		}
+		// Other custom tools: keep original name with raw input schema
+		ct := format.CoreTool{
+			Name:        name,
+			Description: customToolDescription(tool, grammar),
+			InputSchema: codextool.CustomToolInputSchema(grammar),
+		}
+		codextool.AnnotateCoreTool(&ct, codextool.ToolRaw, name, "")
+		return []format.CoreTool{ct}
+
+	default:
+		ext["source_type"] = tool.Type
+		return []format.CoreTool{{
+			Name:        name,
+			Description: tool.Description,
+			InputSchema: tool.Parameters,
+			Extensions:  ext,
+		}}
+	}
+}
+
+// flattenToolsWithNamespace recursively flattens namespace tools and converts
+// individual tools, building a flat list of CoreTools suitable for upstream providers.
+func flattenToolsWithNamespace(openaiTools []Tool, namespace string) []format.CoreTool {
+	var result []format.CoreTool
+	for _, t := range openaiTools {
+		converted := convertToolWithNamespace(t, namespace)
+		result = append(result, converted...)
+	}
+	// Deduplicate by name: Codex may send the same tool both as a namespace member
+	// and as an independently-injected function tool (e.g. MCP tools that inject themselves
+	// after first use). Keep the first occurrence, which has the correct metadata.
+	seen := make(map[string]bool, len(result))
+	deduped := make([]format.CoreTool, 0, len(result))
+	for _, t := range result {
+		if seen[t.Name] {
+			continue
+		}
+		seen[t.Name] = true
+		deduped = append(deduped, t)
+	}
+	result = deduped
+	return result
+}
+
+// namespacedToolName joins namespace and name.
+func namespacedToolName(namespace, name string) string {
+	return codextool.NamespacedToolName(namespace, name)
+}
+
+// customToolDescription builds a description for a custom tool including grammar.
+func customToolDescription(tool Tool, grammar string) string {
+	parts := []string{}
+	if strings.TrimSpace(tool.Description) != "" {
+		parts = append(parts, strings.TrimSpace(tool.Description))
+	}
+	if grammar != "" {
+		parts = append(parts, "OpenAI custom tool grammar:\n"+grammar)
+	}
+	if len(parts) == 0 {
+		return "Use this custom tool with its raw freeform input in the input field."
+	}
+	return strings.Join(parts, "\n\n")
 }

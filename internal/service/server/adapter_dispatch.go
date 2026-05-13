@@ -528,6 +528,17 @@ func (s *Server) handleWithAdapters(
 	}
 
 	// ------------------------------------------------------------------
+
+
+	// Propagate codex_tool_map from CoreRequest to CoreResponse.
+	if coreReq != nil && coreResp != nil && coreReq.Extensions != nil {
+		if tm, ok := coreReq.Extensions["codex_tool_map"]; ok {
+			if coreResp.Extensions == nil {
+				coreResp.Extensions = make(map[string]any)
+			}
+			coreResp.Extensions["codex_tool_map"] = tm
+		}
+	}
 	// 7. Convert CoreResponse → outbound OpenAI Response.
 	// ------------------------------------------------------------------
 	outAny, err := client.FromCoreResponse(ctx, coreResp)
