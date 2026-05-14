@@ -44,11 +44,11 @@ type CacheManager interface {
 // Only references: config, format, and anthropic types.
 type AnthropicProviderAdapter struct {
 	cfgMaxTokens int
-	cacheMgr CacheManager
-	hooks    format.CorePluginHooks
+	cacheMgr     CacheManager
+	hooks        format.CorePluginHooks
 
-	streamMu         sync.Mutex
-	streamEvents     []StreamEvent
+	streamMu     sync.Mutex
+	streamEvents []StreamEvent
 }
 
 // NewAnthropicProviderAdapter creates a new AnthropicProviderAdapter.
@@ -58,8 +58,8 @@ type AnthropicProviderAdapter struct {
 func NewAnthropicProviderAdapter(cfgMaxTokens int, cacheMgr CacheManager, hooks format.CorePluginHooks) *AnthropicProviderAdapter {
 	return &AnthropicProviderAdapter{
 		cfgMaxTokens: cfgMaxTokens,
-		cacheMgr: cacheMgr,
-		hooks:    hooks.WithDefaults(),
+		cacheMgr:     cacheMgr,
+		hooks:        hooks.WithDefaults(),
 	}
 }
 
@@ -166,7 +166,7 @@ func (a *AnthropicProviderAdapter) toCoreCacheControl(cc *CacheControl) *format.
 		return nil
 	}
 	return &format.CoreCacheControl{
-		Enabled: true,
+		Enabled:    true,
 		TTLSeconds: parseTTLSeconds(cc.TTL),
 		Strategy:   "auto",
 	}
@@ -325,7 +325,7 @@ func (a *AnthropicProviderAdapter) FromCoreRequest(ctx context.Context, req *for
 	// ToolChoice
 	if req.ToolChoice != nil {
 		tc := a.toAnthropicToolChoice(*req.ToolChoice)
-	anthropicReq.ToolChoice = &tc
+		anthropicReq.ToolChoice = &tc
 	} else {
 		anthropicReq.ToolChoice = &ToolChoice{Type: "auto"}
 	}
@@ -351,6 +351,7 @@ func (a *AnthropicProviderAdapter) ToCoreResponse(ctx context.Context, resp any)
 	if !ok {
 		return nil, fmt.Errorf("anthropic adapter: expected *MessageResponse, got %T", resp)
 	}
+	ctx = coreHookContext(ctx, msgResp.Model)
 
 	// Map stop_reason to Core status.
 	status := a.mapStopReasonToStatus(msgResp.StopReason)
@@ -371,7 +372,6 @@ func (a *AnthropicProviderAdapter) ToCoreResponse(ctx context.Context, resp any)
 		Usage:      a.toCoreUsage(msgResp.Usage),
 		StopReason: msgResp.StopReason,
 	}
-	a.hooks.RememberContent(ctx, coreContent)
 	a.hooks.RememberContent(ctx, coreContent)
 
 	// Map error-like stop reasons.
@@ -402,11 +402,11 @@ type streamConverterState struct {
 	seqNum          int64
 	msgID           string
 	model           string
-	blockTypes      map[int]string // content index → block type
-	blockSignatures map[int]string // content index → reasoning signature (from signature_delta)
-	finalUsage      *format.CoreUsage // tracked from message_delta, passed to message_stop
+	blockTypes      map[int]string            // content index → block type
+	blockSignatures map[int]string            // content index → reasoning signature (from signature_delta)
+	finalUsage      *format.CoreUsage         // tracked from message_delta, passed to message_stop
 	adapter         *AnthropicProviderAdapter // for buffering raw stream events (trace)
-	suppressText    map[int]bool   // text indices to suppress (server-side search status, etc.)
+	suppressText    map[int]bool              // text indices to suppress (server-side search status, etc.)
 }
 
 // ToCoreStream consumes an anthropic.Stream and returns a channel of CoreStreamEvent.
@@ -418,6 +418,7 @@ func (a *AnthropicProviderAdapter) ToCoreStream(ctx context.Context, src any) (<
 	if !ok {
 		return nil, fmt.Errorf("anthropic adapter: expected anthropic.Stream, got %T", src)
 	}
+	ctx = coreHookContext(ctx, "")
 	events := make(chan format.CoreStreamEvent, 64)
 
 	// Initialize stream event buffer for trace capture.
@@ -472,7 +473,6 @@ func (a *AnthropicProviderAdapter) ToCoreStream(ctx context.Context, src any) (<
 // =========================================================================
 // Stream event conversion
 // =========================================================================
-
 
 func (s *streamConverterState) nextSeq() int64 {
 	s.seqNum++
@@ -644,7 +644,7 @@ func (s *streamConverterState) convertEvent(events chan<- format.CoreStreamEvent
 				CachedInputTokens: ev.Usage.CacheReadInputTokens,
 			}
 			s.emit(events, format.CoreStreamEvent{
-				Type: format.CoreEventInProgress,
+				Type:       format.CoreEventInProgress,
 				Usage:      s.finalUsage,
 				StopReason: ev.Delta.StopReason,
 			})
@@ -679,8 +679,8 @@ func (s *streamConverterState) convertEvent(events chan<- format.CoreStreamEvent
 		})
 	}
 
-
 }
+
 // =========================================================================
 // Helpers: Core → Anthropic
 // =========================================================================
@@ -928,7 +928,7 @@ func (a *AnthropicProviderAdapter) toCoreUsage(u Usage) format.CoreUsage {
 	}
 	totalInput := u.InputTokens + cached
 	return format.CoreUsage{
-		InputTokens:       totalInput,                // Total input (fresh + cache) matching OpenAI API semantics
+		InputTokens:       totalInput, // Total input (fresh + cache) matching OpenAI API semantics
 		OutputTokens:      u.OutputTokens,
 		TotalTokens:       totalInput + u.OutputTokens,
 		CachedInputTokens: cached,
@@ -950,6 +950,7 @@ func (a *AnthropicProviderAdapter) mapStopReasonToStatus(reason string) string {
 		return "completed"
 	}
 }
+
 // bufferStreamEvent buffers the raw anthropic stream event for trace capture,
 // up to the 4MB limit. The event is JSON-marshalled to estimate its size.
 func (a *AnthropicProviderAdapter) bufferStreamEvent(ev StreamEvent) {
@@ -969,13 +970,19 @@ func (a *AnthropicProviderAdapter) StreamBuffer() []StreamEvent {
 	return a.streamEvents
 }
 
-
 // RememberStreamContent stores response content from a stream for plugin state tracking.
 func (a *AnthropicProviderAdapter) RememberStreamContent(ctx context.Context, blocks []format.CoreContentBlock) {
 	if len(blocks) == 0 {
 		return
 	}
 	a.hooks.RememberContent(ctx, blocks)
+}
+
+func coreHookContext(ctx context.Context, model string) context.Context {
+	if model == "" {
+		return ctx
+	}
+	return format.WithCoreHookModelAlias(ctx, model)
 }
 
 // =========================================================================

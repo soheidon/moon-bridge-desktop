@@ -12,13 +12,12 @@ import (
 	"log/slog"
 	"moonbridge/internal/config"
 	"moonbridge/internal/db"
-	"moonbridge/internal/service/store"
+	"moonbridge/internal/format"
 	"moonbridge/internal/logger"
 	"moonbridge/internal/protocol/anthropic"
-	"moonbridge/internal/protocol/google"
-	"moonbridge/internal/protocol/chat"
 	"moonbridge/internal/protocol/cache"
-	"moonbridge/internal/format"
+	"moonbridge/internal/protocol/chat"
+	"moonbridge/internal/protocol/google"
 	"moonbridge/internal/protocol/openai"
 	"moonbridge/internal/service/provider"
 	"moonbridge/internal/service/proxy"
@@ -28,6 +27,7 @@ import (
 	"moonbridge/internal/service/server/trace"
 	"moonbridge/internal/service/server/usage"
 	"moonbridge/internal/service/stats"
+	"moonbridge/internal/service/store"
 	mbtrace "moonbridge/internal/service/trace"
 )
 
@@ -65,11 +65,11 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) erro
 	storeCfg := config.StoreFromGlobalConfig(&cfg)
 	persistCfg := config.PersistenceFromGlobalConfig(&cfg)
 	providerCfg := config.ProviderFromGlobalConfig(&cfg)
-	_ = persistCfg   // used in db init
-	_ = storeCfg     // used in config store
-	_ = proxyCfg     // used in proxy mode
+	_ = persistCfg // used in db init
+	_ = storeCfg   // used in config store
+	_ = proxyCfg   // used in proxy mode
 
-		// === Phase 1: Bootstrap from YAML ===
+	// === Phase 1: Bootstrap from YAML ===
 
 	// Build multi-provider infrastructure from YAML config.
 	providerDefs := provider.BuildProviderDefsFromConfig(providerCfg)
@@ -161,6 +161,7 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) erro
 				if len(pricing) > 0 {
 					sessionStats.SetPricing(pricing)
 				}
+				serverCfg = config.ServerFromGlobalConfig(&cfg)
 			} else {
 				// DB is empty: seed from YAML config.
 				logger.Info("持久化存储为空，从 YAML 导入种子配置")
@@ -179,7 +180,7 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) erro
 		logger.Warn("config store 不可用，跳过持久化引导")
 	}
 
-		// === Phase 3: Build Runtime ===
+	// === Phase 3: Build Runtime ===
 	rt := runtime.NewRuntime(cfg, providerMgr, pricing)
 
 	// === Phase 4: Build Server with Runtime ===
@@ -203,19 +204,19 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) erro
 	_ = adapterReg.RegisterProviderStream(anthAdapter)
 
 	// Upstream: Google GenAI provider adapter.
-		googleCfg := &cache.PlanCacheConfig{
-			Mode:                     cacheCfg.Mode,
-			TTL:                      cacheCfg.TTL,
-			PromptCaching:            cacheCfg.PromptCaching,
-			AutomaticPromptCache:     cacheCfg.AutomaticPromptCache,
-			ExplicitCacheBreakpoints: cacheCfg.ExplicitCacheBreakpoints,
-			AllowRetentionDowngrade:  cacheCfg.AllowRetentionDowngrade,
-			MaxBreakpoints:           cacheCfg.MaxBreakpoints,
-			MinCacheTokens:           cacheCfg.MinCacheTokens,
-			ExpectedReuse:            cacheCfg.ExpectedReuse,
-			MinimumValueScore:        cacheCfg.MinimumValueScore,
-			MinBreakpointTokens:      cacheCfg.MinBreakpointTokens,
-		}
+	googleCfg := &cache.PlanCacheConfig{
+		Mode:                     cacheCfg.Mode,
+		TTL:                      cacheCfg.TTL,
+		PromptCaching:            cacheCfg.PromptCaching,
+		AutomaticPromptCache:     cacheCfg.AutomaticPromptCache,
+		ExplicitCacheBreakpoints: cacheCfg.ExplicitCacheBreakpoints,
+		AllowRetentionDowngrade:  cacheCfg.AllowRetentionDowngrade,
+		MaxBreakpoints:           cacheCfg.MaxBreakpoints,
+		MinCacheTokens:           cacheCfg.MinCacheTokens,
+		ExpectedReuse:            cacheCfg.ExpectedReuse,
+		MinimumValueScore:        cacheCfg.MinimumValueScore,
+		MinBreakpointTokens:      cacheCfg.MinBreakpointTokens,
+	}
 	googleAdapter := google.NewGeminiProviderAdapter(cfg.DefaultMaxTokens, nil, coreHooks, googleCfg, cacheReg)
 	_ = adapterReg.RegisterProvider(googleAdapter)
 	_ = adapterReg.RegisterProviderStream(googleAdapter)
@@ -252,14 +253,13 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) erro
 		}
 	}
 
-
 	// Create sub-package managers for session, usage, and trace.
-	sessMgr := session.NewInMemoryManager(server.NewSessionConfigAdapter(serverCfg), plugins)
+	sessMgr := session.NewInMemoryManager(server.NewSessionConfigAdapterFromRuntime(rt, serverCfg), plugins)
 	usageTrk := usage.NewStatsTracker(sessionStats)
 	traceWtr := trace.NewFileWriter(tracer, errors)
 
 	handler := server.New(server.Config{
-		ServerCfg:      serverCfg,
+		ServerCfg:       serverCfg,
 		Provider:        fallbackProvider,
 		ProviderMgr:     providerMgr,
 		ChatClients:     chatClients,

@@ -9,20 +9,20 @@ import (
 	"net/http"
 	"time"
 
+	"moonbridge/internal/config"
 	deepseekv4 "moonbridge/internal/extension/deepseek_v4"
 	"moonbridge/internal/extension/plugin"
+	visualpkg "moonbridge/internal/extension/visual"
 	"moonbridge/internal/extension/websearchinjected"
-	"moonbridge/internal/config"
-	"moonbridge/internal/session"
-	"moonbridge/internal/protocol/anthropic"
 	"moonbridge/internal/format"
-	openai "moonbridge/internal/protocol/openai"
+	"moonbridge/internal/protocol/anthropic"
 	"moonbridge/internal/protocol/chat"
 	"moonbridge/internal/protocol/google"
+	openai "moonbridge/internal/protocol/openai"
 	"moonbridge/internal/service/provider"
 	"moonbridge/internal/service/stats"
 	mbtrace "moonbridge/internal/service/trace"
-	visualpkg "moonbridge/internal/extension/visual"
+	"moonbridge/internal/session"
 )
 
 // ============================================================================
@@ -57,6 +57,7 @@ func (s *Server) handleWithAdapters(
 ) {
 	ctx := r.Context()
 	log := slog.Default().With("model", openAIReq.Model, "path", "adapter")
+	pm := s.activeProviderManager()
 
 	// Defense-in-depth: ensure model is non-empty.
 	if openAIReq.Model == "" {
@@ -209,7 +210,7 @@ func (s *Server) handleWithAdapters(
 		}
 
 		// Inject web_search tool if enabled for this model.
-		if s.providerMgr.ResolvedWebSearch(preferred.ProviderKey) == "enabled" {
+		if pm != nil && pm.ResolvedWebSearch(preferred.ProviderKey) == "enabled" {
 			injectAnthropicWebSearch(upstreamReq)
 		}
 
@@ -242,42 +243,42 @@ func (s *Server) handleWithAdapters(
 			return
 		}
 
-			// Wrap provider with search orchestrator if web search is "injected".
-			if wsInjected {
-				if acc, ok := effectiveProvider.(provider.AnthropicClientAccessor); ok && s.runtime != nil {
-					cfgC := s.runtime.Current().Config
-					wrapped := websearchinjected.WrapProvider(
-						acc.AnthropicClient(),
-						cfgC.TavilyAPIKey, cfgC.FirecrawlAPIKey, s.maxSearchRounds(),
-					)
-					effectiveProvider = &searchProviderAdapter{wrapped: wrapped}
-				}
+		// Wrap provider with search orchestrator if web search is "injected".
+		if wsInjected {
+			if acc, ok := effectiveProvider.(provider.AnthropicClientAccessor); ok && s.runtime != nil {
+				cfgC := s.runtime.Current().Config
+				wrapped := websearchinjected.WrapProvider(
+					acc.AnthropicClient(),
+					cfgC.TavilyAPIKey, cfgC.FirecrawlAPIKey, s.maxSearchRounds(),
+				)
+				effectiveProvider = &searchProviderAdapter{wrapped: wrapped}
 			}
+		}
 
-			// Wrap with visual orchestrator at Core level if enabled for this model.
-			// This uses CoreProvider, which is protocol-agnostic.
-			if visProv := s.wrapWithVisual(ctx, openAIReq.Model, preferred, providerAdapter); visProv != nil {
-				var coreRespApi *format.CoreResponse
-				coreRespApi, err = visProv.CreateCore(ctx, coreReq)
-				if err == nil {
-					coreResp = coreRespApi
-				}
-			} else {
-				var upstreamRespMsg anthropic.MessageResponse
-				var rawResp any
-				rawResp, err = effectiveProvider.CreateMessage(ctx, *upstreamReq)
-				if err == nil {
-					var okt bool
-					upstreamRespMsg, okt = rawResp.(anthropic.MessageResponse)
-					if !okt {
-						err = fmt.Errorf("unexpected anthropic response type %T", rawResp)
-					} else {
-						// Normal path: convert back to CoreResponse.
-						msgResp := upstreamRespMsg
-						coreResp, err = providerAdapter.ToCoreResponse(ctx, &msgResp)
-					}
+		// Wrap with visual orchestrator at Core level if enabled for this model.
+		// This uses CoreProvider, which is protocol-agnostic.
+		if visProv := s.wrapWithVisual(ctx, openAIReq.Model, preferred, providerAdapter); visProv != nil {
+			var coreRespApi *format.CoreResponse
+			coreRespApi, err = visProv.CreateCore(ctx, coreReq)
+			if err == nil {
+				coreResp = coreRespApi
+			}
+		} else {
+			var upstreamRespMsg anthropic.MessageResponse
+			var rawResp any
+			rawResp, err = effectiveProvider.CreateMessage(ctx, *upstreamReq)
+			if err == nil {
+				var okt bool
+				upstreamRespMsg, okt = rawResp.(anthropic.MessageResponse)
+				if !okt {
+					err = fmt.Errorf("unexpected anthropic response type %T", rawResp)
+				} else {
+					// Normal path: convert back to CoreResponse.
+					msgResp := upstreamRespMsg
+					coreResp, err = providerAdapter.ToCoreResponse(ctx, &msgResp)
 				}
 			}
+		}
 		if err != nil {
 			log.Error("adapter path: CreateMessage failed", "error", err)
 			payload := openai.ErrorResponse{
@@ -321,8 +322,8 @@ func (s *Server) handleWithAdapters(
 			return
 		}
 
-		chatClientRaw, ok := s.chatClients[preferred.ProviderKey]
-		if !ok {
+		chatClientRaw := s.activeChatClient(preferred.ProviderKey)
+		if chatClientRaw == nil {
 			log.Error("adapter path: no chat client for provider", "provider", preferred.ProviderKey)
 			payload := openai.ErrorResponse{
 				Error: openai.ErrorObject{
@@ -428,8 +429,8 @@ func (s *Server) handleWithAdapters(
 			return
 		}
 
-		googleClientRaw, ok := s.googleClients[preferred.ProviderKey]
-		if !ok {
+		googleClientRaw := s.activeGoogleClient(preferred.ProviderKey)
+		if googleClientRaw == nil {
 			log.Error("adapter path: no google client for provider", "provider", preferred.ProviderKey)
 			payload := openai.ErrorResponse{
 				Error: openai.ErrorObject{
@@ -529,7 +530,6 @@ func (s *Server) handleWithAdapters(
 
 	// ------------------------------------------------------------------
 
-
 	// Propagate codex_tool_map from CoreRequest to CoreResponse.
 	if coreReq != nil && coreResp != nil && coreReq.Extensions != nil {
 		if tm, ok := coreReq.Extensions["codex_tool_map"]; ok {
@@ -613,7 +613,7 @@ func (s *Server) handleWithAdapters(
 			CacheCreationInputTokens: 0,
 			CacheReadInputTokens:     cachedInput,
 		}
-		reqCost := computeCostWithProviderPricing(s.providerMgr, s.stats, openAIReq.Model, preferred.UpstreamModel, preferred.ProviderKey, billingUsage)
+		reqCost := computeCostWithProviderPricing(pm, s.stats, openAIReq.Model, preferred.UpstreamModel, preferred.ProviderKey, billingUsage)
 		log.Info("请求完成",
 			"request_model", openAIReq.Model,
 			"actual_model", preferred.UpstreamModel,
@@ -658,6 +658,7 @@ func (s *Server) handleAdapterStream(
 	wsInjected bool,
 ) {
 	log := slog.Default().With("model", openAIReq.Model, "path", "adapter_stream")
+	pm := s.activeProviderManager()
 
 	// Track when the request started for latency measurement.
 	requestStart := time.Now()
@@ -738,8 +739,7 @@ func (s *Server) handleAdapterStream(
 		// This prevents base64 image data from being sent to text-only models.
 		if s.pluginRegistry != nil && s.runtime != nil && openAIReq.Model != "" {
 			cfgV := s.runtime.Current().Config
-			pluginCfg := config.PluginFromGlobalConfig(&cfgV)
-			visCfg, visOk := visualpkg.ConfigForModel(pluginCfg, openAIReq.Model)
+			visCfg, visOk := visualpkg.ConfigForModelFromResolvedConfig(cfgV, openAIReq.Model)
 			if visOk && visCfg.Provider != "" && visCfg.Model != "" {
 				strippedReq, _ := visualpkg.StripImagesFromAnthropic(*anthReq)
 				anthReq = &strippedReq
@@ -815,8 +815,8 @@ func (s *Server) handleAdapterStream(
 			prependCachedReasoningForChat(chatReq, sess)
 		}
 
-		chatClientRaw, ok := s.chatClients[candidate.ProviderKey]
-		if !ok {
+		chatClientRaw := s.activeChatClient(candidate.ProviderKey)
+		if chatClientRaw == nil {
 			log.Error("adapter stream: no chat client", "provider", candidate.ProviderKey)
 			payload := openai.ErrorResponse{
 				Error: openai.ErrorObject{
@@ -832,7 +832,7 @@ func (s *Server) handleAdapterStream(
 		}
 		chatClient, ok := chatClientRaw.(*chat.Client)
 		if !ok {
-			log.Error("adapter stream: chat client type assertion failed", "provider", candidate.ProviderKey)
+			log.Error("adapter stream: invalid chat client type", "provider", candidate.ProviderKey)
 			payload := openai.ErrorResponse{
 				Error: openai.ErrorObject{
 					Message: fmt.Sprintf("invalid chat client for provider %q", candidate.ProviderKey),
@@ -840,7 +840,7 @@ func (s *Server) handleAdapterStream(
 					Code:    "internal_error",
 				},
 			}
-			streamRecord.Error = traceError("stream_chat_type", fmt.Errorf("invalid chat client for %q", candidate.ProviderKey))
+			streamRecord.Error = traceError("stream_chat_client_type", fmt.Errorf("invalid chat client for %q", candidate.ProviderKey))
 			streamRecord.OpenAIResponse = payload
 			writeOpenAIError(w, http.StatusInternalServerError, payload)
 			return
@@ -917,8 +917,8 @@ func (s *Server) handleAdapterStream(
 			return
 		}
 
-		googleClientRaw, ok := s.googleClients[candidate.ProviderKey]
-		if !ok {
+		googleClientRaw := s.activeGoogleClient(candidate.ProviderKey)
+		if googleClientRaw == nil {
 			log.Error("adapter stream: no google client", "provider", candidate.ProviderKey)
 			payload := openai.ErrorResponse{
 				Error: openai.ErrorObject{
@@ -934,7 +934,7 @@ func (s *Server) handleAdapterStream(
 		}
 		googleClient, ok := googleClientRaw.(*google.Client)
 		if !ok {
-			log.Error("adapter stream: google client type assertion failed", "provider", candidate.ProviderKey)
+			log.Error("adapter stream: invalid google client type", "provider", candidate.ProviderKey)
 			payload := openai.ErrorResponse{
 				Error: openai.ErrorObject{
 					Message: fmt.Sprintf("invalid google client for provider %q", candidate.ProviderKey),
@@ -942,7 +942,7 @@ func (s *Server) handleAdapterStream(
 					Code:    "internal_error",
 				},
 			}
-			streamRecord.Error = traceError("stream_google_type", fmt.Errorf("invalid google client for %q", candidate.ProviderKey))
+			streamRecord.Error = traceError("stream_google_client_type", fmt.Errorf("invalid google client for %q", candidate.ProviderKey))
 			streamRecord.OpenAIResponse = payload
 			writeOpenAIError(w, http.StatusInternalServerError, payload)
 			return
@@ -1134,40 +1134,40 @@ func (s *Server) handleAdapterStream(
 									outputText = finalResp.OutputText
 								}
 								s.pluginRegistry.OnStreamComplete(openAIReq.Model, states, outputText, sess.ExtensionData)
-				}
-			}
-		}
-	}
-		// Chat stream events from provider adapter
-		if chatProvider, ok := s.adapterRegistry.GetProvider(config.ProtocolOpenAIChat); ok {
-			if chatAdapter, ok := chatProvider.(*chat.ChatProviderAdapter); ok {
-				if events := chatAdapter.StreamBuffer(); len(events) > 0 {
-					streamRecord.ChatStreamEvents = events
-
-					// Cache reasoning from Chat stream for DeepSeek thinking replay.
-					if sess != nil {
-						var streamReasoning string
-						var streamToolCallIDs []string
-						for _, ev := range events {
-							for _, sc := range ev.Choices {
-								if sc.Delta.ReasoningContent != "" {
-									streamReasoning = sc.Delta.ReasoningContent
-								}
-								for _, tc := range sc.Delta.ToolCalls {
-									if tc.ID != "" {
-										streamToolCallIDs = append(streamToolCallIDs, tc.ID)
-									}
-								}
 							}
 						}
-						if streamReasoning != "" && len(streamToolCallIDs) > 0 {
-							cacheReasoningForChat(sess, streamToolCallIDs, streamReasoning)
+					}
+				}
+				// Chat stream events from provider adapter
+				if chatProvider, ok := s.adapterRegistry.GetProvider(config.ProtocolOpenAIChat); ok {
+					if chatAdapter, ok := chatProvider.(*chat.ChatProviderAdapter); ok {
+						if events := chatAdapter.StreamBuffer(); len(events) > 0 {
+							streamRecord.ChatStreamEvents = events
+
+							// Cache reasoning from Chat stream for DeepSeek thinking replay.
+							if sess != nil {
+								var streamReasoning string
+								var streamToolCallIDs []string
+								for _, ev := range events {
+									for _, sc := range ev.Choices {
+										if sc.Delta.ReasoningContent != "" {
+											streamReasoning = sc.Delta.ReasoningContent
+										}
+										for _, tc := range sc.Delta.ToolCalls {
+											if tc.ID != "" {
+												streamToolCallIDs = append(streamToolCallIDs, tc.ID)
+											}
+										}
+									}
+								}
+								if streamReasoning != "" && len(streamToolCallIDs) > 0 {
+									cacheReasoningForChat(sess, streamToolCallIDs, streamReasoning)
+								}
+							}
 						}
 					}
 				}
 			}
-		}
-	}
 		}
 	}
 	if s.stats != nil && (finalUsage.InputTokens > 0 || finalUsage.OutputTokens > 0) {
@@ -1198,7 +1198,7 @@ func (s *Server) handleAdapterStream(
 		CacheCreationInputTokens: 0,
 		CacheReadInputTokens:     cachedInput,
 	}
-	reqCost := computeCostWithProviderPricing(s.providerMgr, s.stats, openAIReq.Model, candidate.UpstreamModel, candidate.ProviderKey, billingUsage)
+	reqCost := computeCostWithProviderPricing(pm, s.stats, openAIReq.Model, candidate.UpstreamModel, candidate.ProviderKey, billingUsage)
 	log.Info("流式请求完成",
 		"model", openAIReq.Model,
 		"actual_model", candidate.UpstreamModel,
@@ -1229,7 +1229,7 @@ func (s *Server) handleAdapterStream(
 				CachedInputTokens: finalUsage.InputTokensDetails.CachedTokens,
 			}, true) // input tokens now include cache (normalized at adapter level)
 		}
-		reqCost := computeCostWithProviderPricing(s.providerMgr, s.stats, openAIReq.Model, candidate.UpstreamModel, candidate.ProviderKey, billingUsage)
+		reqCost := computeCostWithProviderPricing(pm, s.stats, openAIReq.Model, candidate.UpstreamModel, candidate.ProviderKey, billingUsage)
 		s.onRequestCompleted(
 			openAIReq.Model, candidate.UpstreamModel, candidate.ProviderKey,
 			requestStart, usage,
@@ -1274,13 +1274,13 @@ func (s *Server) wrapWithVisual(
 	preferred provider.ProviderCandidate,
 	providerAdapter format.ProviderAdapter,
 ) visualpkg.CoreProvider {
-	if s.pluginRegistry == nil || s.runtime == nil || modelAlias == "" || s.providerMgr == nil {
+	pm := s.activeProviderManager()
+	if s.pluginRegistry == nil || s.runtime == nil || modelAlias == "" || pm == nil {
 		return nil
 	}
 
 	cfg := s.runtime.Current().Config
-	pluginCfg := config.PluginFromGlobalConfig(&cfg)
-	visCfg, ok := visualpkg.ConfigForModel(pluginCfg, modelAlias)
+	visCfg, ok := visualpkg.ConfigForModelFromResolvedConfig(cfg, modelAlias)
 	if !ok || visCfg.Provider == "" || visCfg.Model == "" {
 		return nil
 	}
@@ -1295,12 +1295,12 @@ func (s *Server) wrapWithVisual(
 	upstreamCP := newAdapterCoreProvider(providerAdapter, effectiveClient)
 
 	// Visual provider CoreProvider.
-	visClient, err := s.providerMgr.ClientForKey(visCfg.Provider)
+	visClient, err := pm.ClientForKey(visCfg.Provider)
 	if err != nil || visClient == nil {
 		slog.Default().Warn("visual: provider not found", "visual_provider", visCfg.Provider, "model", modelAlias)
 		return nil
 	}
-	visProtocol := s.providerMgr.ProtocolForKey(visCfg.Provider)
+	visProtocol := pm.ProtocolForKey(visCfg.Provider)
 	if visProtocol == "" {
 		slog.Default().Warn("visual: cannot resolve visual provider protocol")
 		return nil
@@ -1315,15 +1315,15 @@ func (s *Server) wrapWithVisual(
 	return visualpkg.NewCoreBridge(upstreamCP, visCP, visCfg.Model, visCfg.MaxRounds, visCfg.MaxTokens)
 }
 
-
 // injectCoreWebSearch replaces web_search tools in coreReq.Tools with injected
 // tavily_search/firecrawl_fetch tools when the provider's web search mode is "injected".
 // Returns true if injection was applied.
 func (s *Server) injectCoreWebSearch(ctx context.Context, coreReq *format.CoreRequest, preferred provider.ProviderCandidate, openAIReq openai.ResponsesRequest) bool {
-	if s.providerMgr == nil {
+	pm := s.activeProviderManager()
+	if pm == nil {
 		return false
 	}
-	wsMode := s.providerMgr.ResolvedWebSearch(preferred.ProviderKey)
+	wsMode := pm.ResolvedWebSearch(preferred.ProviderKey)
 	if wsMode != "injected" && wsMode != "auto" {
 		return false
 	}
@@ -1419,7 +1419,6 @@ func (a *searchProviderAdapter) StreamMessage(ctx context.Context, req any) (<-c
 
 func (a *searchProviderAdapter) AnthropicClient() *anthropic.Client { return nil }
 
-
 // injectAnthropicWebSearch adds the Anthropic web_search_20250305 server tool
 // to an anthropic.MessageRequest if not already present.
 func injectAnthropicWebSearch(req *anthropic.MessageRequest) {
@@ -1510,7 +1509,6 @@ func hasThinkingBlock(content []anthropic.ContentBlock) bool {
 	return false
 }
 
-
 // prependCachedReasoningForChat restores reasoning_content on assistant messages
 // for DeepSeek thinking chain replay across conversation turns.
 // It looks up cached thinking blocks from the session state and sets them
@@ -1545,10 +1543,10 @@ func prependCachedReasoningForChat(chatReq *chat.ChatRequest, sess *session.Sess
 					continue
 				}
 				if cached, ok := state.CachedForToolCall(tc.ID); ok {
-						thinking := cached.ReasoningText
-						if thinking == "" {
-							thinking = cached.Text
-						}
+					thinking := cached.ReasoningText
+					if thinking == "" {
+						thinking = cached.Text
+					}
 					if thinking != "" {
 						msg.ReasoningContent = thinking
 						break
@@ -1563,7 +1561,6 @@ func prependCachedReasoningForChat(chatReq *chat.ChatRequest, sess *session.Sess
 		}
 	}
 }
-
 
 // cacheReasoningForChat stores reasoning content from a Chat response
 // into the session extension data for replay on subsequent turns.
@@ -1648,4 +1645,3 @@ func formatContentSliceToAnthropic(blocks []format.CoreContentBlock) []anthropic
 	}
 	return result
 }
-

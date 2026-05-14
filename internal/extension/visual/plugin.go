@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"moonbridge/internal/extension/plugin"
 	"moonbridge/internal/config"
+	"moonbridge/internal/extension/plugin"
 	"moonbridge/internal/format"
 )
 
@@ -103,6 +103,19 @@ func ConfigForModel(pluginCfg config.PluginConfig, modelAlias string) (Config, b
 	return cfg.Normalized(), true
 }
 
+// ConfigForModelFromResolvedConfig resolves visual config using the full
+// extension scope precedence from config.Config.
+func ConfigForModelFromResolvedConfig(fullCfg config.Config, modelAlias string) (Config, bool) {
+	if !fullCfg.ExtensionEnabled(PluginName, modelAlias) {
+		return Config{}, false
+	}
+	cfg, err := decodeVisualConfig(fullCfg, modelAlias)
+	if err != nil {
+		return Config{}, false
+	}
+	return cfg, true
+}
+
 func pluginExtensionEnabled(pluginCfg config.PluginConfig, name string) bool {
 	if setting, ok := pluginCfg.Extensions[name]; ok && setting.Enabled != nil {
 		return *setting.Enabled
@@ -121,7 +134,6 @@ func (cfg Config) Normalized() Config {
 	}
 	return cfg
 }
-
 
 // decodeVisualConfig decodes the visual extension config for a model alias.
 func decodeVisualConfig(fullCfg config.Config, modelAlias string) (Config, error) {

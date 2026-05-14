@@ -1,16 +1,15 @@
 package plugin
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 
-	"context"
-
 	"moonbridge/internal/config"
-	"moonbridge/internal/logger"
 	"moonbridge/internal/format"
+	"moonbridge/internal/logger"
 	"moonbridge/internal/protocol/openai"
 )
 
@@ -491,27 +490,45 @@ func (r *Registry) CorePluginHooks() format.CorePluginHooks {
 		// MutateCoreRequest
 		if m, ok := p.(CoreRequestMutator); ok {
 			prev := hooks.MutateCoreRequest
+			pluginImpl := p
 			hooks.MutateCoreRequest = func(ctx context.Context, req *format.CoreRequest) {
-				if prev != nil { prev(ctx, req) }
+				if prev != nil {
+					prev(ctx, req)
+				}
+				if req == nil || !pluginImpl.EnabledForModel(req.Model) {
+					return
+				}
 				m.MutateCoreRequest(ctx, req)
 			}
 		}
 		// FilterCoreContent
 		if f, ok := p.(CoreContentFilter); ok {
 			prev := hooks.FilterContent
+			pluginImpl := p
 			hooks.FilterContent = func(ctx context.Context, block *format.CoreContentBlock) bool {
-				if prev != nil && prev(ctx, block) { return true }
+				if prev != nil && prev(ctx, block) {
+					return true
+				}
+				model := format.ModelAliasFromCoreHookContext(ctx)
+				if model == "" || !pluginImpl.EnabledForModel(model) {
+					return false
+				}
 				return f.FilterCoreContent(ctx, block)
 			}
 		}
 		// RewriteMessages — only chain plugins enabled for this model.
 		if mw, ok := p.(MessageRewriter); ok {
 			prev := hooks.RewriteMessages
-			plugin := p.(Plugin) // for EnabledForModel check
+			pluginImpl := p
 			hooks.RewriteMessages = func(ctx context.Context, req *format.CoreRequest) {
-				if prev != nil { prev(ctx, req) }
+				if prev != nil {
+					prev(ctx, req)
+				}
+				if req == nil {
+					return
+				}
 				pluginCtx := &RequestContext{ModelAlias: req.Model}
-				if plugin.EnabledForModel(req.Model) {
+				if pluginImpl.EnabledForModel(req.Model) {
 					req.Messages = mw.RewriteMessages(pluginCtx, req.Messages)
 				}
 			}
@@ -519,8 +536,15 @@ func (r *Registry) CorePluginHooks() format.CorePluginHooks {
 		// RememberCoreContent
 		if rmem, ok := p.(CoreContentRememberer); ok {
 			prev := hooks.RememberContent
+			pluginImpl := p
 			hooks.RememberContent = func(ctx context.Context, content []format.CoreContentBlock) {
-				if prev != nil { prev(ctx, content) }
+				if prev != nil {
+					prev(ctx, content)
+				}
+				model := format.ModelAliasFromCoreHookContext(ctx)
+				if model == "" || !pluginImpl.EnabledForModel(model) {
+					return
+				}
 				rmem.RememberCoreContent(ctx, content)
 			}
 		}
