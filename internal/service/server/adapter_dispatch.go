@@ -170,9 +170,11 @@ func (s *Server) handleWithAdapters(
 	// the upstream provider receives the correct model identifier.
 	coreReq.Model = preferred.UpstreamModel
 
+	wsMode := resolvedWebSearchMode(pm, openAIReq.Model, preferred)
+
 	// Inject web search tools at Core level if mode is "injected".
-	// This replaces web_search with tavily_search/firecrawl_fetch tools.
-	wsInjected := s.injectCoreWebSearch(ctx, coreReq, preferred, openAIReq)
+	// This replaces web_search/web_search_preview with tavily_search/firecrawl_fetch tools.
+	wsInjected := s.injectCoreWebSearch(ctx, coreReq, preferred, openAIReq, wsMode)
 	searchCfg := s.resolvedSearchConfig(preferred.ProviderKey, openAIReq.Model)
 
 	upstreamAny, err := providerAdapter.FromCoreRequest(ctx, coreReq)
@@ -210,8 +212,8 @@ func (s *Server) handleWithAdapters(
 			return
 		}
 
-		// Inject web_search tool if enabled for this model.
-		if pm != nil && pm.ResolvedWebSearch(preferred.ProviderKey) == "enabled" {
+		// Inject native web_search tool when the resolved candidate supports it.
+		if wsMode == "enabled" {
 			injectAnthropicWebSearch(upstreamReq)
 		}
 
@@ -1600,44 +1602,29 @@ func (s *Server) wrapWithVisual(
 }
 
 // injectCoreWebSearch replaces web_search tools in coreReq.Tools with injected
-// tavily_search/firecrawl_fetch tools when the provider's web search mode is "injected".
+// tavily_search/firecrawl_fetch tools when the resolved web search mode is "injected".
 // Returns true if injection was applied.
-func (s *Server) injectCoreWebSearch(ctx context.Context, coreReq *format.CoreRequest, preferred provider.ProviderCandidate, openAIReq openai.ResponsesRequest) bool {
-	pm := s.activeProviderManager()
-	if pm == nil {
+func (s *Server) injectCoreWebSearch(ctx context.Context, coreReq *format.CoreRequest, preferred provider.ProviderCandidate, openAIReq openai.ResponsesRequest, wsMode string) bool {
+	_ = ctx
+	if wsMode != "injected" {
 		return false
 	}
-	wsMode := pm.ResolvedWebSearch(preferred.ProviderKey)
-	if wsMode != "injected" && wsMode != "auto" {
+	if s.runtime == nil {
 		return false
 	}
-	// For "auto" mode, check if keys are configured (fallback to injected).
-	if wsMode == "auto" && s.runtime != nil {
-		cfg := s.runtime.Current().Config
-		if cfg.TavilyAPIKey == "" && cfg.FirecrawlAPIKey == "" {
-			return false // no keys configured for "auto" fallback
-		}
-	}
-	// Check if the request has a web_search tool.
-	hasWebSearch := false
-	for _, t := range openAIReq.Tools {
-		if t.Type == "web_search" || t.Type == "web_search_preview" {
-			hasWebSearch = true
-			break
-		}
-	}
-	if !hasWebSearch {
+	searchCfg := s.resolvedSearchConfig(preferred.ProviderKey, openAIReq.Model)
+	if searchCfg.tavilyKey == "" && searchCfg.firecrawlKey == "" {
 		return false
 	}
+
 	// Replace coreReq.Tools: keep non-web_search tools, add injected search tools.
 	filtered := make([]format.CoreTool, 0, len(coreReq.Tools)+2)
 	for _, t := range coreReq.Tools {
-		if t.Name != "web_search" {
+		if t.Name != "web_search" && t.Name != "web_search_preview" {
 			filtered = append(filtered, t)
 		}
 	}
-	cfg := s.runtime.Current().Config
-	injected := websearchinjected.CoreTools(cfg.FirecrawlAPIKey)
+	injected := websearchinjected.CoreTools(searchCfg.firecrawlKey)
 	filtered = append(filtered, injected...)
 	coreReq.Tools = filtered
 	// Set tool_choice to auto so the model has freedom to call tavily_search.
@@ -1645,6 +1632,21 @@ func (s *Server) injectCoreWebSearch(ctx context.Context, coreReq *format.CoreRe
 		coreReq.ToolChoice = &format.CoreToolChoice{Mode: "auto"}
 	}
 	return true
+}
+
+func resolvedWebSearchMode(pm *provider.ProviderManager, modelAlias string, preferred provider.ProviderCandidate) string {
+	if pm == nil {
+		return ""
+	}
+	if preferred.ProviderKey != "" && preferred.UpstreamModel != "" {
+		if mode := pm.ResolvedWebSearchForCandidate(preferred.ProviderKey, preferred.UpstreamModel); mode != "" {
+			return mode
+		}
+	}
+	if modelAlias != "" {
+		return pm.ResolvedWebSearchForModel(modelAlias)
+	}
+	return ""
 }
 
 // searchProvider wraps the websearchinjected orchestrator's behavior.

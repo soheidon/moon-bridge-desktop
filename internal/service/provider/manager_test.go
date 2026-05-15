@@ -2,11 +2,11 @@ package provider
 
 import (
 	"context"
+	"moonbridge/internal/protocol/anthropic"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"moonbridge/internal/protocol/anthropic"
 
 	"moonbridge/internal/config"
 )
@@ -257,6 +257,30 @@ func TestResolveModel_Preferred(t *testing.T) {
 	}
 }
 
+func TestResolvedWebSearchForCandidatePrefersCandidateKey(t *testing.T) {
+	manager, err := NewProviderManager(map[string]ProviderConfig{
+		"deepseek": {
+			BaseURL: "https://deepseek.test",
+			APIKey:  "key-deepseek",
+		},
+	}, map[string]ModelRoute{
+		"deepseek-v4-flash": {Provider: "deepseek", Name: "deepseek-v4-flash"},
+	})
+	if err != nil {
+		t.Fatalf("NewProviderManager() error = %v", err)
+	}
+
+	manager.SetResolvedWebSearch("deepseek", "disabled")
+	manager.SetResolvedWebSearch(WebSearchCandidateKey("deepseek", "deepseek-v4-flash"), "enabled")
+
+	if got := manager.ResolvedWebSearchForCandidate("deepseek", "deepseek-v4-flash"); got != "enabled" {
+		t.Fatalf("ResolvedWebSearchForCandidate() = %q, want enabled", got)
+	}
+	if got := manager.ResolvedWebSearchForModel("deepseek-v4-flash"); got != "enabled" {
+		t.Fatalf("ResolvedWebSearchForModel() = %q, want enabled", got)
+	}
+}
+
 func TestResolveModel_OffersPriorityOverridesModelNames(t *testing.T) {
 	manager, err := NewProviderManager(map[string]ProviderConfig{
 		"low-priority": {
@@ -301,22 +325,22 @@ func TestResolveModel_OffersPriorityOverridesModelNames(t *testing.T) {
 func TestResolveModel_ProviderPriority(t *testing.T) {
 	manager, err := NewProviderManager(map[string]ProviderConfig{
 		"cheap": {
-			BaseURL:    "https://cheap.test",
-			APIKey:     "key-cheap",
+			BaseURL: "https://cheap.test",
+			APIKey:  "key-cheap",
 			Offers: []config.OfferEntry{
 				{Model: "shared-model", Priority: 10},
 			},
 		},
 		"fast": {
-			BaseURL:    "https://fast.test",
-			APIKey:     "key-fast",
+			BaseURL: "https://fast.test",
+			APIKey:  "key-fast",
 			Offers: []config.OfferEntry{
 				{Model: "shared-model", Priority: 5},
 			},
 		},
 		"zulu": {
-			BaseURL:    "https://z.test",
-			APIKey:     "key-z",
+			BaseURL: "https://z.test",
+			APIKey:  "key-z",
 			Offers: []config.OfferEntry{
 				{Model: "shared-model"},
 			},

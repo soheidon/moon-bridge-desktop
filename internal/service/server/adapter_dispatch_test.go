@@ -2,10 +2,13 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"moonbridge/internal/config"
 	"moonbridge/internal/format"
+	"moonbridge/internal/protocol/openai"
+	"moonbridge/internal/service/provider"
 	"moonbridge/internal/service/runtime"
 )
 
@@ -148,5 +151,117 @@ func TestResolvedSearchConfig_FallsBackToProvider(t *testing.T) {
 	}
 	if cfg.maxRounds != 8 {
 		t.Fatalf("maxRounds=%d, want 8", cfg.maxRounds)
+	}
+}
+
+func TestResolvedWebSearchModePrefersCandidateOverProvider(t *testing.T) {
+	pm, err := provider.NewProviderManager(
+		map[string]provider.ProviderConfig{
+			"deepseek": {
+				BaseURL: "https://deepseek.example.test",
+				APIKey:  "key-deepseek",
+			},
+		},
+		map[string]provider.ModelRoute{
+			"deepseek-v4-flash": {Provider: "deepseek", Name: "deepseek-v4-flash"},
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewProviderManager() error = %v", err)
+	}
+	pm.SetResolvedWebSearch("deepseek", "disabled")
+	pm.SetResolvedWebSearch(provider.WebSearchCandidateKey("deepseek", "deepseek-v4-flash"), "enabled")
+
+	mode := resolvedWebSearchMode(pm, "deepseek-v4-flash", provider.ProviderCandidate{
+		ProviderKey:   "deepseek",
+		UpstreamModel: "deepseek-v4-flash",
+	})
+	if mode != "enabled" {
+		t.Fatalf("resolvedWebSearchMode() = %q, want enabled", mode)
+	}
+}
+
+func TestInjectCoreWebSearchAutoInjectedAddsToolsWithoutExplicitRequestTools(t *testing.T) {
+	pm, err := provider.NewProviderManager(
+		map[string]provider.ProviderConfig{
+			"opencode": {
+				BaseURL: "https://opencode.example.test",
+				APIKey:  "key-opencode",
+			},
+		},
+		map[string]provider.ModelRoute{
+			"deepseek-v4-pro": {Provider: "opencode", Name: "deepseek-v4-pro"},
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewProviderManager() error = %v", err)
+	}
+	rt := runtime.NewRuntime(config.Config{
+		TavilyAPIKey: "tavily-key",
+		ProviderDefs: map[string]config.ProviderDef{
+			"opencode": {
+				TavilyAPIKey: "tavily-key",
+			},
+		},
+		Routes: map[string]config.RouteEntry{
+			"deepseek-v4-pro": {Provider: "opencode", Model: "deepseek-v4-pro"},
+		},
+	}, pm, nil)
+	srv := &Server{providerMgr: pm, runtime: rt}
+
+	coreReq := &format.CoreRequest{Model: "deepseek-v4-pro"}
+	openAIReq := openai.ResponsesRequest{
+		Model: "deepseek-v4-pro",
+		Input: json.RawMessage(`"搜索互联网获取今天的日期"`),
+	}
+	ok := srv.injectCoreWebSearch(context.Background(), coreReq, provider.ProviderCandidate{
+		ProviderKey:   "opencode",
+		UpstreamModel: "deepseek-v4-pro",
+	}, openAIReq, "injected")
+	if !ok {
+		t.Fatal("injectCoreWebSearch() = false, want true")
+	}
+	if len(coreReq.Tools) != 1 {
+		t.Fatalf("len(coreReq.Tools) = %d, want 1", len(coreReq.Tools))
+	}
+	if coreReq.Tools[0].Name != "tavily_search" {
+		t.Fatalf("tool[0].Name = %q, want tavily_search", coreReq.Tools[0].Name)
+	}
+	if coreReq.ToolChoice == nil || coreReq.ToolChoice.Mode != "auto" {
+		t.Fatalf("tool_choice = %+v, want auto", coreReq.ToolChoice)
+	}
+}
+
+func TestInjectCoreWebSearchSkipsWhenCandidateHasNativeSearch(t *testing.T) {
+	pm, err := provider.NewProviderManager(
+		map[string]provider.ProviderConfig{
+			"deepseek": {
+				BaseURL: "https://deepseek.example.test",
+				APIKey:  "key-deepseek",
+			},
+		},
+		map[string]provider.ModelRoute{
+			"deepseek-v4-flash": {Provider: "deepseek", Name: "deepseek-v4-flash"},
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewProviderManager() error = %v", err)
+	}
+	srv := &Server{providerMgr: pm}
+
+	coreReq := &format.CoreRequest{Model: "deepseek-v4-flash"}
+	openAIReq := openai.ResponsesRequest{
+		Model: "deepseek-v4-flash",
+		Input: json.RawMessage(`"搜索互联网获取今天的日期"`),
+	}
+	ok := srv.injectCoreWebSearch(context.Background(), coreReq, provider.ProviderCandidate{
+		ProviderKey:   "deepseek",
+		UpstreamModel: "deepseek-v4-flash",
+	}, openAIReq, "enabled")
+	if ok {
+		t.Fatal("injectCoreWebSearch() = true, want false for native search candidate")
+	}
+	if len(coreReq.Tools) != 0 {
+		t.Fatalf("len(coreReq.Tools) = %d, want 0", len(coreReq.Tools))
 	}
 }
