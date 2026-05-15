@@ -110,6 +110,9 @@ func (a *OpenAIAdapter) ToCoreRequest(ctx context.Context, req any) (*format.Cor
 	if len(openaiReq.Tools) > 0 {
 		coreReq.Tools = flattenToolsWithNamespace(openaiReq.Tools, "")
 	}
+	if injected := a.hooks.InjectTools(format.ContextWithCoreRequest(ctx, coreReq)); len(injected) > 0 {
+		coreReq.Tools = append(coreReq.Tools, injected...)
+	}
 
 	// 6. Convert tool choice.
 	if len(openaiReq.ToolChoice) > 0 && string(openaiReq.ToolChoice) != "null" {
@@ -1018,11 +1021,9 @@ func convertInput(raw json.RawMessage, model string) ([]format.CoreMessage, []fo
 			messages = append(messages, format.CoreMessage{
 				Role: "tool",
 				Content: []format.CoreContentBlock{{
-					Type:      "tool_result",
-					ToolUseID: item.CallID,
-					ToolResultContent: []format.CoreContentBlock{
-						{Type: "text", Text: outputToString(item.Output)},
-					},
+					Type:              "tool_result",
+					ToolUseID:         item.CallID,
+					ToolResultContent: outputToContentBlocks(item.Output),
 				}},
 			})
 			continue
@@ -1261,7 +1262,6 @@ func imageSourceFromRaw(raw json.RawMessage) string {
 // Tool Conversion
 // ============================================================================
 
-// convertTool converts an OpenAI Tool to a CoreTool.
 // convertToolChoice parses an OpenAI tool_choice JSON value into a CoreToolChoice.
 
 func convertToolChoice(raw json.RawMessage) (*format.CoreToolChoice, error) {
@@ -1662,4 +1662,18 @@ func customToolDescription(tool Tool, grammar string) string {
 		return "Use this custom tool with its raw freeform input in the input field."
 	}
 	return strings.Join(parts, "\n\n")
+}
+
+func outputToContentBlocks(raw json.RawMessage) []format.CoreContentBlock {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	blocks := contentBlocksFromRaw(raw)
+	if len(blocks) > 0 {
+		return blocks
+	}
+	if text := outputToString(raw); text != "" {
+		return []format.CoreContentBlock{{Type: "text", Text: text}}
+	}
+	return nil
 }

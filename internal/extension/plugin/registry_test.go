@@ -192,6 +192,18 @@ func TestRegistryInjectTools(t *testing.T) {
 	}
 }
 
+func TestRegistryCorePluginHooksInjectTools(t *testing.T) {
+	r := plugin.NewRegistry(nil)
+	r.Register(&testToolInjector{testPlugin: testPlugin{name: "ti", enabled: true}})
+
+	hooks := r.CorePluginHooks()
+	req := &format.CoreRequest{Model: "test"}
+	tools := hooks.InjectTools(format.ContextWithCoreRequest(context.Background(), req))
+	if len(tools) != 1 || tools[0].Name != "injected_tool" {
+		t.Fatalf("unexpected tools: %+v", tools)
+	}
+}
+
 func TestRegistryFilterContent(t *testing.T) {
 	r := plugin.NewRegistry(nil)
 	r.Register(&testContentFilter{testPlugin: testPlugin{name: "cf", enabled: true}})

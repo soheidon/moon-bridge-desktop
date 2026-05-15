@@ -695,6 +695,30 @@ func (s *Server) handleAdapterStream(
 		s.writeTrace(streamRecord)
 	}()
 
+	if candidate.Protocol == config.ProtocolAnthropic && coreRequestHasImage(coreReq) {
+		if providerAdapter := s.adapterRegistryProvider(config.ProtocolAnthropic); providerAdapter != nil {
+			if visProv := s.wrapWithVisual(ctx, openAIReq.Model, candidate, providerAdapter, sess); visProv != nil {
+				coreResp, err := visProv.CreateCore(ctx, coreReq)
+				if err != nil {
+					log.Error("adapter stream visual fallback: CreateCore failed", "error", err)
+					payload := openai.ErrorResponse{
+						Error: openai.ErrorObject{
+							Message: fmt.Sprintf("upstream error: %v", err),
+							Type:    "server_error",
+							Code:    "provider_error",
+						},
+					}
+					streamRecord.Error = traceError("stream_visual_create", err)
+					streamRecord.OpenAIResponse = payload
+					writeOpenAIError(w, http.StatusBadGateway, payload)
+					return
+				}
+				s.writeCoreResponseAsOpenAIStream(w, ctx, openAIReq, coreReq, coreResp, candidate, requestStart, &streamRecord)
+				return
+			}
+		}
+	}
+
 	// Protocol-specific upstream streaming: get stream + convert to CoreStreamEvent.
 	var coreEvents <-chan format.CoreStreamEvent
 	var providerStream format.ProviderStreamAdapter
@@ -1378,6 +1402,213 @@ func (s *Server) handleAdapterStream(
 	}
 }
 
+func (s *Server) adapterRegistryProvider(protocol string) format.ProviderAdapter {
+	if s.adapterRegistry == nil {
+		return nil
+	}
+	adapter, _ := s.adapterRegistry.GetProvider(protocol)
+	return adapter
+}
+
+func (s *Server) writeCoreResponseAsOpenAIStream(
+	w http.ResponseWriter,
+	ctx context.Context,
+	openAIReq openai.ResponsesRequest,
+	coreReq *format.CoreRequest,
+	coreResp *format.CoreResponse,
+	candidate provider.ProviderCandidate,
+	requestStart time.Time,
+	streamRecord *mbtrace.Record,
+) {
+	log := slog.Default().With("model", openAIReq.Model, "path", "adapter_stream_visual")
+
+	clientStream, ok := s.adapterRegistry.GetClientStream(config.ProtocolOpenAIResponse)
+	if !ok {
+		payload := openai.ErrorResponse{
+			Error: openai.ErrorObject{
+				Message: "adapter stream fallback not available",
+				Type:    "server_error",
+				Code:    "adapter_fallback",
+			},
+		}
+		streamRecord.Error = traceError("stream_client_adapter", fmt.Errorf("no client stream adapter"))
+		streamRecord.OpenAIResponse = payload
+		writeOpenAIError(w, http.StatusInternalServerError, payload)
+		return
+	}
+
+	streamChanAny, err := clientStream.FromCoreStream(ctx, coreReq, coreResponseToStreamEvents(coreResp))
+	if err != nil {
+		payload := openai.ErrorResponse{
+			Error: openai.ErrorObject{
+				Message: fmt.Sprintf("client stream conversion failed: %v", err),
+				Type:    "server_error",
+				Code:    "conversion_error",
+			},
+		}
+		streamRecord.Error = traceError("stream_from_core", err)
+		streamRecord.OpenAIResponse = payload
+		writeOpenAIError(w, http.StatusInternalServerError, payload)
+		return
+	}
+	streamChan, ok := streamChanAny.(<-chan openai.StreamEvent)
+	if !ok {
+		payload := openai.ErrorResponse{
+			Error: openai.ErrorObject{
+				Message: "unexpected stream channel type",
+				Type:    "server_error",
+				Code:    "internal_error",
+			},
+		}
+		streamRecord.Error = traceError("stream_channel_type", fmt.Errorf("unexpected stream channel type %T", streamChanAny))
+		streamRecord.OpenAIResponse = payload
+		writeOpenAIError(w, http.StatusInternalServerError, payload)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+
+	var finalResp *openai.Response
+	for ev := range streamChan {
+		if ev.Event == "response.completed" {
+			if lf, ok := ev.Data.(openai.ResponseLifecycleEvent); ok {
+				lfResp := lf.Response
+				finalResp = &lfResp
+			}
+		}
+		if err := writeSSE(w, ev); err != nil {
+			log.Warn("adapter stream visual fallback: SSE write failed", "error", err)
+			break
+		}
+	}
+
+	if finalResp != nil {
+		streamRecord.OpenAIResponse = finalResp
+	} else {
+		streamRecord.OpenAIResponse = &openai.Response{Model: openAIReq.Model, Status: "completed"}
+	}
+
+	usage := coreResp.Usage
+	billingUsage := billingUsageFromAnthropic(usage)
+	if s.stats != nil && (usage.InputTokens > 0 || usage.OutputTokens > 0) {
+		s.stats.Record(openAIReq.Model, candidate.UpstreamModel, statsUsageFromAnthropic(usage, true))
+	}
+	reqCost := computeCostWithProviderPricing(s.providerMgr, s.stats, openAIReq.Model, candidate.UpstreamModel, candidate.ProviderKey, billingUsage)
+	log.Info("流式视觉请求完成",
+		"actual_model", candidate.UpstreamModel,
+		"provider", candidate.ProviderKey,
+		"input_total", usage.InputTokens,
+		"output_tokens", usage.OutputTokens,
+		"duration", time.Since(requestStart),
+	)
+	if s.pluginRegistry != nil {
+		s.onRequestCompleted(
+			openAIReq.Model, candidate.UpstreamModel, candidate.ProviderKey,
+			requestStart, usageFromAnthropic(string(config.ProtocolAnthropic), "core_visual_stream", usage, true),
+			reqCost, "success", "",
+		)
+	}
+}
+
+func coreResponseToStreamEvents(resp *format.CoreResponse) <-chan format.CoreStreamEvent {
+	out := make(chan format.CoreStreamEvent, 16)
+	go func() {
+		defer close(out)
+		if resp == nil {
+			out <- format.CoreStreamEvent{
+				Type: format.CoreEventFailed,
+				Error: &format.CoreError{
+					Message: "core response is nil",
+					Type:    "server_error",
+				},
+			}
+			return
+		}
+		out <- format.CoreStreamEvent{Type: format.CoreEventCreated, ItemID: resp.ID, Model: resp.Model}
+		index := 0
+		for _, msg := range resp.Messages {
+			if msg.Role != "assistant" {
+				continue
+			}
+			for _, block := range msg.Content {
+				switch block.Type {
+				case "reasoning":
+					out <- format.CoreStreamEvent{Type: format.CoreContentBlockStarted, Index: index, ContentBlock: &format.CoreContentBlock{Type: "reasoning"}}
+					if block.ReasoningText != "" {
+						out <- format.CoreStreamEvent{Type: format.CoreTextDelta, Index: index, Delta: block.ReasoningText}
+					}
+					out <- format.CoreStreamEvent{Type: format.CoreContentBlockDone, Index: index, ContentBlock: &format.CoreContentBlock{
+						Type:               "reasoning",
+						ReasoningSignature: block.ReasoningSignature,
+					}}
+					index++
+				case "text":
+					out <- format.CoreStreamEvent{Type: format.CoreContentBlockStarted, Index: index, ContentBlock: &format.CoreContentBlock{Type: "text"}}
+					if block.Text != "" {
+						out <- format.CoreStreamEvent{Type: format.CoreTextDelta, Index: index, Delta: block.Text}
+					}
+					out <- format.CoreStreamEvent{Type: format.CoreContentBlockDone, Index: index}
+					index++
+				}
+			}
+		}
+		status := "completed"
+		if resp.Status != "" {
+			status = resp.Status
+		}
+		eventType := format.CoreEventCompleted
+		if status == "failed" {
+			eventType = format.CoreEventFailed
+		} else if status == "incomplete" {
+			eventType = format.CoreEventIncomplete
+		}
+		out <- format.CoreStreamEvent{
+			Type:   eventType,
+			Status: status,
+			Model:  resp.Model,
+			Usage:  &resp.Usage,
+			Error:  resp.Error,
+		}
+	}()
+	return out
+}
+
+func coreRequestHasImage(req *format.CoreRequest) bool {
+	if req == nil {
+		return false
+	}
+	for _, block := range req.System {
+		if block.Type == "image" {
+			return true
+		}
+	}
+	for _, msg := range req.Messages {
+		for _, block := range msg.Content {
+			if coreBlockHasImage(block) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func coreBlockHasImage(block format.CoreContentBlock) bool {
+	if block.Type == "image" {
+		return true
+	}
+	if block.Type != "tool_result" {
+		return false
+	}
+	for _, child := range block.ToolResultContent {
+		if coreBlockHasImage(child) {
+			return true
+		}
+	}
+	return false
+}
+
 // ============================================================================
 // Protocol-Agnostic Visual Bridge
 // ============================================================================
@@ -1417,6 +1648,9 @@ func (p *adapterCoreProvider) CreateCore(ctx context.Context, req *format.CoreRe
 	rawResp, err := p.client.CreateMessage(ctx, upstreamAny)
 	if err != nil {
 		return nil, err
+	}
+	if msgResp, ok := rawResp.(anthropic.MessageResponse); ok {
+		rawResp = &msgResp
 	}
 	return p.adapter.ToCoreResponse(ctx, rawResp)
 }

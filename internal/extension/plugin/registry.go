@@ -544,6 +544,22 @@ func (r *Registry) CorePluginHooks() format.CorePluginHooks {
 				}
 			}
 		}
+		// InjectTools — only chain plugins enabled for this model.
+		if ti, ok := p.(ToolInjector); ok {
+			prev := hooks.InjectTools
+			plugin := p.(Plugin) // for EnabledForModel check
+			hooks.InjectTools = func(ctx context.Context) []format.CoreTool {
+				tools := prev(ctx)
+				modelAlias := ""
+				if req, ok := format.CoreRequestFromContext(ctx); ok && req != nil {
+					modelAlias = req.Model
+				}
+				if plugin.EnabledForModel(modelAlias) {
+					tools = append(tools, ti.InjectTools(&RequestContext{ModelAlias: modelAlias})...)
+				}
+				return tools
+			}
+		}
 		// RememberCoreContent
 		if rmem, ok := p.(CoreContentRememberer); ok {
 			prev := hooks.RememberContent
