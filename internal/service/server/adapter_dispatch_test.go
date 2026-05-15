@@ -4,7 +4,9 @@ import (
 	"context"
 	"testing"
 
+	"moonbridge/internal/config"
 	"moonbridge/internal/format"
+	"moonbridge/internal/service/runtime"
 )
 
 func TestCoreResponseToCoreStreamEmitsUsageOnCompleted(t *testing.T) {
@@ -78,5 +80,73 @@ func TestCoreResponseToCoreStreamEmitsUsageOnCompleted(t *testing.T) {
 	}
 	if !sawToolArgsDone {
 		t.Fatal("missing tool args done event")
+	}
+}
+
+func TestResolvedSearchConfig_UsesModelOverrides(t *testing.T) {
+	rt := runtime.NewRuntime(config.Config{
+		SearchMaxRounds: 4,
+		TavilyAPIKey:    "global-tv",
+		FirecrawlAPIKey: "global-fc",
+		ProviderDefs: map[string]config.ProviderDef{
+			"main": {
+				SearchMaxRounds: 6,
+				TavilyAPIKey:    "provider-tv",
+				FirecrawlAPIKey: "provider-fc",
+				Models: map[string]config.ModelMeta{
+					"gpt-4o-mini": {
+						WebSearch: config.WebSearchConfig{
+							Support:         config.WebSearchSupportInjected,
+							TavilyAPIKey:    "model-tv",
+							FirecrawlAPIKey: "model-fc",
+							SearchMaxRounds: 9,
+						},
+					},
+				},
+			},
+		},
+		Routes: map[string]config.RouteEntry{
+			"assistant-mini": {Provider: "main", Model: "gpt-4o-mini"},
+		},
+	}, nil, nil)
+	srv := &Server{runtime: rt}
+
+	cfg := srv.resolvedSearchConfig("main", "assistant-mini")
+	if cfg.tavilyKey != "model-tv" {
+		t.Fatalf("tavily=%q, want model-tv", cfg.tavilyKey)
+	}
+	if cfg.firecrawlKey != "model-fc" {
+		t.Fatalf("firecrawl=%q, want model-fc", cfg.firecrawlKey)
+	}
+	if cfg.maxRounds != 9 {
+		t.Fatalf("maxRounds=%d, want 9", cfg.maxRounds)
+	}
+}
+
+func TestResolvedSearchConfig_FallsBackToProvider(t *testing.T) {
+	rt := runtime.NewRuntime(config.Config{
+		SearchMaxRounds: 5,
+		TavilyAPIKey:    "global-tv",
+		FirecrawlAPIKey: "global-fc",
+		ProviderDefs: map[string]config.ProviderDef{
+			"main": {
+				SearchMaxRounds:  8,
+				TavilyAPIKey:     "provider-tv",
+				FirecrawlAPIKey:  "provider-fc",
+				WebSearchSupport: config.WebSearchSupportInjected,
+			},
+		},
+	}, nil, nil)
+	srv := &Server{runtime: rt}
+
+	cfg := srv.resolvedSearchConfig("main", "")
+	if cfg.tavilyKey != "provider-tv" {
+		t.Fatalf("tavily=%q, want provider-tv", cfg.tavilyKey)
+	}
+	if cfg.firecrawlKey != "provider-fc" {
+		t.Fatalf("firecrawl=%q, want provider-fc", cfg.firecrawlKey)
+	}
+	if cfg.maxRounds != 8 {
+		t.Fatalf("maxRounds=%d, want 8", cfg.maxRounds)
 	}
 }

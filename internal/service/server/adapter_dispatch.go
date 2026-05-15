@@ -173,6 +173,7 @@ func (s *Server) handleWithAdapters(
 	// Inject web search tools at Core level if mode is "injected".
 	// This replaces web_search with tavily_search/firecrawl_fetch tools.
 	wsInjected := s.injectCoreWebSearch(ctx, coreReq, preferred, openAIReq)
+	searchCfg := s.resolvedSearchConfig(preferred.ProviderKey, openAIReq.Model)
 
 	upstreamAny, err := providerAdapter.FromCoreRequest(ctx, coreReq)
 	if err != nil {
@@ -245,11 +246,10 @@ func (s *Server) handleWithAdapters(
 
 		// Wrap provider with search orchestrator if web search is "injected".
 		if wsInjected {
-			if acc, ok := effectiveProvider.(provider.AnthropicClientAccessor); ok && s.runtime != nil {
-				cfgC := s.runtime.Current().Config
+			if acc, ok := effectiveProvider.(provider.AnthropicClientAccessor); ok {
 				wrapped := websearchinjected.WrapProvider(
 					acc.AnthropicClient(),
-					cfgC.TavilyAPIKey, cfgC.FirecrawlAPIKey, s.maxSearchRounds(),
+					searchCfg.tavilyKey, searchCfg.firecrawlKey, searchCfg.maxRounds,
 				)
 				effectiveProvider = &searchProviderAdapter{wrapped: wrapped}
 			}
@@ -356,7 +356,7 @@ func (s *Server) handleWithAdapters(
 		record.ChatRequest = chatReq
 		var chatResp *chat.ChatResponse
 		if wsInjected {
-			chatResp, err = s.executeChatSearchLoop(ctx, chatClient, chatReq, s.runtime.Current().Config.TavilyAPIKey, s.runtime.Current().Config.FirecrawlAPIKey, s.maxSearchRounds())
+			chatResp, err = s.executeChatSearchLoop(ctx, chatClient, chatReq, searchCfg.tavilyKey, searchCfg.firecrawlKey, searchCfg.maxRounds)
 		} else {
 			chatResp, err = chatClient.CreateChat(ctx, chatReq)
 		}
@@ -463,7 +463,7 @@ func (s *Server) handleWithAdapters(
 		record.UpstreamRequest = googleReq
 		var googleResp *google.GenerateContentResponse
 		if wsInjected {
-			googleResp, err = s.executeGoogleSearchLoop(ctx, googleClient, preferred.UpstreamModel, googleReq, s.runtime.Current().Config.TavilyAPIKey, s.runtime.Current().Config.FirecrawlAPIKey, s.maxSearchRounds())
+			googleResp, err = s.executeGoogleSearchLoop(ctx, googleClient, preferred.UpstreamModel, googleReq, searchCfg.tavilyKey, searchCfg.firecrawlKey, searchCfg.maxRounds)
 		} else {
 			googleResp, err = googleClient.GenerateContent(ctx, preferred.UpstreamModel, googleReq)
 		}
@@ -876,7 +876,8 @@ func (s *Server) handleAdapterStream(
 		var chatStream <-chan chat.ChatStreamChunk
 		var err error
 		if wsInjected {
-			chatStream, err = s.chatSearchBufferedStream(ctx, chatClient, chatReq, s.runtime.Current().Config.TavilyAPIKey, s.runtime.Current().Config.FirecrawlAPIKey, s.maxSearchRounds())
+			searchCfg := s.resolvedSearchConfig(candidate.ProviderKey, openAIReq.Model)
+			chatStream, err = s.chatSearchBufferedStream(ctx, chatClient, chatReq, searchCfg.tavilyKey, searchCfg.firecrawlKey, searchCfg.maxRounds)
 		} else {
 			chatStream, err = chatClient.StreamChat(ctx, chatReq)
 		}
@@ -975,6 +976,74 @@ func (s *Server) handleAdapterStream(
 		}
 
 		streamRecord.UpstreamRequest = googleReq
+		if wsInjected {
+			searchCfg := s.resolvedSearchConfig(candidate.ProviderKey, openAIReq.Model)
+			googleResp, err := s.executeGoogleSearchLoop(ctx, googleClient, candidate.UpstreamModel, googleReq, searchCfg.tavilyKey, searchCfg.firecrawlKey, searchCfg.maxRounds)
+			if err != nil {
+				log.Error("adapter stream: injected google search loop failed", "error", err)
+				payload := openai.ErrorResponse{
+					Error: openai.ErrorObject{
+						Message: fmt.Sprintf("google stream error: %v", err),
+						Type:    "server_error",
+						Code:    "provider_error",
+					},
+				}
+				streamRecord.Error = traceError("stream_google_injected", err)
+				streamRecord.OpenAIResponse = payload
+				writeOpenAIError(w, http.StatusBadGateway, payload)
+				return
+			}
+			streamRecord.UpstreamResponse = googleResp
+			googleProvAdapter, ok := s.adapterRegistry.GetProvider(config.ProtocolGoogleGenAI)
+			if !ok {
+				log.Error("adapter stream: no google provider adapter for injected path")
+				payload := openai.ErrorResponse{
+					Error: openai.ErrorObject{
+						Message: "google stream adapter not available",
+						Type:    "server_error",
+						Code:    "adapter_fallback",
+					},
+				}
+				streamRecord.Error = traceError("stream_google_adapter", fmt.Errorf("no google provider adapter"))
+				streamRecord.OpenAIResponse = payload
+				writeOpenAIError(w, http.StatusInternalServerError, payload)
+				return
+			}
+			googleAdapter, ok := googleProvAdapter.(interface {
+				ToCoreResponse(context.Context, any) (*format.CoreResponse, error)
+			})
+			if !ok {
+				log.Error("adapter stream: google adapter lacks ToCoreResponse for injected path")
+				payload := openai.ErrorResponse{
+					Error: openai.ErrorObject{
+						Message: "google stream conversion failed",
+						Type:    "server_error",
+						Code:    "conversion_error",
+					},
+				}
+				streamRecord.Error = traceError("stream_google_injected_type", fmt.Errorf("google adapter type mismatch"))
+				streamRecord.OpenAIResponse = payload
+				writeOpenAIError(w, http.StatusInternalServerError, payload)
+				return
+			}
+			coreFinal, convErr := googleAdapter.ToCoreResponse(ctx, googleResp)
+			if convErr != nil {
+				log.Error("adapter stream: injected google ToCoreResponse failed", "error", convErr)
+				payload := openai.ErrorResponse{
+					Error: openai.ErrorObject{
+						Message: fmt.Sprintf("google stream conversion failed: %v", convErr),
+						Type:    "server_error",
+						Code:    "conversion_error",
+					},
+				}
+				streamRecord.Error = traceError("stream_google_injected_tocore", convErr)
+				streamRecord.OpenAIResponse = payload
+				writeOpenAIError(w, http.StatusInternalServerError, payload)
+				return
+			}
+			coreEvents = coreResponseToCoreStream(ctx, coreFinal)
+			break
+		}
 		googleStream, err := googleClient.StreamGenerateContent(ctx, candidate.UpstreamModel, googleReq)
 		if err != nil {
 			log.Error("adapter stream: StreamGenerateContent failed", "error", err)
@@ -1633,6 +1702,54 @@ func (a *searchProviderAdapter) StreamMessage(ctx context.Context, req any) (<-c
 }
 
 func (a *searchProviderAdapter) AnthropicClient() *anthropic.Client { return nil }
+
+type searchConfig struct {
+	tavilyKey    string
+	firecrawlKey string
+	maxRounds    int
+}
+
+func (s *Server) resolvedSearchConfig(providerKey, modelAlias string) searchConfig {
+	// Keep a conservative fallback to existing global/runtime behavior.
+	cfg := searchConfig{
+		tavilyKey:    "",
+		firecrawlKey: "",
+		maxRounds:    s.maxSearchRounds(),
+	}
+	if s.runtime == nil {
+		return cfg
+	}
+	fullCfg := s.runtime.Current().Config
+	cfg.tavilyKey = fullCfg.TavilyAPIKey
+	cfg.firecrawlKey = fullCfg.FirecrawlAPIKey
+
+	// Prefer model-level resolved config; then provider-level fallback.
+	if modelAlias != "" {
+		if key := fullCfg.WebSearchTavilyKeyForModel(modelAlias); key != "" {
+			cfg.tavilyKey = key
+		}
+		if key := fullCfg.WebSearchFirecrawlKeyForModel(modelAlias); key != "" {
+			cfg.firecrawlKey = key
+		}
+		if rounds := fullCfg.WebSearchMaxRoundsForModel(modelAlias); rounds > 0 {
+			cfg.maxRounds = rounds
+		}
+		return cfg
+	}
+
+	if providerKey != "" {
+		if key := fullCfg.WebSearchTavilyKeyForProvider(providerKey); key != "" {
+			cfg.tavilyKey = key
+		}
+		if key := fullCfg.WebSearchFirecrawlKeyForProvider(providerKey); key != "" {
+			cfg.firecrawlKey = key
+		}
+		if rounds := fullCfg.WebSearchMaxRoundsForProvider(providerKey); rounds > 0 {
+			cfg.maxRounds = rounds
+		}
+	}
+	return cfg
+}
 
 // injectAnthropicWebSearch adds the Anthropic web_search_20250305 server tool
 // to an anthropic.MessageRequest if not already present.
