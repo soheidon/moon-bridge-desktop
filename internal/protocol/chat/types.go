@@ -89,6 +89,7 @@ type FunctionDef struct {
 
 // ToolCall represents a tool call in a response or streaming delta.
 type ToolCall struct {
+	Index    *int         `json:"index,omitempty"` // tool call position in streaming deltas
 	ID       string       `json:"id"`
 	Type     string       `json:"type"` // "function"
 	Function ToolCallFunc `json:"function"`

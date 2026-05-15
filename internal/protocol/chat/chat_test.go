@@ -2191,6 +2191,141 @@ func TestToCoreStream_ContentBlockStartedNoRole(t *testing.T) {
 	}
 }
 
+func TestToCoreStream_ToolCallArgsDeltaByPosition(t *testing.T) {
+	adapter := newTestAdapter()
+	src := make(chan chat.ChatStreamChunk, 4)
+	idx0 := 0
+	idx1 := 1
+	src <- chat.ChatStreamChunk{
+		Choices: []chat.StreamChoice{{
+			Index: 0,
+			Delta: chat.Delta{
+				Role: "assistant",
+				ToolCalls: []chat.ToolCall{
+					{
+						Index: &idx0, ID: "call_a", Type: "function",
+						Function: chat.ToolCallFunc{Name: "tool_a", Arguments: json.RawMessage(``)},
+					},
+					{
+						Index: &idx1, ID: "call_b", Type: "function",
+						Function: chat.ToolCallFunc{Name: "tool_b", Arguments: json.RawMessage(``)},
+					},
+				},
+			},
+		}},
+	}
+	src <- chat.ChatStreamChunk{
+		Choices: []chat.StreamChoice{{
+			Index: 0,
+			Delta: chat.Delta{
+				ToolCalls: []chat.ToolCall{
+					{Index: &idx0, Function: chat.ToolCallFunc{Arguments: json.RawMessage(`"{\"a\":1}"`)}},
+					{Index: &idx1, Function: chat.ToolCallFunc{Arguments: json.RawMessage(`"{\"b\":2}"`)}},
+				},
+			},
+		}},
+	}
+	src <- chat.ChatStreamChunk{
+		Choices: []chat.StreamChoice{{Index: 0, FinishReason: "tool_calls"}},
+	}
+	close(src)
+
+	events, err := adapter.ToCoreStream(context.Background(), (<-chan chat.ChatStreamChunk)(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deltas []format.CoreStreamEvent
+	for e := range events {
+		if e.Type == format.CoreToolCallArgsDelta {
+			deltas = append(deltas, e)
+		}
+	}
+	if len(deltas) != 2 {
+		t.Fatalf("tool_call_args.delta count = %d, want 2", len(deltas))
+	}
+	if deltas[0].Index == deltas[1].Index {
+		t.Fatalf("tool deltas should map to different indices, got both at %d", deltas[0].Index)
+	}
+}
+
+func TestToCoreStream_ToolCallArgsDeltaRespectsExplicitToolIndex(t *testing.T) {
+	adapter := newTestAdapter()
+	src := make(chan chat.ChatStreamChunk, 4)
+	idx0 := 0
+	idx1 := 1
+	src <- chat.ChatStreamChunk{
+		Choices: []chat.StreamChoice{{
+			Index: 0,
+			Delta: chat.Delta{
+				Role: "assistant",
+				ToolCalls: []chat.ToolCall{
+					{
+						Index: &idx0, ID: "call_a", Type: "function",
+						Function: chat.ToolCallFunc{Name: "tool_a", Arguments: json.RawMessage(``)},
+					},
+					{
+						Index: &idx1, ID: "call_b", Type: "function",
+						Function: chat.ToolCallFunc{Name: "tool_b", Arguments: json.RawMessage(``)},
+					},
+				},
+			},
+		}},
+	}
+	src <- chat.ChatStreamChunk{
+		Choices: []chat.StreamChoice{{
+			Index: 0,
+			Delta: chat.Delta{
+				ToolCalls: []chat.ToolCall{
+					{Index: &idx1, Function: chat.ToolCallFunc{Arguments: json.RawMessage(`"{\"b\":2}"`)}},
+					{Index: &idx0, Function: chat.ToolCallFunc{Arguments: json.RawMessage(`"{\"a\":1}"`)}},
+				},
+			},
+		}},
+	}
+	src <- chat.ChatStreamChunk{
+		Choices: []chat.StreamChoice{{Index: 0, FinishReason: "tool_calls"}},
+	}
+	close(src)
+
+	events, err := adapter.ToCoreStream(context.Background(), (<-chan chat.ChatStreamChunk)(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var started []format.CoreStreamEvent
+	var deltas []format.CoreStreamEvent
+	for e := range events {
+		if e.Type == format.CoreContentBlockStarted && e.ContentBlock != nil && e.ContentBlock.Type == "tool_use" {
+			started = append(started, e)
+		}
+		if e.Type == format.CoreToolCallArgsDelta {
+			deltas = append(deltas, e)
+		}
+	}
+	if len(started) != 2 || len(deltas) != 2 {
+		t.Fatalf("started=%d deltas=%d, want 2/2", len(started), len(deltas))
+	}
+	toolIndexByID := map[string]int{
+		started[0].ContentBlock.ToolUseID: started[0].Index,
+		started[1].ContentBlock.ToolUseID: started[1].Index,
+	}
+	idxA, okA := toolIndexByID["call_a"]
+	idxB, okB := toolIndexByID["call_b"]
+	if !okA || !okB {
+		t.Fatalf("missing tool start mapping: %+v", toolIndexByID)
+	}
+	if idxA == idxB {
+		t.Fatalf("tool indices should differ, both=%d", idxA)
+	}
+	for _, d := range deltas {
+		if d.Delta == `{"a":1}` && d.Index != idxA {
+			t.Fatalf("delta for call_a routed to %d, want %d", d.Index, idxA)
+		}
+		if d.Delta == `{"b":2}` && d.Index != idxB {
+			t.Fatalf("delta for call_b routed to %d, want %d", d.Index, idxB)
+		}
+	}
+}
+
 func TestFromCoreRequest_ToolResultInImagePath(t *testing.T) {
 	adapter := newTestAdapter()
 	result, err := adapter.FromCoreRequest(context.Background(), &format.CoreRequest{

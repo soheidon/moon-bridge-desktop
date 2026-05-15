@@ -1123,6 +1123,40 @@ func (s *Server) handleAdapterStream(
 		}
 	}
 
+	// Cache reasoning from Chat stream for DeepSeek thinking replay.
+	// This must not depend on trace being enabled.
+	if sess != nil {
+		if chatProvider, ok := s.adapterRegistry.GetProvider(config.ProtocolOpenAIChat); ok {
+			if chatAdapter, ok := chatProvider.(*chat.ChatProviderAdapter); ok {
+				if events := chatAdapter.StreamBuffer(); len(events) > 0 {
+					var streamReasoning string
+					seenToolCallIDs := make(map[string]struct{})
+					streamToolCallIDs := make([]string, 0, 4)
+					for _, ev := range events {
+						for _, sc := range ev.Choices {
+							if sc.Delta.ReasoningContent != "" {
+								streamReasoning += sc.Delta.ReasoningContent
+							}
+							for _, tc := range sc.Delta.ToolCalls {
+								if tc.ID == "" {
+									continue
+								}
+								if _, ok := seenToolCallIDs[tc.ID]; ok {
+									continue
+								}
+								seenToolCallIDs[tc.ID] = struct{}{}
+								streamToolCallIDs = append(streamToolCallIDs, tc.ID)
+							}
+						}
+					}
+					if streamReasoning != "" && len(streamToolCallIDs) > 0 {
+						cacheReasoningForChat(sess, streamToolCallIDs, streamReasoning)
+					}
+				}
+			}
+		}
+	}
+
 	// Capture stream events for trace.
 	if s.tracer != nil && s.tracer.Enabled() {
 		// OpenAI stream events from client adapter
@@ -1145,27 +1179,6 @@ func (s *Server) handleAdapterStream(
 					if chatAdapter, ok := chatProvider.(*chat.ChatProviderAdapter); ok {
 						if events := chatAdapter.StreamBuffer(); len(events) > 0 {
 							streamRecord.ChatStreamEvents = events
-
-							// Cache reasoning from Chat stream for DeepSeek thinking replay.
-							if sess != nil {
-								var streamReasoning string
-								var streamToolCallIDs []string
-								for _, ev := range events {
-									for _, sc := range ev.Choices {
-										if sc.Delta.ReasoningContent != "" {
-											streamReasoning = sc.Delta.ReasoningContent
-										}
-										for _, tc := range sc.Delta.ToolCalls {
-											if tc.ID != "" {
-												streamToolCallIDs = append(streamToolCallIDs, tc.ID)
-											}
-										}
-									}
-								}
-								if streamReasoning != "" && len(streamToolCallIDs) > 0 {
-									cacheReasoningForChat(sess, streamToolCallIDs, streamReasoning)
-								}
-							}
 						}
 					}
 				}

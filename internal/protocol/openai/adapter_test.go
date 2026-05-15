@@ -3,6 +3,7 @@ package openai_test
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"moonbridge/internal/format"
@@ -127,5 +128,75 @@ func TestToCoreRequest_NilInput(t *testing.T) {
 	_, err := adapter.ToCoreRequest(context.Background(), req)
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestToCoreRequest_ReasoningModelInjectsEmptyReasoningBeforeFunctionCall(t *testing.T) {
+	adapter := openai.NewOpenAIAdapter(format.CorePluginHooks{})
+	req := &openai.ResponsesRequest{
+		Model: "o3-mini",
+		Input: json.RawMessage(`[
+			{"type":"function_call","id":"fc_1","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"Paris\"}"}
+		]`),
+	}
+	result, err := adapter.ToCoreRequest(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Messages) != 1 {
+		t.Fatalf("messages len=%d, want 1", len(result.Messages))
+	}
+	if len(result.Messages[0].Content) < 2 {
+		t.Fatalf("assistant content len=%d, want >=2", len(result.Messages[0].Content))
+	}
+	if result.Messages[0].Content[0].Type != "reasoning" {
+		t.Fatalf("first content type=%q, want reasoning", result.Messages[0].Content[0].Type)
+	}
+	if result.Messages[0].Content[1].Type != "tool_use" {
+		t.Fatalf("second content type=%q, want tool_use", result.Messages[0].Content[1].Type)
+	}
+}
+
+func TestFromCoreStream_NoDuplicateDoneForToolUse(t *testing.T) {
+	adapter := openai.NewOpenAIAdapter(format.CorePluginHooks{})
+	coreReq := &format.CoreRequest{Model: "gpt-4o"}
+	evCh := make(chan format.CoreStreamEvent, 8)
+	evCh <- format.CoreStreamEvent{
+		Type:  format.CoreContentBlockStarted,
+		Index: 5,
+		ContentBlock: &format.CoreContentBlock{
+			Type:      "tool_use",
+			ToolUseID: "call_1",
+			ToolName:  "exec_command",
+		},
+	}
+	evCh <- format.CoreStreamEvent{Type: format.CoreToolCallArgsDelta, Index: 5, Delta: `{"cmd":"ls"}`}
+	evCh <- format.CoreStreamEvent{Type: format.CoreToolCallArgsDone, Index: 5, Delta: `{"cmd":"ls"}`}
+	evCh <- format.CoreStreamEvent{Type: format.CoreContentBlockDone, Index: 5}
+	evCh <- format.CoreStreamEvent{Type: format.CoreEventCompleted, Status: "completed"}
+	close(evCh)
+
+	streamAny, err := adapter.FromCoreStream(context.Background(), coreReq, evCh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := streamAny.(<-chan openai.StreamEvent)
+	var argsDone int
+	var itemDone int
+	for ev := range stream {
+		if ev.Event == "response.function_call_arguments.done" {
+			argsDone++
+		}
+		if ev.Event == "response.output_item.done" {
+			if data, ok := ev.Data.(openai.OutputItemEvent); ok && strings.HasPrefix(data.Item.CallID, "call_") {
+				itemDone++
+			}
+		}
+	}
+	if argsDone != 1 {
+		t.Fatalf("function_call_arguments.done count=%d, want 1", argsDone)
+	}
+	if itemDone != 1 {
+		t.Fatalf("output_item.done (tool) count=%d, want 1", itemDone)
 	}
 }

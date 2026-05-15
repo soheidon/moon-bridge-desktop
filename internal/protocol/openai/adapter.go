@@ -15,8 +15,8 @@ import (
 	"strings"
 	"sync"
 
-	"moonbridge/internal/format"
 	"moonbridge/internal/extension/codextool"
+	"moonbridge/internal/format"
 )
 
 // ============================================================================
@@ -31,7 +31,6 @@ import (
 //
 // The adapter is stateless; all configuration is injected via the constructor.
 type OpenAIAdapter struct {
-
 	hooks format.CorePluginHooks
 
 	streamMu     sync.Mutex
@@ -82,7 +81,7 @@ func (a *OpenAIAdapter) ToCoreRequest(ctx context.Context, req any) (*format.Cor
 	openaiReq.Input = preprocessed
 
 	// 2. Parse Input → Messages + System.
-	messages, system, err := convertInput(openaiReq.Input)
+	messages, system, err := convertInput(openaiReq.Input, openaiReq.Model)
 	if err != nil {
 		return nil, fmt.Errorf("invalid input: %w", err)
 	}
@@ -164,7 +163,6 @@ func (a *OpenAIAdapter) ToCoreRequest(ctx context.Context, req any) (*format.Cor
 	if len(openaiExt) > 0 {
 		coreReq.Extensions["openai"] = openaiExt
 	}
-
 
 	a.hooks.MutateCoreRequest(ctx, coreReq)
 
@@ -288,7 +286,6 @@ func (a *OpenAIAdapter) FromCoreResponse(ctx context.Context, resp *format.CoreR
 	}
 	response.Usage = usage
 
-
 	// Map error.
 	if resp.Error != nil {
 		response.Error = &ErrorObject{
@@ -369,6 +366,7 @@ func (a *OpenAIAdapter) streamLoop(ctx context.Context, coreReq *format.CoreRequ
 	outputIndexes := make(map[int]int)
 	itemIDs := make(map[int]string)
 	reasonIndexes := make(map[int]bool)
+	toolCallFinalized := make(map[int]bool)
 
 	for event := range events {
 		// Let hooks skip events.
@@ -627,20 +625,28 @@ func (a *OpenAIAdapter) streamLoop(ctx context.Context, coreReq *format.CoreRequ
 				},
 			})
 
-		// ==================================================================
-		// Tool call arguments done
-		// ==================================================================
+			// ==================================================================
+			// Tool call arguments done
+			// ==================================================================
 		case format.CoreToolCallArgsDone:
 			index := event.Index
+			if toolCallFinalized[index] {
+				break
+			}
+			finalArgs := event.Delta
+			if finalArgs == "" {
+				finalArgs = toolCallArgs[index]
+			}
 			if idx, ok := outputIndexes[index]; ok && idx < len(response.Output) {
-				response.Output[idx].Arguments = event.Delta
+				response.Output[idx].Arguments = finalArgs
 				response.Output[idx].Status = "completed"
 				if response.Output[idx].Type == "custom_tool_call" {
-					if bn, ok := toolBlockNames[index]; ok && event.Delta != "" {
-						response.Output[idx].Input = codextool.RebuildGrammar(bn, json.RawMessage(event.Delta))
+					if bn, ok := toolBlockNames[index]; ok && finalArgs != "" {
+						response.Output[idx].Input = codextool.RebuildGrammar(bn, json.RawMessage(finalArgs))
 					}
 				}
 			}
+			toolCallFinalized[index] = true
 			send(StreamEvent{
 				Event: "response.function_call_arguments.done",
 				Data: FunctionCallArgumentsDoneEvent{
@@ -648,7 +654,7 @@ func (a *OpenAIAdapter) streamLoop(ctx context.Context, coreReq *format.CoreRequ
 					SequenceNumber: next(),
 					ItemID:         itemIDs[index],
 					OutputIndex:    outputIndexes[index],
-					Arguments:      event.Delta,
+					Arguments:      finalArgs,
 				},
 			})
 			send(StreamEvent{
@@ -839,6 +845,9 @@ func (a *OpenAIAdapter) streamLoop(ctx context.Context, coreReq *format.CoreRequ
 				delete(contentText, index)
 
 			} else if _, ok := outputIndexes[index]; ok {
+				if toolCallFinalized[index] {
+					break
+				}
 				// 2. Tool_use block done — emit function_call_arguments.done + output_item.done.
 				itemID := itemIDs[index]
 				outputIndex := outputIndexes[index]
@@ -880,6 +889,7 @@ func (a *OpenAIAdapter) streamLoop(ctx context.Context, coreReq *format.CoreRequ
 						Item:           response.Output[outputIndexes[index]],
 					},
 				})
+				toolCallFinalized[index] = true
 
 				// Clean up state.
 				delete(toolCallArgs, index)
@@ -936,7 +946,7 @@ type inputItem struct {
 //     from function_call items).
 //   - Items with type "function_call_output" → tool_result user messages.
 //   - Items with type "function_call" → tool_use within assistant messages.
-func convertInput(raw json.RawMessage) ([]format.CoreMessage, []format.CoreContentBlock, error) {
+func convertInput(raw json.RawMessage, model string) ([]format.CoreMessage, []format.CoreContentBlock, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, nil, nil
 	}
@@ -1037,13 +1047,19 @@ func convertInput(raw json.RawMessage) ([]format.CoreMessage, []format.CoreConte
 
 		switch {
 		case item.Type == "function_call":
-		// NOTE: Reasoning alignment for inference models (o3/o4-mini):
-		// OpenAI requires a "reasoning" input item before each "function_call" item
-		// when using reasoning models. Currently, pendingReasoning blocks (from preceding
-		// reasoning input items) are merged into the next assistant message, but no
-		// dummy reasoning block is injected if pendingReasoning is empty.
-		// A future fix should add a dummy reasoning block here when:
-		// (a) the model is a reasoning model, and (b) pendingReasoning is empty.
+			// NOTE: Reasoning alignment for inference models (o3/o4-mini):
+			// OpenAI requires a "reasoning" input item before each "function_call" item
+			// when using reasoning models. Currently, pendingReasoning blocks (from preceding
+			// reasoning input items) are merged into the next assistant message, but no
+			// dummy reasoning block is injected if pendingReasoning is empty.
+			// A future fix should add a dummy reasoning block here when:
+			// (a) the model is a reasoning model, and (b) pendingReasoning is empty.
+			if len(pendingReasoning) == 0 && isReasoningModel(model) {
+				pendingReasoning = append(pendingReasoning, format.CoreContentBlock{
+					Type:          "reasoning",
+					ReasoningText: "",
+				})
+			}
 
 			// function_call in input → tool_use assistant block.
 			// Collect into pendingFCBlocks to batch consecutive calls into a single assistant message.
@@ -1342,6 +1358,17 @@ func cloneResponse(r *Response) Response {
 	return *r
 }
 
+func isReasoningModel(model string) bool {
+	m := strings.TrimSpace(strings.ToLower(model))
+	if m == "" {
+		return false
+	}
+	return strings.HasPrefix(m, "o1") ||
+		strings.HasPrefix(m, "o3") ||
+		strings.HasPrefix(m, "o4") ||
+		strings.Contains(m, "reasoning")
+}
+
 // toolInputString converts a json.RawMessage tool input to a string,
 // defaulting to "{}" when the input is nil or null.
 func toolInputString(input json.RawMessage) string {
@@ -1365,7 +1392,6 @@ func outputToString(raw json.RawMessage) string {
 	// Fallback: return the raw JSON as a string (array/object).
 	return string(raw)
 }
-
 
 // localShellActionFromRaw parses tool input JSON into a ToolAction for local_shell.
 func localShellActionFromRaw(raw json.RawMessage) *ToolAction {
@@ -1456,7 +1482,7 @@ func convertToolWithNamespace(tool Tool, namespace string) []format.CoreTool {
 	ext := make(map[string]any)
 
 	switch tool.Type {
-case "function":
+	case "function":
 		ct := format.CoreTool{
 			Name:        name,
 			Description: tool.Description,
