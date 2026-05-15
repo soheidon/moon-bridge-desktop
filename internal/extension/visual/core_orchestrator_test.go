@@ -17,7 +17,7 @@ type fakeCoreUpstream struct {
 }
 
 func (f *fakeCoreUpstream) CreateCore(_ context.Context, req *format.CoreRequest) (*format.CoreResponse, error) {
-	f.requests = append(f.requests, req)
+	f.requests = append(f.requests, cloneCoreRequest(req))
 	if len(f.responses) == 0 {
 		return nil, io.EOF
 	}
@@ -33,7 +33,7 @@ type fakeCoreVision struct {
 }
 
 func (f *fakeCoreVision) CreateCore(_ context.Context, req *format.CoreRequest) (*format.CoreResponse, error) {
-	f.requests = append(f.requests, req)
+	f.requests = append(f.requests, cloneCoreRequest(req))
 	return &format.CoreResponse{
 		ID:     "vision_resp",
 		Status: "completed",
@@ -56,6 +56,27 @@ type fakeCoreVisionClient struct {
 func (f *fakeCoreVisionClient) Analyze(_ context.Context, req AnalysisRequest) (string, error) {
 	f.requests = append(f.requests, req)
 	return f.text, nil
+}
+
+type mutatingCoreUpstream struct {
+	responses []*format.CoreResponse
+	requests  []*format.CoreRequest
+}
+
+func (m *mutatingCoreUpstream) CreateCore(_ context.Context, req *format.CoreRequest) (*format.CoreResponse, error) {
+	m.requests = append(m.requests, cloneCoreRequest(req))
+	if len(req.Messages) > 0 && len(req.Messages[len(req.Messages)-1].Content) > 0 {
+		req.Messages[len(req.Messages)-1].Content = append(
+			req.Messages[len(req.Messages)-1].Content,
+			format.CoreContentBlock{Type: "text", Text: "upstream-side mutation"},
+		)
+	}
+	if len(m.responses) == 0 {
+		return nil, io.EOF
+	}
+	resp := m.responses[0]
+	m.responses = m.responses[1:]
+	return resp, nil
 }
 
 // ============================================================================
@@ -763,5 +784,90 @@ func TestCoreOrchestrator_ImageStrippedAcrossMultipleTurns(t *testing.T) {
 	if placeholderCount != 2 {
 		t.Fatalf("expected 2 text placeholders in first upstream request, got %d. Content=%+v",
 			placeholderCount, firstMsg.Content)
+	}
+}
+
+func TestCoreOrchestratorIsolatesRequestsAcrossRounds(t *testing.T) {
+	upstream := &mutatingCoreUpstream{
+		responses: []*format.CoreResponse{
+			{
+				ID: "turn1", Status: "completed", StopReason: "tool_use",
+				Messages: []format.CoreMessage{{
+					Role: "assistant",
+					Content: []format.CoreContentBlock{
+						{
+							Type: "tool_use", ToolUseID: "toolu_1", ToolName: ToolVisualBrief,
+							ToolInput: json.RawMessage(`{"image_refs":["Image #1"],"context":"describe"}`),
+						},
+					},
+				}},
+			},
+			{
+				ID: "turn2", Status: "completed", StopReason: "tool_use",
+				Messages: []format.CoreMessage{{
+					Role: "assistant",
+					Content: []format.CoreContentBlock{
+						{
+							Type: "tool_use", ToolUseID: "toolu_2", ToolName: ToolVisualQA,
+							ToolInput: json.RawMessage(`{"question":"what changed?","image_refs":["Image #1"]}`),
+						},
+					},
+				}},
+			},
+			{
+				ID: "turn3", Status: "completed", StopReason: "end_turn",
+				Messages: []format.CoreMessage{{
+					Role: "assistant",
+					Content: []format.CoreContentBlock{
+						{Type: "text", Text: "final answer"},
+					},
+				}},
+			},
+		},
+	}
+	vision := &fakeCoreVisionClient{text: "visual analysis result"}
+	orchestrator := NewCoreOrchestrator(CoreOrchestratorConfig{
+		Upstream:  upstream,
+		Client:    vision,
+		MaxRounds: 5,
+	})
+
+	_, err := orchestrator.CreateCore(context.Background(), &format.CoreRequest{
+		Model: "test-model",
+		Messages: []format.CoreMessage{{
+			Role: "user",
+			Content: []format.CoreContentBlock{
+				{Type: "text", Text: "look at this"},
+				{Type: "image", ImageData: "b64_image_1", MediaType: "image/png"},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateCore() error = %v", err)
+	}
+
+	if len(upstream.requests) != 3 {
+		t.Fatalf("upstream requests = %d, want 3", len(upstream.requests))
+	}
+
+	secondReq := upstream.requests[1]
+	if len(secondReq.Messages) != 3 {
+		t.Fatalf("second upstream request messages = %d, want 3; got %+v", len(secondReq.Messages), secondReq.Messages)
+	}
+
+	assistantMsg := secondReq.Messages[1]
+	if assistantMsg.Role != "assistant" {
+		t.Fatalf("second request assistant role = %q", assistantMsg.Role)
+	}
+	if len(assistantMsg.Content) != 1 || assistantMsg.Content[0].Type != "tool_use" || assistantMsg.Content[0].ToolUseID != "toolu_1" {
+		t.Fatalf("second request assistant content = %+v", assistantMsg.Content)
+	}
+
+	toolResultMsg := secondReq.Messages[2]
+	if toolResultMsg.Role != "user" {
+		t.Fatalf("tool_result message role = %q", toolResultMsg.Role)
+	}
+	if len(toolResultMsg.Content) != 1 || toolResultMsg.Content[0].Type != "tool_result" || toolResultMsg.Content[0].ToolUseID != "toolu_1" {
+		t.Fatalf("tool_result message content = %+v", toolResultMsg.Content)
 	}
 }

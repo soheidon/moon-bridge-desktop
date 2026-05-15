@@ -56,13 +56,15 @@ func (o *CoreOrchestrator) CreateCore(ctx context.Context, req *format.CoreReque
 	if o.client == nil {
 		return nil, fmt.Errorf("visual client is nil")
 	}
+	req = cloneCoreRequest(req)
 	req, availableImages := prepareCoreRequestForVisual(req)
 	log := slog.Default()
 	aggregatedUsage := format.CoreUsage{}
 	hasAggregatedUsage := false
 
 	for round := 0; round < o.maxRounds; round++ {
-		resp, err := o.upstream.CreateCore(ctx, req)
+		roundReq := cloneCoreRequest(req)
+		resp, err := o.upstream.CreateCore(ctx, roundReq)
 		if err != nil {
 			return nil, err
 		}
@@ -268,4 +270,23 @@ func applyCoreUsageAggregation(resp *format.CoreResponse, usage format.CoreUsage
 	resp.Usage = usage
 	resp.Usage.TotalTokens = resp.Usage.InputTokens + resp.Usage.OutputTokens
 	return resp
+}
+
+func cloneCoreRequest(req *format.CoreRequest) *format.CoreRequest {
+	if req == nil {
+		return nil
+	}
+
+	data, err := json.Marshal(req)
+	if err != nil {
+		cloned := *req
+		return &cloned
+	}
+
+	var cloned format.CoreRequest
+	if err := json.Unmarshal(data, &cloned); err != nil {
+		cloned = *req
+		return &cloned
+	}
+	return &cloned
 }
