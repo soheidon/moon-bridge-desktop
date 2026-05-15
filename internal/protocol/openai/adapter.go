@@ -944,8 +944,8 @@ type inputItem struct {
 //   - Items with role "system" or "developer" → system blocks.
 //   - Items with role "assistant" → assistant messages (including tool_use blocks
 //     from function_call items).
-//   - Items with type "function_call_output" → tool_result user messages.
-//   - Items with type "function_call" → tool_use within assistant messages.
+//   - Items with tool-call output types → tool_result user messages.
+//   - Items with tool-call input types → tool_use within assistant messages.
 func convertInput(raw json.RawMessage, model string) ([]format.CoreMessage, []format.CoreContentBlock, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, nil, nil
@@ -986,7 +986,7 @@ func convertInput(raw json.RawMessage, model string) ([]format.CoreMessage, []fo
 	var pendingFCBlocks []format.CoreContentBlock // batch consecutive function_calls
 
 	for _, item := range items {
-		if item.Type == "function_call_output" {
+		if isToolCallOutputType(item.Type) {
 			// Keep any pending reasoning within the same assistant tool-call turn.
 			// Emitting a standalone assistant reasoning message here would break
 			// the required adjacency of assistant tool_use -> immediate tool_result.
@@ -1030,7 +1030,7 @@ func convertInput(raw json.RawMessage, model string) ([]format.CoreMessage, []fo
 		// Flush pending function_calls before non-function-call items.
 		// Don't flush between consecutive function_call items — they should
 		// be batched into a single assistant message.
-		if item.Type != "function_call" && item.Type != "custom_tool_call" && item.Type != "local_shell_call" && item.Type != "reasoning" && len(pendingFCBlocks) > 0 {
+		if !isToolCallInputType(item.Type) && item.Type != "reasoning" && len(pendingFCBlocks) > 0 {
 			flushed := make([]format.CoreContentBlock, len(pendingFCBlocks))
 			copy(flushed, pendingFCBlocks)
 			messages = append(messages, format.CoreMessage{
@@ -1374,6 +1374,24 @@ func mergeReasoningBeforeToolUse(blocks []format.CoreContentBlock, reasoning []f
 	merged = append(merged, reasoning...)
 	merged = append(merged, blocks[insertAt:]...)
 	return merged
+}
+
+func isToolCallInputType(itemType string) bool {
+	switch itemType {
+	case "function_call", "custom_tool_call", "local_shell_call":
+		return true
+	default:
+		return false
+	}
+}
+
+func isToolCallOutputType(itemType string) bool {
+	switch itemType {
+	case "function_call_output", "custom_tool_call_output", "local_shell_call_output":
+		return true
+	default:
+		return false
+	}
 }
 
 // cloneResponse creates a shallow copy of a Response for use in stream events.

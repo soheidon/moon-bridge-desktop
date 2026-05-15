@@ -199,6 +199,68 @@ func TestToCoreRequest_KeepsToolUseAdjacentToToolResultWhenReasoningPrecedesOutp
 	}
 }
 
+func TestToCoreRequest_BatchesCustomToolCallsAndOutputsIntoSingleRound(t *testing.T) {
+	adapter := openai.NewOpenAIAdapter(format.CorePluginHooks{})
+	req := &openai.ResponsesRequest{
+		Model: "gpt-5.4",
+		Input: json.RawMessage(`[
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"before tools"}]},
+			{"type":"custom_tool_call","call_id":"call_a","name":"apply_patch","input":"patch a","arguments":"{\"input\":\"patch a\"}"},
+			{"type":"custom_tool_call_output","call_id":"call_a","output":"ok a"},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"between tools"}]},
+			{"type":"custom_tool_call","call_id":"call_b","name":"apply_patch","input":"patch b","arguments":"{\"input\":\"patch b\"}"},
+			{"type":"custom_tool_call_output","call_id":"call_b","output":"ok b"},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"between tools 2"}]},
+			{"type":"custom_tool_call","call_id":"call_c","name":"apply_patch","input":"patch c","arguments":"{\"input\":\"patch c\"}"},
+			{"type":"custom_tool_call_output","call_id":"call_c","output":"ok c"},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"after tools"}]}
+		]`),
+	}
+
+	result, err := adapter.ToCoreRequest(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(result.Messages) != 10 {
+		t.Fatalf("messages len=%d, want 10; got %+v", len(result.Messages), result.Messages)
+	}
+
+	if result.Messages[0].Role != "assistant" || len(result.Messages[0].Content) != 1 || result.Messages[0].Content[0].Text != "before tools" {
+		t.Fatalf("messages[0]=%+v, want pre-tool assistant text", result.Messages[0])
+	}
+
+	for i, want := range []struct {
+		assistantTextIdx int
+		msgIdx           int
+		callID  string
+		outcome string
+	}{
+		{0, 1, "call_a", "ok a"},
+		{3, 4, "call_b", "ok b"},
+		{6, 7, "call_c", "ok c"},
+	} {
+		if result.Messages[want.assistantTextIdx].Role != "assistant" {
+			t.Fatalf("assistant commentary turn %d = %+v", i, result.Messages[want.assistantTextIdx])
+		}
+		assistant := result.Messages[want.msgIdx]
+		if assistant.Role != "assistant" || len(assistant.Content) != 1 || assistant.Content[0].Type != "tool_use" || assistant.Content[0].ToolUseID != want.callID {
+			t.Fatalf("assistant tool turn %d = %+v", i, assistant)
+		}
+		toolResult := result.Messages[want.msgIdx+1]
+		if toolResult.Role != "tool" || len(toolResult.Content) != 1 || toolResult.Content[0].Type != "tool_result" || toolResult.Content[0].ToolUseID != want.callID {
+			t.Fatalf("tool result turn %d = %+v", i, toolResult)
+		}
+		if got := toolResult.Content[0].ToolResultContent[0].Text; got != want.outcome {
+			t.Fatalf("tool result text turn %d = %q, want %q", i, got, want.outcome)
+		}
+	}
+
+	if result.Messages[9].Role != "assistant" || len(result.Messages[9].Content) != 1 || result.Messages[9].Content[0].Text != "after tools" {
+		t.Fatalf("messages[9]=%+v, want trailing assistant text", result.Messages[9])
+	}
+}
+
 func TestFromCoreStream_NoDuplicateDoneForToolUse(t *testing.T) {
 	adapter := openai.NewOpenAIAdapter(format.CorePluginHooks{})
 	coreReq := &format.CoreRequest{Model: "gpt-4o"}
