@@ -987,6 +987,13 @@ func convertInput(raw json.RawMessage, model string) ([]format.CoreMessage, []fo
 
 	for _, item := range items {
 		if item.Type == "function_call_output" {
+			// Keep any pending reasoning within the same assistant tool-call turn.
+			// Emitting a standalone assistant reasoning message here would break
+			// the required adjacency of assistant tool_use -> immediate tool_result.
+			if len(pendingFCBlocks) > 0 && len(pendingReasoning) > 0 {
+				pendingFCBlocks = mergeReasoningBeforeToolUse(pendingFCBlocks, pendingReasoning)
+				pendingReasoning = pendingReasoning[:0]
+			}
 			// Flush pending function_calls before tool results.
 			if len(pendingFCBlocks) > 0 {
 				flushed := make([]format.CoreContentBlock, len(pendingFCBlocks))
@@ -1023,7 +1030,7 @@ func convertInput(raw json.RawMessage, model string) ([]format.CoreMessage, []fo
 		// Flush pending function_calls before non-function-call items.
 		// Don't flush between consecutive function_call items — they should
 		// be batched into a single assistant message.
-		if item.Type != "function_call" && item.Type != "custom_tool_call" && item.Type != "local_shell_call" && len(pendingFCBlocks) > 0 {
+		if item.Type != "function_call" && item.Type != "custom_tool_call" && item.Type != "local_shell_call" && item.Type != "reasoning" && len(pendingFCBlocks) > 0 {
 			flushed := make([]format.CoreContentBlock, len(pendingFCBlocks))
 			copy(flushed, pendingFCBlocks)
 			messages = append(messages, format.CoreMessage{
@@ -1041,6 +1048,10 @@ func convertInput(raw json.RawMessage, model string) ([]format.CoreMessage, []fo
 		// Handle reasoning input items — convert to thinking blocks for the next assistant message.
 		if item.Type == "reasoning" {
 			blocks := reasoningBlocksFromSummary(item.Summary)
+			if len(pendingFCBlocks) > 0 {
+				pendingFCBlocks = mergeReasoningBeforeToolUse(pendingFCBlocks, blocks)
+				continue
+			}
 			pendingReasoning = append(pendingReasoning, blocks...)
 			continue
 		}
@@ -1348,6 +1359,21 @@ func reasoningBlocksFromSummary(raw json.RawMessage) []format.CoreContentBlock {
 		})
 	}
 	return blocks
+}
+
+func mergeReasoningBeforeToolUse(blocks []format.CoreContentBlock, reasoning []format.CoreContentBlock) []format.CoreContentBlock {
+	if len(reasoning) == 0 {
+		return blocks
+	}
+	insertAt := 0
+	for insertAt < len(blocks) && blocks[insertAt].Type == "reasoning" {
+		insertAt++
+	}
+	merged := make([]format.CoreContentBlock, 0, len(blocks)+len(reasoning))
+	merged = append(merged, blocks[:insertAt]...)
+	merged = append(merged, reasoning...)
+	merged = append(merged, blocks[insertAt:]...)
+	return merged
 }
 
 // cloneResponse creates a shallow copy of a Response for use in stream events.

@@ -157,6 +157,48 @@ func TestToCoreRequest_ReasoningModelInjectsEmptyReasoningBeforeFunctionCall(t *
 	}
 }
 
+func TestToCoreRequest_KeepsToolUseAdjacentToToolResultWhenReasoningPrecedesOutput(t *testing.T) {
+	adapter := openai.NewOpenAIAdapter(format.CorePluginHooks{})
+	req := &openai.ResponsesRequest{
+		Model: "gpt-5.4",
+		Input: json.RawMessage(`[
+			{"type":"function_call","id":"fc_1","call_id":"call_1","name":"tool_a","arguments":"{\"a\":1}"},
+			{"type":"reasoning","summary":[{"type":"text","text":"thinking after tool call"}]},
+			{"type":"function_call_output","call_id":"call_1","output":"ok"}
+		]`),
+	}
+
+	result, err := adapter.ToCoreRequest(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Messages) != 2 {
+		t.Fatalf("messages len=%d, want 2; got %+v", len(result.Messages), result.Messages)
+	}
+
+	assistant := result.Messages[0]
+	if assistant.Role != "assistant" {
+		t.Fatalf("messages[0].Role=%q, want assistant", assistant.Role)
+	}
+	if len(assistant.Content) != 2 {
+		t.Fatalf("assistant content len=%d, want 2; got %+v", len(assistant.Content), assistant.Content)
+	}
+	if assistant.Content[0].Type != "reasoning" || assistant.Content[0].ReasoningText != "thinking after tool call" {
+		t.Fatalf("assistant.Content[0]=%+v, want merged reasoning", assistant.Content[0])
+	}
+	if assistant.Content[1].Type != "tool_use" || assistant.Content[1].ToolUseID != "call_1" {
+		t.Fatalf("assistant.Content[1]=%+v, want tool_use call_1", assistant.Content[1])
+	}
+
+	toolResult := result.Messages[1]
+	if toolResult.Role != "tool" {
+		t.Fatalf("messages[1].Role=%q, want tool", toolResult.Role)
+	}
+	if len(toolResult.Content) != 1 || toolResult.Content[0].Type != "tool_result" || toolResult.Content[0].ToolUseID != "call_1" {
+		t.Fatalf("tool result message=%+v", toolResult)
+	}
+}
+
 func TestFromCoreStream_NoDuplicateDoneForToolUse(t *testing.T) {
 	adapter := openai.NewOpenAIAdapter(format.CorePluginHooks{})
 	coreReq := &format.CoreRequest{Model: "gpt-4o"}
