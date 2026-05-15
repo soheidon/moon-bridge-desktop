@@ -58,6 +58,8 @@ func RunServer(ctx context.Context, cfg config.Config, errors io.Writer) error {
 }
 
 func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) error {
+	var rt *runtime.Runtime
+
 	// Construct domain configs from global config.
 	serverCfg := config.ServerFromGlobalConfig(&cfg)
 	cacheCfg := config.CacheFromGlobalConfig(&cfg)
@@ -103,6 +105,12 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) erro
 
 	// Register plugins.
 	plugins := BuiltinExtensions().NewRegistry(slog.Default(), cfg)
+	plugins.SetCurrentConfigProvider(func() config.Config {
+		if rt != nil && rt.Current() != nil {
+			return rt.Current().Config
+		}
+		return cfg
+	})
 	if err := plugins.InitAll(&cfg); err != nil {
 		return fmt.Errorf("init plugins: %w", err)
 	}
@@ -115,9 +123,12 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) erro
 
 	// Initialize persistence layer (db.Registry).
 	dbRegistry := db.NewRegistry(slog.Default())
-	for _, p := range plugins.DBProviders() {
+	dbProviders := plugins.DBProviders()
+	providers := make([]db.Provider, 0, len(dbProviders))
+	for _, p := range dbProviders {
 		if prov := p.DBProvider(); prov != nil {
 			dbRegistry.RegisterProvider(prov)
+			providers = append(providers, prov)
 		}
 	}
 	for _, c := range plugins.DBConsumers() {
@@ -129,7 +140,8 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) erro
 	configStoreConsumer := store.NewConfigStoreConsumer(logger.L())
 	configStoreConsumer.SetExtensionSpecs(BuiltinExtensions().ConfigSpecs())
 	dbRegistry.RegisterConsumer(configStoreConsumer)
-	if err := dbRegistry.Init(ctx, cfg.Persistence.ActiveProvider); err != nil {
+	activePersistenceProvider := ResolvePersistenceActiveProvider(cfg.Persistence.ActiveProvider, providers)
+	if err := dbRegistry.Init(ctx, activePersistenceProvider); err != nil {
 		return fmt.Errorf("init persistence: %w", err)
 	}
 	defer dbRegistry.Shutdown()
@@ -181,7 +193,7 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) erro
 	}
 
 	// === Phase 3: Build Runtime ===
-	rt := runtime.NewRuntime(cfg, providerMgr, pricing)
+	rt = runtime.NewRuntime(cfg, providerMgr, pricing)
 
 	// === Phase 4: Build Server with Runtime ===
 	// Create shared cache registry (used by both Bridge and Adapter paths).

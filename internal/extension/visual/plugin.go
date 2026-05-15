@@ -24,8 +24,9 @@ type Config struct {
 // Plugin injects the Visual tools for models that opt in.
 type Plugin struct {
 	plugin.BasePlugin
-	isEnabled EnabledFunc
-	pluginCfg config.PluginConfig
+	isEnabled     EnabledFunc
+	pluginCfg     config.PluginConfig
+	currentConfig func() config.Config
 }
 
 func NewPlugin(isEnabled ...EnabledFunc) *Plugin {
@@ -42,10 +43,14 @@ func (p *Plugin) ConfigSpecs() []config.ExtensionConfigSpec { return ConfigSpecs
 
 func (p *Plugin) Init(ctx plugin.PluginContext) error {
 	p.pluginCfg = config.PluginFromGlobalConfig(&ctx.AppConfig)
+	p.currentConfig = ctx.CurrentConfig
 	return nil
 }
 
 func (p *Plugin) EnabledForModel(model string) bool {
+	if p.currentConfig != nil {
+		return p.currentConfig().ExtensionEnabled(PluginName, model)
+	}
 	if p.isEnabled != nil {
 		return p.isEnabled(model)
 	}

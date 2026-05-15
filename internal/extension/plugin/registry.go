@@ -35,6 +35,7 @@ type Registry struct {
 	routeRegistrars        []RouteRegistrar
 	configSpecs            []config.ExtensionConfigSpec
 	logger                 *slog.Logger
+	currentConfig          func() config.Config
 }
 
 // NewRegistry creates an empty plugin registry.
@@ -43,6 +44,15 @@ func NewRegistry(logger *slog.Logger) *Registry {
 		logger = slog.Default()
 	}
 	return &Registry{logger: logger}
+}
+
+// SetCurrentConfigProvider installs a callback used by plugins that need the
+// latest resolved configuration at request time.
+func (r *Registry) SetCurrentConfigProvider(provider func() config.Config) {
+	if r == nil {
+		return
+	}
+	r.currentConfig = provider
 }
 
 // Register adds a plugin and detects its capabilities.
@@ -136,9 +146,10 @@ func (r *Registry) InitAll(appCfg InitConfigProvider) error {
 			}
 		}
 		ctx := PluginContext{
-			Config:    typedCfg,
-			AppConfig: appConfig,
-			Logger:    r.logger.With("plugin", p.Name()),
+			Config:        typedCfg,
+			AppConfig:     appConfig,
+			CurrentConfig: r.currentConfig,
+			Logger:        r.logger.With("plugin", p.Name()),
 		}
 		if err := p.Init(ctx); err != nil {
 			return fmt.Errorf("plugin %s init failed: %w", p.Name(), err)
