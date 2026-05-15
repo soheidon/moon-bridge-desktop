@@ -347,9 +347,9 @@ func (a *AnthropicProviderAdapter) FromCoreRequest(ctx context.Context, req *for
 // The response content blocks become a single assistant message. Cache registry
 // is updated from usage signals via CacheManager.
 func (a *AnthropicProviderAdapter) ToCoreResponse(ctx context.Context, resp any) (*format.CoreResponse, error) {
-	msgResp, ok := resp.(*MessageResponse)
-	if !ok {
-		return nil, fmt.Errorf("anthropic adapter: expected *MessageResponse, got %T", resp)
+	msgResp, err := normalizeAnthropicMessageResponse(resp)
+	if err != nil {
+		return nil, fmt.Errorf("anthropic adapter: %w", err)
 	}
 	ctx = coreHookContext(ctx, msgResp.Model)
 
@@ -391,6 +391,21 @@ func (a *AnthropicProviderAdapter) ToCoreResponse(ctx context.Context, resp any)
 	}
 
 	return coreResp, nil
+}
+
+func normalizeAnthropicMessageResponse(resp any) (*MessageResponse, error) {
+	switch v := resp.(type) {
+	case MessageResponse:
+		msgResp := v
+		return &msgResp, nil
+	case *MessageResponse:
+		if v == nil {
+			return nil, fmt.Errorf("expected anthropic.MessageResponse, got nil *anthropic.MessageResponse")
+		}
+		return v, nil
+	default:
+		return nil, fmt.Errorf("expected anthropic.MessageResponse, got %T", resp)
+	}
 }
 
 // =========================================================================
