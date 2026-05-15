@@ -697,7 +697,20 @@ func (s *Server) handleAdapterStream(
 
 	if candidate.Protocol == config.ProtocolAnthropic && coreRequestHasImage(coreReq) {
 		if providerAdapter := s.adapterRegistryProvider(config.ProtocolAnthropic); providerAdapter != nil {
-			if visProv := s.wrapWithVisual(ctx, openAIReq.Model, candidate, providerAdapter, sess); visProv != nil {
+			finalizeAnthropicUpstream := func(_ context.Context, upstream any) (any, error) {
+				msgReq, err := normalizeAnthropicRequest(upstream)
+				if err != nil {
+					return nil, err
+				}
+				if wsMode == "enabled" {
+					injectAnthropicWebSearch(&msgReq)
+				}
+				if s.pluginRegistry != nil && sess != nil {
+					prependCachedThinking(&msgReq, sess)
+				}
+				return &msgReq, nil
+			}
+			if visProv := s.wrapWithVisual(ctx, openAIReq.Model, candidate, providerAdapter, finalizeAnthropicUpstream); visProv != nil {
 				coreResp, err := visProv.CreateCore(ctx, coreReq)
 				if err != nil {
 					log.Error("adapter stream visual fallback: CreateCore failed", "error", err)
@@ -1617,8 +1630,8 @@ func coreBlockHasImage(block format.CoreContentBlock) bool {
 // CoreProvider so the visual orchestrator can operate on format.CoreRequest
 // without knowing the underlying protocol.
 type adapterCoreProvider struct {
-	adapter format.ProviderAdapter
-	client  provider.ProviderClient
+	adapter  format.ProviderAdapter
+	client   provider.ProviderClient
 	finalize func(ctx context.Context, upstream any) (any, error)
 }
 
