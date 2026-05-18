@@ -24,7 +24,7 @@
 
 **食材：**
 
-- **Go 1.25+** — `go version` 确认。没有的话去 [go.dev](https://go.dev/dl/) 下载。
+- **Go 1.25+** — `go version` 确认。没有的话去 [go.dev](https://go.dev/dl/) 下载，或者通过[scoop](https://scoop.sh/)直接安装（scoop install go命令即可完成无需配置go的环境变量）。
 - **API Key** — 推荐 DeepSeek，在 [platform.deepseek.com](https://platform.deepseek.com) 注册后创建 API Key。
 - **一个终端**
 
@@ -32,7 +32,8 @@
 
 ```powershell
 go version
-# go version go1.25.0 windows/amd64
+
+go version go1.25.5 windows/amd64
 ```
 
 **搞不定：**
@@ -145,14 +146,17 @@ Invoke-RestMethod -Uri http://localhost:38440/v1/models | Select-Object -First 3
 
 然后用一条命令生成 `config.toml` 和 `models_catalog.json`：
 
+逐条输入下列命令，请勿一起输入，可能会导致生成的toml格式出现错误导致这种报错（Error loading config.toml: ~\codex\config.toml:1:21: unexpected key or value, expected newline, `#`）
 ```powershell
 $CODEX_HOME_DIR = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { "$HOME\.codex" }
-$MODEL = go run ./cmd/moonbridge -print-codex-model
-go run ./cmd/moonbridge `
-  -print-codex-config "$MODEL" `
-  -codex-base-url "http://127.0.0.1:38440/v1" `
-  -codex-home "$CODEX_HOME_DIR" `
-  | Set-Content -Path "$CODEX_HOME_DIR\config.toml" -NoNewline
+
+
+```powershell
+$MODEL = go run ./cmd/moonbridge -print-codex-model -config "./config.yml"
+```
+
+```powershell
+go run ./cmd/moonbridge -print-codex-config "$MODEL" -codex-base-url "http://127.0.0.1:38440/v1" -codex-home "$CODEX_HOME_DIR" -config "./config.yml" Set-Content -Path "$CODEX_HOME_DIR\config.toml" -NoNewline
 ```
 
 这会在 `$CODEX_HOME_DIR` 下写入两个文件：
