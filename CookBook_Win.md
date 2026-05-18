@@ -24,9 +24,9 @@
 
 **食材：**
 
-- **Go 1.25+** — `go version` 确认。没有的话去 [go.dev](https://go.dev/dl/) 下载，或者通过[scoop](https://scoop.sh/)直接安装（scoop install go命令即可完成无需配置go的环境变量）。
+- **Go 1.25+** — `go version` 确认。没有的话去 [go.dev](https://go.dev/dl/) 下载，或者通过[scoop](https://scoop.sh/)安装（scoop install go命令即可完成安装，无需配置go的环境变量）。
 - **API Key** — 推荐 DeepSeek，在 [platform.deepseek.com](https://platform.deepseek.com) 注册后创建 API Key。
-- **一个终端**
+- **一个终端（建议使用[Powershell7](https://github.com/powershell/powershell/releases)）**
 
 **验证：**
 
@@ -149,7 +149,7 @@ Invoke-RestMethod -Uri http://localhost:38440/v1/models | Select-Object -First 3
 逐条输入下列命令，请勿一起输入，可能会导致生成的toml格式出现错误导致这种报错（Error loading config.toml: ~\codex\config.toml:1:21: unexpected key or value, expected newline, `#`）
 ```powershell
 $CODEX_HOME_DIR = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { "$HOME\.codex" }
-
+```
 
 ```powershell
 $MODEL = go run ./cmd/moonbridge -print-codex-model -config "./config.yml"
