@@ -588,6 +588,8 @@ func (s *Server) handleWithAdapters(
 		return
 	}
 
+	rememberAdapterResponseContent(s.pluginRegistry, sess, openAIReq.Model, coreResp)
+
 	// ------------------------------------------------------------------
 	// 8. Write the response.
 	// ------------------------------------------------------------------
@@ -660,6 +662,131 @@ func (s *Server) handleWithAdapters(
 			})
 		}
 	}
+}
+
+func rememberAdapterResponseContent(registry *plugin.Registry, sess *session.Session, model string, coreResp *format.CoreResponse) {
+	if registry == nil || sess == nil || coreResp == nil {
+		return
+	}
+	reqCtx := &plugin.RequestContext{
+		ModelAlias:  model,
+		SessionData: sess.ExtensionData,
+	}
+	for _, msg := range coreResp.Messages {
+		if msg.Role != "assistant" || len(msg.Content) == 0 {
+			continue
+		}
+		registry.RememberContent(reqCtx, msg.Content)
+	}
+}
+
+func rememberStreamResponseContent(registry *plugin.Registry, sess *session.Session, model string, resp *openai.Response) bool {
+	if registry == nil || sess == nil || resp == nil {
+		return false
+	}
+	reqCtx := &plugin.RequestContext{
+		ModelAlias:  model,
+		SessionData: sess.ExtensionData,
+	}
+	var pending []format.CoreContentBlock
+	remembered := false
+	flush := func() {
+		if len(pending) == 0 {
+			return
+		}
+		registry.RememberContent(reqCtx, pending)
+		pending = nil
+		remembered = true
+	}
+
+	for _, item := range resp.Output {
+		blocks := streamOutputItemToCoreBlocks(item)
+		if len(blocks) == 0 {
+			continue
+		}
+		if item.Type == "reasoning" && len(pending) > 0 {
+			flush()
+		}
+		pending = append(pending, blocks...)
+	}
+	flush()
+	return remembered
+}
+
+func streamOutputItemToCoreBlocks(item openai.OutputItem) []format.CoreContentBlock {
+	switch item.Type {
+	case "reasoning":
+		return reasoningBlocksFromStreamOutput(item.Summary)
+	case "function_call", "custom_tool_call", "local_shell_call":
+		toolUseID := firstNonEmptyString(item.CallID, item.ID)
+		if toolUseID == "" {
+			return nil
+		}
+		return []format.CoreContentBlock{{
+			Type:      "tool_use",
+			ToolUseID: toolUseID,
+			ToolName:  item.Name,
+			ToolInput: streamOutputToolInput(item),
+		}}
+	case "message":
+		blocks := make([]format.CoreContentBlock, 0, len(item.Content))
+		for _, part := range item.Content {
+			if (part.Type == "text" || part.Type == "output_text") && part.Text != "" {
+				blocks = append(blocks, format.CoreContentBlock{
+					Type: "text",
+					Text: part.Text,
+				})
+			}
+		}
+		return blocks
+	default:
+		return nil
+	}
+}
+
+func reasoningBlocksFromStreamOutput(summary []openai.ReasoningItemSummary) []format.CoreContentBlock {
+	blocks := make([]format.CoreContentBlock, 0, len(summary))
+	for _, item := range summary {
+		if item.Text == "" && item.Signature == "" {
+			continue
+		}
+		if block, ok := deepseekv4.DecodeThinkingSummary(item.Text); ok {
+			if block.ReasoningSignature == "" && item.Signature != "" {
+				block.ReasoningSignature = item.Signature
+			}
+			blocks = append(blocks, block)
+			continue
+		}
+		blocks = append(blocks, format.CoreContentBlock{
+			Type:               "reasoning",
+			ReasoningText:      item.Text,
+			ReasoningSignature: item.Signature,
+		})
+	}
+	return blocks
+}
+
+func streamOutputToolInput(item openai.OutputItem) json.RawMessage {
+	if item.Arguments != "" && json.Valid([]byte(item.Arguments)) {
+		return json.RawMessage(item.Arguments)
+	}
+	if item.Input == "" {
+		return nil
+	}
+	payload, err := json.Marshal(map[string]string{"input": item.Input})
+	if err != nil {
+		return nil
+	}
+	return payload
+}
+
+func firstNonEmptyString(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // handleAdapterStream handles the streaming path through adapter dispatch.
@@ -1250,36 +1377,39 @@ func (s *Server) handleAdapterStream(
 	// Remember reasoning content for DeepSeek thinking replay via StreamInterceptor.
 	// This must not depend on trace being enabled.
 	if s.pluginRegistry != nil && sess != nil {
-		if anthProvider, ok := s.adapterRegistry.GetProvider(config.ProtocolAnthropic); ok {
-			if anthAdapter, ok := anthProvider.(*anthropic.AnthropicProviderAdapter); ok {
-				events := anthAdapter.StreamBuffer()
-				if len(events) > 0 {
-					states := s.pluginRegistry.NewStreamStates(openAIReq.Model)
-					for _, ev := range events {
-						pluginType := ""
-						switch {
-						case ev.Type == "content_block_start":
-							pluginType = "block_start"
-						case ev.Type == "content_block_delta":
-							pluginType = "block_delta"
-						case ev.Type == "content_block_stop":
-							pluginType = "block_stop"
+		remembered := rememberStreamResponseContent(s.pluginRegistry, sess, openAIReq.Model, finalResp)
+		if !remembered {
+			if anthProvider, ok := s.adapterRegistry.GetProvider(config.ProtocolAnthropic); ok {
+				if anthAdapter, ok := anthProvider.(*anthropic.AnthropicProviderAdapter); ok {
+					events := anthAdapter.StreamBuffer()
+					if len(events) > 0 {
+						states := s.pluginRegistry.NewStreamStates(openAIReq.Model)
+						for _, ev := range events {
+							pluginType := ""
+							switch {
+							case ev.Type == "content_block_start":
+								pluginType = "block_start"
+							case ev.Type == "content_block_delta":
+								pluginType = "block_delta"
+							case ev.Type == "content_block_stop":
+								pluginType = "block_stop"
+							}
+							if pluginType == "" {
+								continue
+							}
+							s.pluginRegistry.OnStreamEvent(openAIReq.Model, plugin.StreamEvent{
+								Type:  pluginType,
+								Index: ev.Index,
+								Block: anthropicContentBlockPtrToFormat(ev.ContentBlock),
+								Delta: ev.Delta,
+							}, states)
 						}
-						if pluginType == "" {
-							continue
+						outputText := ""
+						if finalResp != nil {
+							outputText = finalResp.OutputText
 						}
-						s.pluginRegistry.OnStreamEvent(openAIReq.Model, plugin.StreamEvent{
-							Type:  pluginType,
-							Index: ev.Index,
-							Block: anthropicContentBlockPtrToFormat(ev.ContentBlock),
-							Delta: ev.Delta,
-						}, states)
+						s.pluginRegistry.OnStreamComplete(openAIReq.Model, states, outputText, sess.ExtensionData)
 					}
-					outputText := ""
-					if finalResp != nil {
-						outputText = finalResp.OutputText
-					}
-					s.pluginRegistry.OnStreamComplete(openAIReq.Model, states, outputText, sess.ExtensionData)
 				}
 			}
 		}

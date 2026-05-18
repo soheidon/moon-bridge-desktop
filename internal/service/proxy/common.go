@@ -75,12 +75,24 @@ func writeTrace(tracer *mbtrace.Tracer, traceErrors io.Writer, record mbtrace.Re
 
 func copyHeaders(dst http.Header, src http.Header) {
 	for key, values := range src {
-		if isHopByHopHeader(key) || strings.EqualFold(key, "host") || strings.EqualFold(key, "accept-encoding") {
+		if isHopByHopHeader(key) || isUpstreamManagedHeader(key) ||
+			strings.EqualFold(key, "host") || strings.EqualFold(key, "accept-encoding") {
 			continue
 		}
 		for _, value := range values {
 			dst.Add(key, value)
 		}
+	}
+}
+
+func isUpstreamManagedHeader(key string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(key))
+	normalized = strings.ReplaceAll(normalized, "_", "-")
+	switch normalized {
+	case "authorization", "proxy-authorization", "x-api-key", "api-key", "apikey", "anthropic-api-key", "openai-api-key":
+		return true
+	default:
+		return false
 	}
 }
 

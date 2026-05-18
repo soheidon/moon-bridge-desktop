@@ -5,8 +5,10 @@ import (
 	"testing"
 
 	deepseekv4 "moonbridge/internal/extension/deepseek_v4"
+	"moonbridge/internal/extension/plugin"
 	"moonbridge/internal/format"
 	"moonbridge/internal/protocol/anthropic"
+	openai "moonbridge/internal/protocol/openai"
 	"moonbridge/internal/service/provider"
 	"moonbridge/internal/service/stats"
 	"moonbridge/internal/session"
@@ -152,5 +154,199 @@ func TestPrependCachedThinkingChecksAllToolUseBlocks(t *testing.T) {
 	head := req.Messages[0].Content[0]
 	if head.Type != "thinking" || head.Thinking != "replayed" || head.Signature != "sig-hit" {
 		t.Fatalf("cached thinking block mismatch, got %+v", head)
+	}
+}
+
+func TestRememberAdapterResponseContentCachesDeepSeekThinkingForLaterReplay(t *testing.T) {
+	registry := plugin.NewRegistry(nil)
+	dsPlugin := deepseekv4.NewPlugin(func(string) bool { return true })
+	registry.Register(dsPlugin)
+	if err := registry.InitAll(nil); err != nil {
+		t.Fatalf("InitAll() error = %v", err)
+	}
+
+	sess := session.New()
+	sess.InitExtensions(registry.NewSessionData())
+
+	resp := &format.CoreResponse{
+		Messages: []format.CoreMessage{{
+			Role: "assistant",
+			Content: []format.CoreContentBlock{
+				{
+					Type:               "reasoning",
+					ReasoningText:      "trace reasoning",
+					ReasoningSignature: "sig-trace",
+				},
+				{
+					Type:      "tool_use",
+					ToolUseID: "call-trace",
+					ToolName:  "exec_command",
+					ToolInput: json.RawMessage(`{"cmd":"pwd"}`),
+				},
+				{
+					Type: "text",
+					Text: "assistant tool turn",
+				},
+			},
+		}},
+	}
+
+	rememberAdapterResponseContent(registry, sess, "deepseek-v4-flash", resp)
+
+	req := &anthropic.MessageRequest{
+		Messages: []anthropic.Message{{
+			Role: "assistant",
+			Content: []anthropic.ContentBlock{
+				{Type: "tool_use", ID: "call-trace", Name: "exec_command", Input: json.RawMessage(`{"cmd":"pwd"}`)},
+			},
+		}},
+	}
+
+	prependCachedThinking(req, sess)
+
+	if len(req.Messages[0].Content) < 2 {
+		t.Fatalf("assistant message should prepend cached thinking, got %+v", req.Messages[0].Content)
+	}
+	head := req.Messages[0].Content[0]
+	if head.Type != "thinking" || head.Thinking != "trace reasoning" || head.Signature != "sig-trace" {
+		t.Fatalf("prepended thinking block mismatch, got %+v", head)
+	}
+}
+
+func TestStreamReplayCachesDeepSeekThinkingForLaterReplay(t *testing.T) {
+	registry := plugin.NewRegistry(nil)
+	dsPlugin := deepseekv4.NewPlugin(func(string) bool { return true })
+	registry.Register(dsPlugin)
+	if err := registry.InitAll(nil); err != nil {
+		t.Fatalf("InitAll() error = %v", err)
+	}
+
+	sess := session.New()
+	sess.InitExtensions(registry.NewSessionData())
+
+	states := registry.NewStreamStates("deepseek-v4-flash")
+	if states == nil {
+		t.Fatal("NewStreamStates() returned nil")
+	}
+
+	streamEvents := []plugin.StreamEvent{
+		{
+			Type:  "block_start",
+			Index: 0,
+			Block: &format.CoreContentBlock{
+				Type:               "reasoning",
+				ReasoningText:      "",
+				ReasoningSignature: "",
+			},
+		},
+		{
+			Type:  "block_delta",
+			Index: 0,
+			Delta: anthropic.StreamDelta{
+				Type:     "thinking_delta",
+				Thinking: "stream reasoning",
+			},
+		},
+		{
+			Type:  "block_delta",
+			Index: 0,
+			Delta: anthropic.StreamDelta{
+				Type:      "signature_delta",
+				Signature: "sig-stream",
+			},
+		},
+		{
+			Type:  "block_stop",
+			Index: 0,
+		},
+		{
+			Type:  "block_start",
+			Index: 1,
+			Block: &format.CoreContentBlock{
+				Type:      "tool_use",
+				ToolUseID: "call-stream",
+				ToolName:  "exec_command",
+			},
+		},
+	}
+
+	for _, ev := range streamEvents {
+		registry.OnStreamEvent("deepseek-v4-flash", ev, states)
+	}
+	registry.OnStreamComplete("deepseek-v4-flash", states, "", sess.ExtensionData)
+
+	req := &anthropic.MessageRequest{
+		Messages: []anthropic.Message{{
+			Role: "assistant",
+			Content: []anthropic.ContentBlock{
+				{Type: "tool_use", ID: "call-stream", Name: "exec_command", Input: json.RawMessage(`{"cmd":"pwd"}`)},
+			},
+		}},
+	}
+
+	prependCachedThinking(req, sess)
+
+	if len(req.Messages[0].Content) < 2 {
+		t.Fatalf("assistant message should prepend cached thinking, got %+v", req.Messages[0].Content)
+	}
+	head := req.Messages[0].Content[0]
+	if head.Type != "thinking" || head.Thinking != "stream reasoning" || head.Signature != "sig-stream" {
+		t.Fatalf("prepended stream thinking block mismatch, got %+v", head)
+	}
+}
+
+func TestRememberStreamResponseContentCachesDeepSeekThinkingForLaterReplay(t *testing.T) {
+	registry := plugin.NewRegistry(nil)
+	dsPlugin := deepseekv4.NewPlugin(func(string) bool { return true })
+	registry.Register(dsPlugin)
+	if err := registry.InitAll(nil); err != nil {
+		t.Fatalf("InitAll() error = %v", err)
+	}
+
+	sess := session.New()
+	sess.InitExtensions(registry.NewSessionData())
+
+	streamResp := &openai.Response{
+		Output: []openai.OutputItem{
+			{
+				Type:   "reasoning",
+				Status: "completed",
+				Summary: []openai.ReasoningItemSummary{{
+					Type:      "text",
+					Text:      "trace stream reasoning",
+					Signature: "sig-trace-stream",
+				}},
+			},
+			{
+				Type:      "function_call",
+				CallID:    "call-stream-trace",
+				Name:      "exec_command",
+				Arguments: `{"cmd":"pwd"}`,
+				Status:    "completed",
+			},
+		},
+	}
+
+	if !rememberStreamResponseContent(registry, sess, "deepseek-v4-flash", streamResp) {
+		t.Fatal("rememberStreamResponseContent() = false, want true")
+	}
+
+	req := &anthropic.MessageRequest{
+		Messages: []anthropic.Message{{
+			Role: "assistant",
+			Content: []anthropic.ContentBlock{
+				{Type: "tool_use", ID: "call-stream-trace", Name: "exec_command", Input: json.RawMessage(`{"cmd":"pwd"}`)},
+			},
+		}},
+	}
+
+	prependCachedThinking(req, sess)
+
+	if len(req.Messages[0].Content) < 2 {
+		t.Fatalf("assistant message should prepend cached thinking, got %+v", req.Messages[0].Content)
+	}
+	head := req.Messages[0].Content[0]
+	if head.Type != "thinking" || head.Thinking != "trace stream reasoning" || head.Signature != "sig-trace-stream" {
+		t.Fatalf("prepended stream-response thinking block mismatch, got %+v", head)
 	}
 }
