@@ -370,6 +370,47 @@ func (s *Server) handleWithAdapters(
 		}
 
 		record.ChatRequest = chatReq
+
+		// finalizeChatUpstream applies per-round mutations (cached reasoning
+		// replay) on every orchestrator round. prependCachedReasoningForChat
+		// is idempotent so duplicate application against the initial chatReq
+		// above is safe.
+		finalizeChatUpstream := func(_ context.Context, upstream any) (any, error) {
+			req, ok := upstream.(*chat.ChatRequest)
+			if !ok {
+				return nil, fmt.Errorf("finalizeChatUpstream: expected *chat.ChatRequest, got %T", upstream)
+			}
+			if s.pluginRegistry != nil && sess != nil {
+				prependCachedReasoningForChat(req, sess)
+			}
+			return req, nil
+		}
+
+		// Wrap with visual orchestrator at Core level if enabled for this model.
+		// preferred.Client carries an anthropic-shaped adapter; substitute the
+		// real chat client so the orchestrator's per-round upstream calls hit
+		// the chat-protocol endpoint instead.
+		visualCandidate := preferred
+		visualCandidate.Client = &chatProviderClient{c: chatClient}
+		if visProv := s.wrapWithVisual(ctx, openAIReq.Model, visualCandidate, providerAdapter, finalizeChatUpstream); visProv != nil {
+			coreResp, err = visProv.CreateCore(ctx, coreReq)
+			if err != nil {
+				log.Error("adapter path: chat visual CreateCore failed", "error", err)
+				payload := openai.ErrorResponse{
+					Error: openai.ErrorObject{
+						Message: fmt.Sprintf("visual orchestration failed: %v", err),
+						Type:    "server_error",
+						Code:    "provider_error",
+					},
+				}
+				record.Error = traceError("chat_visual_core", err)
+				record.OpenAIResponse = payload
+				writeOpenAIError(w, http.StatusBadGateway, payload)
+				return
+			}
+			break
+		}
+
 		var chatResp *chat.ChatResponse
 		if wsInjected {
 			chatResp, err = s.executeChatSearchLoop(ctx, chatClient, chatReq, searchCfg.tavilyKey, searchCfg.firecrawlKey, searchCfg.maxRounds)
@@ -1028,6 +1069,20 @@ func (s *Server) handleAdapterStream(
 			streamRecord.OpenAIResponse = payload
 			writeOpenAIError(w, http.StatusInternalServerError, payload)
 			return
+		}
+
+		// Strip image blocks from chat request when the visual extension is
+		// enabled for this model. The visual orchestrator does not run on the
+		// streaming path; without stripping, raw base64 image data would be
+		// forwarded to a text-only upstream that cannot consume it and would
+		// burn input tokens. Mirrors the anthropic streaming behavior above.
+		if s.pluginRegistry != nil && s.runtime != nil && openAIReq.Model != "" {
+			cfgV := s.runtime.Current().Config
+			visCfg, visOk := visualpkg.ConfigForModelFromResolvedConfig(cfgV, openAIReq.Model)
+			if visOk && visCfg.Provider != "" && visCfg.Model != "" {
+				strippedReq, _ := visualpkg.StripImagesFromChat(*chatReq)
+				chatReq = &strippedReq
+			}
 		}
 
 		// Prepend cached reasoning for DeepSeek thinking chain replay.
@@ -2002,11 +2057,6 @@ func (s *Server) wrapWithVisual(
 	upstreamCP := newFinalizingAdapterCoreProvider(providerAdapter, effectiveClient, finalizeUpstream)
 
 	// Visual provider CoreProvider.
-	visClient, err := pm.ClientForKey(visCfg.Provider)
-	if err != nil || visClient == nil {
-		slog.Default().Warn("visual: provider not found", "visual_provider", visCfg.Provider, "model", modelAlias)
-		return nil
-	}
 	visProtocol := pm.ProtocolForKey(visCfg.Provider)
 	if visProtocol == "" {
 		slog.Default().Warn("visual: cannot resolve visual provider protocol")
@@ -2017,9 +2067,66 @@ func (s *Server) wrapWithVisual(
 		slog.Default().Warn("visual: no provider adapter for visual protocol", "protocol", visProtocol)
 		return nil
 	}
+	// Resolve a protocol-appropriate ProviderClient for the visual provider.
+	// pm.ClientForKey always returns an anthropic-shaped adapter; for
+	// chat-protocol visual providers, wrap the dedicated chat client so the
+	// visual call uses the chat protocol end-to-end.
+	var visClient provider.ProviderClient
+	switch visProtocol {
+	case config.ProtocolOpenAIChat:
+		chatClient, ok := s.chatClients[visCfg.Provider].(*chat.Client)
+		if !ok || chatClient == nil {
+			slog.Default().Warn("visual: no chat client for visual provider", "visual_provider", visCfg.Provider, "model", modelAlias)
+			return nil
+		}
+		visClient = &chatProviderClient{c: chatClient}
+	default:
+		c, err := pm.ClientForKey(visCfg.Provider)
+		if err != nil || c == nil {
+			slog.Default().Warn("visual: provider not found", "visual_provider", visCfg.Provider, "model", modelAlias)
+			return nil
+		}
+		visClient = c
+	}
 	visCP := newAdapterCoreProvider(visAdapter, visClient)
 
 	return visualpkg.NewCoreBridge(upstreamCP, visCP, visCfg.Model, visCfg.MaxRounds, visCfg.MaxTokens)
+}
+
+// chatProviderClient adapts *chat.Client to provider.ProviderClient so the
+// adapter-based CoreProvider machinery (used by the visual orchestrator) can
+// drive a chat-protocol upstream uniformly across protocols.
+//
+// pm.ClientForKey only constructs anthropic-shaped clients; chat-protocol
+// providers keep their dedicated *chat.Client in s.chatClients. This adapter
+// bridges the two when visual orchestration needs to call into a chat upstream.
+type chatProviderClient struct{ c *chat.Client }
+
+func (p *chatProviderClient) CreateMessage(ctx context.Context, req any) (any, error) {
+	chatReq, ok := req.(*chat.ChatRequest)
+	if !ok {
+		return nil, fmt.Errorf("chatProviderClient: expected *chat.ChatRequest, got %T", req)
+	}
+	return p.c.CreateChat(ctx, chatReq)
+}
+
+func (p *chatProviderClient) StreamMessage(ctx context.Context, req any) (<-chan any, error) {
+	chatReq, ok := req.(*chat.ChatRequest)
+	if !ok {
+		return nil, fmt.Errorf("chatProviderClient: expected *chat.ChatRequest, got %T", req)
+	}
+	stream, err := p.c.StreamChat(ctx, chatReq)
+	if err != nil {
+		return nil, err
+	}
+	out := make(chan any)
+	go func() {
+		defer close(out)
+		for chunk := range stream {
+			out <- chunk
+		}
+	}()
+	return out, nil
 }
 
 func normalizeAnthropicRequest(upstream any) (anthropic.MessageRequest, error) {
@@ -2035,6 +2142,7 @@ func normalizeAnthropicRequest(upstream any) (anthropic.MessageRequest, error) {
 		return anthropic.MessageRequest{}, fmt.Errorf("expected anthropic.MessageRequest, got %T", upstream)
 	}
 }
+
 
 // injectCoreWebSearch replaces web_search tools in coreReq.Tools with injected
 // tavily_search/firecrawl_fetch tools when the resolved web search mode is "injected".

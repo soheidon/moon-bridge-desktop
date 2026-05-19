@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 
 	"moonbridge/internal/format"
@@ -654,9 +655,22 @@ func (a *ChatProviderAdapter) toChatContent(blocks []format.CoreContentBlock) an
 		case "text", "input_text", "output_text":
 			parts = append(parts, ContentPart{Type: "text", Text: b.Text})
 		case "image":
+			// CoreContentBlock.ImageData may be either a full URL/data URL or
+			// raw base64 (with MediaType set separately, e.g. after the visual
+			// extension's CoreSource splits an incoming data URL). Reconstruct
+			// a "data:<mime>;base64,<data>" URL when needed so chat upstreams
+			// receive a well-formed image_url reference.
+			imgURL := b.ImageData
+			if !strings.HasPrefix(imgURL, "http://") && !strings.HasPrefix(imgURL, "https://") && !strings.HasPrefix(imgURL, "data:") {
+				mediaType := b.MediaType
+				if mediaType == "" {
+					mediaType = "image/png"
+				}
+				imgURL = "data:" + mediaType + ";base64," + imgURL
+			}
 			parts = append(parts, ContentPart{
 				Type:     "image_url",
-				ImageURL: &ImageURL{URL: b.ImageData, Detail: "auto"},
+				ImageURL: &ImageURL{URL: imgURL, Detail: "auto"},
 			})
 		case "tool_result":
 			var resultText string
