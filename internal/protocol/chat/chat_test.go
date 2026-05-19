@@ -995,6 +995,85 @@ func TestFromCoreRequest_MultiTurn(t *testing.T) {
 	}
 }
 
+// TestFromCoreRequest_ImageContent_DataURLReconstructed proves the chat
+// adapter rebuilds a "data:<mime>;base64,<data>" URL from a CoreContentBlock
+// whose ImageData is raw base64 with a separate MediaType field. Without the
+// reconstruction the chat upstream receives a bare base64 string in
+// image_url.url which DashScope (and other OpenAI-compatible providers)
+// reject as malformed.
+func TestFromCoreRequest_ImageContent_DataURLReconstructed(t *testing.T) {
+	adapter := newTestAdapter()
+	result, err := adapter.FromCoreRequest(context.Background(), &format.CoreRequest{
+		Model: "qwen-vl-plus",
+		Messages: []format.CoreMessage{{
+			Role: "user",
+			Content: []format.CoreContentBlock{
+				{Type: "text", Text: "describe"},
+				{Type: "image", ImageData: "abc123base64==", MediaType: "image/png"},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chatReq := result.(*chat.ChatRequest)
+	parts, ok := chatReq.Messages[0].Content.([]chat.ContentPart)
+	if !ok {
+		t.Fatalf("Content = %T, want []ContentPart", chatReq.Messages[0].Content)
+	}
+	if len(parts) != 2 {
+		t.Fatalf("parts = %d, want 2", len(parts))
+	}
+	if parts[1].Type != "image_url" || parts[1].ImageURL == nil {
+		t.Fatalf("part[1] = %+v, want image_url with ImageURL set", parts[1])
+	}
+	if got, want := parts[1].ImageURL.URL, "data:image/png;base64,abc123base64=="; got != want {
+		t.Errorf("ImageURL.URL = %q, want %q", got, want)
+	}
+}
+
+func TestFromCoreRequest_ImageContent_FullDataURLPreserved(t *testing.T) {
+	adapter := newTestAdapter()
+	original := "data:image/jpeg;base64,xyz"
+	result, err := adapter.FromCoreRequest(context.Background(), &format.CoreRequest{
+		Model: "qwen-vl-plus",
+		Messages: []format.CoreMessage{{
+			Role: "user",
+			Content: []format.CoreContentBlock{
+				{Type: "image", ImageData: original, MediaType: "image/png"},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := result.(*chat.ChatRequest).Messages[0].Content.([]chat.ContentPart)
+	if got := parts[0].ImageURL.URL; got != original {
+		t.Errorf("ImageURL.URL = %q, want %q (existing data URL must pass through unchanged)", got, original)
+	}
+}
+
+func TestFromCoreRequest_ImageContent_HTTPURLPreserved(t *testing.T) {
+	adapter := newTestAdapter()
+	original := "https://example.com/cat.png"
+	result, err := adapter.FromCoreRequest(context.Background(), &format.CoreRequest{
+		Model: "qwen-vl-plus",
+		Messages: []format.CoreMessage{{
+			Role: "user",
+			Content: []format.CoreContentBlock{
+				{Type: "image", ImageData: original},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := result.(*chat.ChatRequest).Messages[0].Content.([]chat.ContentPart)
+	if got := parts[0].ImageURL.URL; got != original {
+		t.Errorf("ImageURL.URL = %q, want %q (http(s) URL must pass through unchanged)", got, original)
+	}
+}
+
 func TestFromCoreRequest_SystemInstruction(t *testing.T) {
 	adapter := newTestAdapter()
 	result, err := adapter.FromCoreRequest(context.Background(), &format.CoreRequest{
