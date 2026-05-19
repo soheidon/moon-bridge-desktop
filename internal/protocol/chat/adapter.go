@@ -138,7 +138,28 @@ func (a *ChatProviderAdapter) FromCoreRequest(ctx context.Context, req *format.C
 		}
 	}
 
+	// reasoning_effort: surfaced from the OpenAI Responses input via
+	// Extensions["openai"]["reasoning"]["effort"] (see openai.OpenAIAdapter).
+	if effort := extractReasoningEffort(req.Extensions); effort != "" {
+		chatReq.ReasoningEffort = effort
+	}
+
 	return chatReq, nil
+}
+
+// extractReasoningEffort pulls the reasoning effort string out of the OpenAI
+// extension bag attached to a CoreRequest. Returns "" when not present.
+func extractReasoningEffort(ext map[string]any) string {
+	openai, ok := ext["openai"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	reasoning, ok := openai["reasoning"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	effort, _ := reasoning["effort"].(string)
+	return effort
 }
 
 // =========================================================================

@@ -23,6 +23,10 @@ type ChatRequest struct {
 	StreamOptions     *StreamOptions  `json:"stream_options,omitempty"`
 	Metadata          map[string]any  `json:"metadata,omitempty"`
 	User              string          `json:"user,omitempty"`
+	// ReasoningEffort is the OpenAI Chat Completions reasoning_effort field
+	// ("low" | "medium" | "high" | "minimal"). Populated from the inbound
+	// OpenAI Responses request's reasoning.effort.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 // ChatMessage represents a single message in the conversation.
