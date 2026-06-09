@@ -941,22 +941,25 @@ func (s *Server) handleAdapterStream(
 		}
 
 		var visCoreProvider visualpkg.CoreProvider
-		if provAdapter, ok := s.adapterRegistry.GetProvider(candidate.Protocol); ok {
-			finalizeAnthropicUpstream := func(_ context.Context, upstream any) (any, error) {
-				msgReq, err := normalizeAnthropicRequest(upstream)
-				if err != nil {
-					return nil, err
+		hasImage := coreRequestHasImage(coreReq)
+		if hasImage {
+			if provAdapter, ok := s.adapterRegistry.GetProvider(candidate.Protocol); ok {
+				finalizeAnthropicUpstream := func(_ context.Context, upstream any) (any, error) {
+					msgReq, err := normalizeAnthropicRequest(upstream)
+					if err != nil {
+						return nil, err
+					}
+					if wsMode == "enabled" {
+						injectAnthropicWebSearch(&msgReq)
+					}
+					if s.pluginRegistry != nil && sess != nil {
+						prependCachedThinking(&msgReq, sess)
+					}
+					return &msgReq, nil
 				}
-				if wsMode == "enabled" {
-					injectAnthropicWebSearch(&msgReq)
+				if visProv := s.wrapWithVisual(ctx, openAIReq.Model, candidate, provAdapter, finalizeAnthropicUpstream); visProv != nil {
+					visCoreProvider = visProv
 				}
-				if s.pluginRegistry != nil && sess != nil {
-					prependCachedThinking(&msgReq, sess)
-				}
-				return &msgReq, nil
-			}
-			if visProv := s.wrapWithVisual(ctx, openAIReq.Model, candidate, provAdapter, finalizeAnthropicUpstream); visProv != nil {
-				visCoreProvider = visProv
 			}
 		}
 
@@ -977,9 +980,10 @@ func (s *Server) handleAdapterStream(
 			writeOpenAIError(w, http.StatusInternalServerError, payload)
 			return
 		}
-		// Strip image blocks from anthropic request if visual extension is enabled.
-		// This prevents base64 image data from being sent to text-only models.
-		if s.pluginRegistry != nil && s.runtime != nil && openAIReq.Model != "" {
+		// Strip image blocks from anthropic request if visual extension is enabled
+		// and images are present. This prevents base64 image data from being sent to
+		// text-only models while keeping pure-text requests on the real streaming path.
+		if hasImage && s.pluginRegistry != nil && s.runtime != nil && openAIReq.Model != "" {
 			cfgV := s.runtime.Current().Config
 			visCfg, visOk := visualpkg.ConfigForModelFromResolvedConfig(cfgV, openAIReq.Model)
 			if visOk && visCfg.Provider != "" && visCfg.Model != "" {
