@@ -536,13 +536,7 @@ func TestGenerateConfigTomlWritesAuthJSONWithOwnerOnlyPermissions(t *testing.T) 
 		t.Fatalf("GenerateConfigToml() error = %v", err)
 	}
 
-	info, err := os.Stat(filepath.Join(codexHome, "auth.json"))
-	if err != nil {
-		t.Fatalf("Stat() error = %v", err)
-	}
-	if perm := info.Mode().Perm(); perm != 0600 {
-		t.Fatalf("auth.json perm = %04o, want 0600", perm)
-	}
+	assertAuthJSONPermissions(t, filepath.Join(codexHome, "auth.json"))
 }
 
 func TestBuildModelInfoFromProviderModelIncludesInputModalities(t *testing.T) {

@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 	"moonbridge/internal/extension/codex"
 	"moonbridge/internal/logger"
 	"moonbridge/internal/service/app"
+	"moonbridge/internal/service/desktopcontrol"
 )
 
 const (
@@ -34,8 +36,11 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 	flags.SetOutput(stderr)
 
 	configPath := flags.String("config", "", "Path to config.yml")
+	initConfig := flags.Bool("init-config", false, "Create a starter config if it does not exist and exit")
 	addr := flags.String("addr", "", "Override server listen address")
 	mode := flags.String("mode", "", "Override mode: CaptureAnthropic, CaptureResponse, or Transform")
+	desktopMode := flags.Bool("desktop-mode", false, "Enable the authenticated Desktop lifecycle endpoints")
+	desktopInstanceID := flags.String("desktop-instance-id", "", "Desktop shell instance identifier")
 	printAddr := flags.Bool("print-addr", false, "Print configured listen address and exit")
 	printMode := flags.Bool("print-mode", false, "Print configured mode and exit")
 	printDefaultModel := flags.Bool("print-default-model", false, "Print configured default model alias and exit")
@@ -58,6 +63,15 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 		writeStartupError(stderr, "配置文件路径解析失败", "", err,
 			"设置 HOME，或使用 -config 明确指定配置文件路径。")
 		return exitStartupErr
+	}
+	if *initConfig {
+		if err := ensureStarterConfig(resolvedConfigPath, extensions.ConfigSpecs()); err != nil {
+			writeStartupError(stderr, "默认配置创建失败", resolvedConfigPath, err,
+				"确认配置目录可写，或使用 -config 指向已有配置文件。")
+			return exitStartupErr
+		}
+		fmt.Fprintln(stdout, resolvedConfigPath)
+		return exitOK
 	}
 	if *dumpConfigSchema {
 		if err := app.DumpConfigSchema(resolvedConfigPath); err != nil {
@@ -111,6 +125,21 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 	if *addr != "" {
 		cfg.OverrideAddr(*addr)
 	}
+	if *desktopMode {
+		token := os.Getenv("MOONBRIDGE_DESKTOP_TOKEN")
+		if token == "" || *desktopInstanceID == "" {
+			writeStartupError(stderr, "Desktopモードの引数が不足しています", resolvedConfigPath,
+				fmt.Errorf("-desktop-mode requires -desktop-instance-id and MOONBRIDGE_DESKTOP_TOKEN"),
+				"Tauri Desktopから起動してください。")
+			return exitStartupErr
+		}
+		if !isLoopbackAddr(cfg.Addr) {
+			writeStartupError(stderr, "Desktopモードの待受先が安全ではありません", resolvedConfigPath,
+				fmt.Errorf("Desktopモードはloopbackアドレスだけを許可します: %s", cfg.Addr),
+				"addrを127.0.0.1:ポートに設定してください。")
+			return exitStartupErr
+		}
+	}
 	if *printAddr {
 		fmt.Fprintln(stdout, cfg.Addr)
 		return exitOK
@@ -144,12 +173,33 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
 
-	if err := app.RunServer(ctx, cfg, stderr); err != nil {
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	var runOptions app.RunOptions
+	if *desktopMode {
+		runOptions.DesktopControl = desktopcontrol.New(*desktopInstanceID, os.Getenv("MOONBRIDGE_DESKTOP_TOKEN"), cancelRun).
+			WithServerToken(cfg.AuthToken)
+	}
+	if err := app.RunServerWithOptions(runCtx, cfg, stderr, runOptions); err != nil {
 		writeStartupError(stderr, "服务运行失败", resolvedConfigPath, err,
 			"检查监听地址是否被占用，以及上游 provider 配置是否可用。")
 		return exitRuntimeErr
 	}
 	return exitOK
+}
+
+func ensureStarterConfig(configPath string, specs []config.ExtensionConfigSpec) error {
+	_, err := createStarterConfigIfMissing(configPath, config.LoadOptions{ExtensionSpecs: specs})
+	return err
+}
+
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func flagWasSet(flags *flag.FlagSet, name string) bool {
@@ -241,25 +291,6 @@ func publishConfigFile(tempPath string, finalPath string) (bool, error) {
 		return false, fmt.Errorf("sync config directory after removing temp config %s: %w", tempPath, err)
 	}
 	return true, nil
-}
-
-func syncParentDir(path string) error {
-	dirPath := filepath.Dir(path)
-	dir, err := os.Open(dirPath)
-	if err != nil {
-		return fmt.Errorf("open config directory %s: %w", dirPath, err)
-	}
-	if err := dir.Sync(); err != nil {
-		closeErr := dir.Close()
-		if closeErr != nil {
-			return errors.Join(fmt.Errorf("sync config directory %s: %w", dirPath, err), fmt.Errorf("close config directory %s: %w", dirPath, closeErr))
-		}
-		return fmt.Errorf("sync config directory %s: %w", dirPath, err)
-	}
-	if err := dir.Close(); err != nil {
-		return fmt.Errorf("close config directory %s: %w", dirPath, err)
-	}
-	return nil
 }
 
 func cleanupTempConfigFile(file *os.File, path string, cause error) error {

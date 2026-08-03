@@ -1,0 +1,4 @@
+interface:
+  display_name: "Implement Approved Plan"
+  short_description: "Implement an approved repository plan one commit at a time"
+  default_prompt: "Use $implement-approved-plan to implement the next incomplete boundary from the approved repository plan, update its progress, and stop after verification."

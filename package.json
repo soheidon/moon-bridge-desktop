@@ -9,6 +9,7 @@
     "start": "wrangler dev"
   },
   "devDependencies": {
+    "vitest": "^4.1.10",
     "wrangler": "^4.86.0"
   }
 }

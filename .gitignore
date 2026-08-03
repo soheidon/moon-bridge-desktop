@@ -25,6 +25,15 @@ CLAUDE.md
 .agents
 .agents/
 .cursor
+
+# Repository-backed Codex planning workflow
+!AGENTS.md
+!.agents/
+!.agents/skills/
+!.agents/skills/implement-approved-plan/
+!.agents/skills/implement-approved-plan/SKILL.md
+!.agents/skills/implement-approved-plan/agents/
+!.agents/skills/implement-approved-plan/agents/openai.yaml
 .cursor/
 .continue
 .continue/

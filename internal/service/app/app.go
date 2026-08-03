@@ -22,6 +22,7 @@ import (
 	"moonbridge/internal/protocol/chat"
 	"moonbridge/internal/protocol/google"
 	"moonbridge/internal/protocol/openai"
+	"moonbridge/internal/service/desktopcontrol"
 	"moonbridge/internal/service/provider"
 	"moonbridge/internal/service/proxy"
 	"moonbridge/internal/service/runtime"
@@ -32,6 +33,7 @@ import (
 	"moonbridge/internal/service/stats"
 	"moonbridge/internal/service/store"
 	mbtrace "moonbridge/internal/service/trace"
+	"moonbridge/internal/service/trafficanalysis"
 )
 
 const Name = "Moon Bridge"
@@ -45,22 +47,30 @@ func WelcomeMessage() string {
 }
 
 func RunServer(ctx context.Context, cfg config.Config, errors io.Writer) error {
+	return RunServerWithOptions(ctx, cfg, errors, RunOptions{})
+}
+
+type RunOptions struct {
+	DesktopControl *desktopcontrol.Control
+}
+
+func RunServerWithOptions(ctx context.Context, cfg config.Config, errors io.Writer, options RunOptions) error {
 	switch cfg.Mode {
 	case config.ModeTransform:
 		slog.Info("启动服务器", "mode", cfg.Mode, "addr", cfg.Addr)
-		return runTransform(ctx, cfg, errors)
+		return runTransform(ctx, cfg, errors, options)
 	case config.ModeCaptureResponse:
 		slog.Info("启动服务器", "mode", cfg.Mode, "addr", cfg.Addr)
-		return runCaptureResponse(ctx, cfg, errors)
+		return runCaptureResponse(ctx, cfg, errors, options)
 	case config.ModeCaptureAnthropic:
 		slog.Info("启动服务器", "mode", cfg.Mode, "addr", cfg.Addr)
-		return runCaptureAnthropic(ctx, cfg, errors)
+		return runCaptureAnthropic(ctx, cfg, errors, options)
 	default:
 		return fmt.Errorf("unsupported mode %q", cfg.Mode)
 	}
 }
 
-func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) error {
+func runTransform(ctx context.Context, cfg config.Config, errors io.Writer, options RunOptions) error {
 	var rt *runtime.Runtime
 
 	// Construct domain configs from global config.
@@ -334,7 +344,19 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer) erro
 		TraceWriter:      traceWtr,
 	})
 
-	wrapped := handler
+	// The persistence layer may replace the file configuration, including the
+	// management API token. Refresh the Desktop bridge after that resolution so
+	// authenticated config-graph requests still reach the active server.
+	if options.DesktopControl != nil {
+		options.DesktopControl.WithServerToken(cfg.AuthToken)
+	}
+	if options.DesktopControl != nil {
+		capture := trafficanalysis.NewCaptureProxy(trafficanalysis.CaptureConfig{InstanceID: options.DesktopControl.InstanceID})
+		options.DesktopControl.WithTrafficAnalysis(capture.ManagementHandler()).WithTrafficAnalysisStatus(func() any { return capture.Status() })
+		defer capture.Close()
+	}
+	wrapped := http.Handler(handler)
+	wrapped = desktopcontrol.Wrap(wrapped, options.DesktopControl)
 	return runHTTPServer(ctx, cfg.Addr, wrapped, errors, sessionStats)
 }
 
@@ -586,7 +608,7 @@ func injectedSearchConfigured(cfg config.Config, modelAlias, providerKey string)
 	return cfg.WebSearchTavilyKeyForProvider(providerKey) != "" || cfg.WebSearchFirecrawlKeyForProvider(providerKey) != ""
 }
 
-func runCaptureResponse(ctx context.Context, cfg config.Config, errors io.Writer) error {
+func runCaptureResponse(ctx context.Context, cfg config.Config, errors io.Writer, options RunOptions) error {
 	tracer := mbtrace.New(captureResponseTraceConfig(cfg.TraceRequests))
 	logTrace(errors, "response proxy", tracer)
 	handler, err := proxy.NewResponse(proxy.ResponseConfig{
@@ -599,10 +621,10 @@ func runCaptureResponse(ctx context.Context, cfg config.Config, errors io.Writer
 		return err
 	}
 	slog.Info("响应代理已初始化", "upstream", cfg.ResponseProxy.ProviderBaseURL)
-	return runHTTPServer(ctx, cfg.Addr, handler, errors, nil)
+	return runHTTPServer(ctx, cfg.Addr, desktopcontrol.Wrap(handler, options.DesktopControl), errors, nil)
 }
 
-func runCaptureAnthropic(ctx context.Context, cfg config.Config, errors io.Writer) error {
+func runCaptureAnthropic(ctx context.Context, cfg config.Config, errors io.Writer, options RunOptions) error {
 	tracer := mbtrace.New(captureAnthropicTraceConfig(cfg.TraceRequests))
 	logTrace(errors, "anthropic proxy", tracer)
 	handler, err := proxy.NewAnthropic(proxy.AnthropicConfig{
@@ -616,7 +638,7 @@ func runCaptureAnthropic(ctx context.Context, cfg config.Config, errors io.Write
 		return err
 	}
 	slog.Info("Anthropic 代理已初始化", "upstream", cfg.AnthropicProxy.ProviderBaseURL)
-	return runHTTPServer(ctx, cfg.Addr, handler, errors, nil)
+	return runHTTPServer(ctx, cfg.Addr, desktopcontrol.Wrap(handler, options.DesktopControl), errors, nil)
 }
 
 func logTrace(errors io.Writer, label string, tracer *mbtrace.Tracer) {
@@ -670,7 +692,7 @@ func runHTTPServer(ctx context.Context, addr string, handler http.Handler, error
 			fmt.Fprintln(errors)
 			stats.WriteSummary(errors, summary)
 		}
-		shutdownCtx, cancel := context.WithCancel(context.Background())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		return httpServer.Shutdown(shutdownCtx)
 	case err := <-errCh:

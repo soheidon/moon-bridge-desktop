@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Moon Bridge Desktop default permissions",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:default", "shell:allow-spawn", "shell:allow-execute", "shell:allow-kill"]
+}

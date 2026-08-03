@@ -158,20 +158,8 @@ func TestRunCreatesStarterConfigWhenDefaultConfigIsMissing(t *testing.T) {
 		t.Fatalf("stdout = %q, want Transform", got)
 	}
 	configPath := filepath.Join(home, "moonbridge", "config.yml")
-	dirInfo, err := os.Stat(filepath.Dir(configPath))
-	if err != nil {
-		t.Fatalf("stat config dir: %v", err)
-	}
-	if got := dirInfo.Mode().Perm(); got != 0o700 {
-		t.Fatalf("created config dir mode = %v, want 0700", got)
-	}
-	info, err := os.Stat(configPath)
-	if err != nil {
-		t.Fatalf("stat created config: %v", err)
-	}
-	if got := info.Mode().Perm(); got != 0o600 {
-		t.Fatalf("created config mode = %v, want 0600", got)
-	}
+	assertConfigDirPermissions(t, filepath.Dir(configPath))
+	assertConfigFilePermissions(t, configPath)
 	cfg, err := config.LoadFromFileWithOptions(configPath, config.LoadOptions{
 		ExtensionSpecs: app.BuiltinExtensions().ConfigSpecs(),
 	})
