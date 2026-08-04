@@ -10,9 +10,11 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"moonbridge/internal/config"
 	"moonbridge/internal/service/app"
 	"moonbridge/internal/service/desktopcontrol"
@@ -116,6 +118,15 @@ func NewService(opts ServiceOptions) *Service {
 		runServer: app.RunServerWithOptions,
 		state:     State{Status: StatusStopped},
 	}
+}
+
+// NewDesktopIdentity returns a fresh instance identity for a desktop-hosted
+// gateway run: a 32-hex instance id and its matching control token. Both are
+// generated as UUIDv4 without dashes, matching the shape the Tauri shell uses.
+func NewDesktopIdentity() (instanceID, token string) {
+	instanceID = strings.ReplaceAll(uuid.NewString(), "-", "")
+	token = strings.ReplaceAll(uuid.NewString(), "-", "")
+	return instanceID, token
 }
 
 // Start validates the options, transitions to starting, and blocks until the

@@ -1,6 +1,6 @@
 //go:build windows
 
-package main
+package config
 
 // Windows does not provide the Unix directory-fsync durability primitive in
 // the same way. File contents are still synced before rename, and the

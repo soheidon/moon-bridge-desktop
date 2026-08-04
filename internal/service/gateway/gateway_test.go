@@ -800,3 +800,27 @@ func TestServicePanicAfterOnListening(t *testing.T) {
 	}
 	stopService(t, svc)
 }
+
+func TestNewDesktopIdentityIs32Hex(t *testing.T) {
+	seen := make(map[string]bool)
+	for range 8 {
+		instanceID, token := NewDesktopIdentity()
+		if len(instanceID) != 32 {
+			t.Fatalf("instanceID = %q, want length 32", instanceID)
+		}
+		if len(token) != 32 {
+			t.Fatalf("token = %q, want length 32", token)
+		}
+		for _, s := range []string{instanceID, token} {
+			for _, r := range s {
+				if !strings.ContainsRune("0123456789abcdef", r) {
+					t.Fatalf("%q contains non-hex rune %q", s, r)
+				}
+			}
+			if seen[s] {
+				t.Fatalf("identity component %q repeated, want unique", s)
+			}
+			seen[s] = true
+		}
+	}
+}

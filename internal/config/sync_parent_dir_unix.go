@@ -1,6 +1,6 @@
 //go:build !windows
 
-package main
+package config
 
 import (
 	"errors"
