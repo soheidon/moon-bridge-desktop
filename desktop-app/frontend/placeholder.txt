@@ -1,0 +1,1 @@
+Wails development uses the Vite dev server configured in wails.json.

@@ -83,6 +83,14 @@ webui/playwright-report/
 /logs/
 logs/
 !/webui/src/features/logs/
+
+# Wails generated frontend assets
+/desktop-app/frontend/dist/*
+!/desktop-app/frontend/dist/.gitkeep
+/desktop-app/build/bin/
+/desktop/wailsjs/
+/desktop/package.json.md5
+/desktop-app/frontend/wailsjs/
 *.log
 .omx/
 omx_wiki/

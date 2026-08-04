@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "build:web": "tsc -b && vite build",
+    "build:wails": "tsc -b && vite build --outDir ../desktop-app/frontend/dist",
     "test:web": "vitest run",
     "build:sidecar": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ..\\scripts\\build-desktop-sidecar.ps1",
     "build:desktop": "tauri build",
