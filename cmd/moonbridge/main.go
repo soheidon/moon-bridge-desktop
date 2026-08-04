@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -17,7 +16,7 @@ import (
 	"moonbridge/internal/extension/codex"
 	"moonbridge/internal/logger"
 	"moonbridge/internal/service/app"
-	"moonbridge/internal/service/desktopcontrol"
+	"moonbridge/internal/service/gateway"
 )
 
 const (
@@ -133,7 +132,7 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 				"Tauri Desktopから起動してください。")
 			return exitStartupErr
 		}
-		if !isLoopbackAddr(cfg.Addr) {
+		if !gateway.IsLoopbackAddress(cfg.Addr) {
 			writeStartupError(stderr, "Desktopモードの待受先が安全ではありません", resolvedConfigPath,
 				fmt.Errorf("Desktopモードはloopbackアドレスだけを許可します: %s", cfg.Addr),
 				"addrを127.0.0.1:ポートに設定してください。")
@@ -173,16 +172,49 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
 
-	runCtx, cancelRun := context.WithCancel(ctx)
-	defer cancelRun()
-	var runOptions app.RunOptions
-	if *desktopMode {
-		runOptions.DesktopControl = desktopcontrol.New(*desktopInstanceID, os.Getenv("MOONBRIDGE_DESKTOP_TOKEN"), cancelRun).
-			WithServerToken(cfg.AuthToken)
+	svc := gateway.NewService(gateway.ServiceOptions{Errors: stderr})
+	if _, err := svc.Start(ctx, gateway.StartOptions{
+		Config:      cfg,
+		DesktopMode: *desktopMode,
+		InstanceID:  *desktopInstanceID,
+		Token:       os.Getenv("MOONBRIDGE_DESKTOP_TOKEN"),
+		ServerToken: cfg.AuthToken,
+	}); err != nil {
+		switch {
+		case errors.Is(err, gateway.ErrStartCanceled):
+			return finishCanceledStart(stderr, resolvedConfigPath, svc)
+		case errors.Is(err, gateway.ErrDesktopModeRequiresLoopback), errors.Is(err, gateway.ErrDesktopModeRequiresIdentity):
+			writeStartupError(stderr, "Desktopモードの設定が無効です", resolvedConfigPath, err,
+				"desktop-mode は loopback 待受アドレスと instance-id / token を要求します。")
+			return exitStartupErr
+		default:
+			writeStartupError(stderr, "服务运行失败", resolvedConfigPath, err,
+				"检查监听地址是否被占用，以及上游 provider 配置是否可用。")
+			return exitRuntimeErr
+		}
 	}
-	if err := app.RunServerWithOptions(runCtx, cfg, stderr, runOptions); err != nil {
+	if err := svc.Wait(); err != nil {
 		writeStartupError(stderr, "服务运行失败", resolvedConfigPath, err,
 			"检查监听地址是否被占用，以及上游 provider 配置是否可用。")
+		return exitRuntimeErr
+	}
+	return exitOK
+}
+
+// gatewayWaiter is the subset of the gateway service needed to await the
+// cleanup of a canceled start. It is an interface so the branch is unit
+// testable without a real signal-triggered run.
+type gatewayWaiter interface {
+	Wait() error
+}
+
+// finishCanceledStart is called when Start returns ErrStartCanceled (a signal
+// arrived before the listener bound). It waits for the interrupted run to
+// finish its cleanup, then returns the process exit code.
+func finishCanceledStart(stderr io.Writer, configPath string, svc gatewayWaiter) int {
+	if waitErr := svc.Wait(); waitErr != nil {
+		writeStartupError(stderr, "服务停止失败", configPath, waitErr,
+			"检查 Gateway 是否能够正常释放监听端口和运行资源。")
 		return exitRuntimeErr
 	}
 	return exitOK
@@ -191,15 +223,6 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 func ensureStarterConfig(configPath string, specs []config.ExtensionConfigSpec) error {
 	_, err := createStarterConfigIfMissing(configPath, config.LoadOptions{ExtensionSpecs: specs})
 	return err
-}
-
-func isLoopbackAddr(addr string) bool {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return false
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
 }
 
 func flagWasSet(flags *flag.FlagSet, name string) bool {

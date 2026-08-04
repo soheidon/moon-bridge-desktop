@@ -104,10 +104,21 @@ func SetConsumeFunc(fn ConsumeFunc) {
 }
 
 // AddConsumeFunc appends a consume callback to the current consume pipeline.
-func AddConsumeFunc(fn ConsumeFunc) {
+// The returned function removes exactly this consumer (idempotent).
+func AddConsumeFunc(fn ConsumeFunc) func() {
 	if defaultHandler != nil {
-		defaultHandler.AddConsumeFunc(fn)
+		return defaultHandler.AddConsumeFunc(fn)
 	}
+	return func() {}
+}
+
+// ConsumeFuncCount returns the number of consume functions currently
+// registered on the default handler's consume pipeline.
+func ConsumeFuncCount() int {
+	if defaultHandler == nil {
+		return 0
+	}
+	return defaultHandler.ConsumeFuncCount()
 }
 
 // Recent returns entries captured by the default log ring.

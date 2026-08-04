@@ -5,6 +5,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -52,6 +53,10 @@ func RunServer(ctx context.Context, cfg config.Config, errors io.Writer) error {
 
 type RunOptions struct {
 	DesktopControl *desktopcontrol.Control
+	// OnListening is called once the HTTP listener is bound, with the
+	// resolved listen address (useful for :0). A panic here must not leak
+	// the listener.
+	OnListening func(addr string)
 }
 
 func RunServerWithOptions(ctx context.Context, cfg config.Config, errors io.Writer, options RunOptions) error {
@@ -156,10 +161,12 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer, opti
 	}
 	defer plugins.ShutdownAll()
 
-	// Wire plugin LogConsumer into the slog consume pipeline.
-	logger.AddConsumeFunc(func(entries []logger.LogEntry) []logger.LogEntry {
+	// Wire plugin LogConsumer into the slog consume pipeline, scoped to this
+	// run so a subsequent run in the same process does not accumulate consumers.
+	removePluginConsumer := logger.AddConsumeFunc(func(entries []logger.LogEntry) []logger.LogEntry {
 		return plugins.ConsumeGlobalLog(entries)
 	})
+	defer removePluginConsumer()
 
 	// Initialize persistence layer (db.Registry).
 	dbRegistry := db.NewRegistry(slog.Default())
@@ -357,7 +364,7 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer, opti
 	}
 	wrapped := http.Handler(handler)
 	wrapped = desktopcontrol.Wrap(wrapped, options.DesktopControl)
-	return runHTTPServer(ctx, cfg.Addr, wrapped, errors, sessionStats)
+	return runHTTPServer(ctx, cfg.Addr, wrapped, errors, sessionStats, options.OnListening)
 }
 
 // resolveDefaultClient returns the provider client for the default key.
@@ -621,7 +628,7 @@ func runCaptureResponse(ctx context.Context, cfg config.Config, errors io.Writer
 		return err
 	}
 	slog.Info("响应代理已初始化", "upstream", cfg.ResponseProxy.ProviderBaseURL)
-	return runHTTPServer(ctx, cfg.Addr, desktopcontrol.Wrap(handler, options.DesktopControl), errors, nil)
+	return runHTTPServer(ctx, cfg.Addr, desktopcontrol.Wrap(handler, options.DesktopControl), errors, nil, options.OnListening)
 }
 
 func runCaptureAnthropic(ctx context.Context, cfg config.Config, errors io.Writer, options RunOptions) error {
@@ -638,7 +645,7 @@ func runCaptureAnthropic(ctx context.Context, cfg config.Config, errors io.Write
 		return err
 	}
 	slog.Info("Anthropic 代理已初始化", "upstream", cfg.AnthropicProxy.ProviderBaseURL)
-	return runHTTPServer(ctx, cfg.Addr, desktopcontrol.Wrap(handler, options.DesktopControl), errors, nil)
+	return runHTTPServer(ctx, cfg.Addr, desktopcontrol.Wrap(handler, options.DesktopControl), errors, nil, options.OnListening)
 }
 
 func logTrace(errors io.Writer, label string, tracer *mbtrace.Tracer) {
@@ -668,20 +675,29 @@ func captureAnthropicTraceConfig(enabled bool) mbtrace.Config {
 	}
 }
 
-func runHTTPServer(ctx context.Context, addr string, handler http.Handler, errors io.Writer, sessionStats *stats.SessionStats) error {
+func runHTTPServer(ctx context.Context, addr string, handler http.Handler, errors io.Writer, sessionStats *stats.SessionStats, onListening func(addr string)) error {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
 	httpServer := &http.Server{Addr: addr, Handler: handler}
 	defer func() {
 		if closer, ok := handler.(io.Closer); ok {
 			_ = closer.Close()
 		}
 	}()
+	resolvedAddr := listener.Addr().String()
+	if onListening != nil {
+		onListening(resolvedAddr)
+	}
 	errCh := make(chan error, 1)
 	go func() {
-		fmt.Fprintf(errors, "%s 监听于 %s\n", Name, addr)
-		consoleURL := fmt.Sprintf("http://%s/console/", addr)
+		fmt.Fprintf(errors, "%s 监听于 %s\n", Name, resolvedAddr)
+		consoleURL := fmt.Sprintf("http://%s/console/", resolvedAddr)
 		fmt.Fprintf(errors, "Web Console: %s\n", consoleURL)
-		slog.Info("HTTP 服务器监听中", "addr", addr, "webui", consoleURL)
-		errCh <- httpServer.ListenAndServe()
+		slog.Info("HTTP 服务器监听中", "addr", resolvedAddr, "webui", consoleURL)
+		errCh <- httpServer.Serve(listener)
 	}()
 
 	select {

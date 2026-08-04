@@ -10,20 +10,30 @@ import (
 // ConsumeFunc transforms a batch of log entries before output.
 type ConsumeFunc func(entries []LogEntry) []LogEntry
 
-// consumeState is a shared mutable cell holding the current ConsumeFunc.
+// consumeEntry identifies a single registered consumer so it can be
+// removed independently of the others.
+type consumeEntry struct {
+	id uint64
+	fn ConsumeFunc
+}
+
+// consumeState is a shared mutable cell holding the current ConsumeFuncs.
 // All handlers derived from the same root (via WithAttrs/WithGroup) share
 // a pointer to the same consumeState, so a later SetConsumeFunc call on
 // the root handler is visible to every derived logger.
 type consumeState struct {
-	mu    sync.RWMutex
-	funcs []ConsumeFunc
+	mu      sync.RWMutex
+	nextID  uint64
+	entries []consumeEntry
 }
 
 func (s *consumeState) load() []ConsumeFunc {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]ConsumeFunc, len(s.funcs))
-	copy(out, s.funcs)
+	out := make([]ConsumeFunc, len(s.entries))
+	for i, e := range s.entries {
+		out[i] = e.fn
+	}
 	return out
 }
 
@@ -31,19 +41,43 @@ func (s *consumeState) store(fn ConsumeFunc) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if fn == nil {
-		s.funcs = nil
+		s.entries = nil
 		return
 	}
-	s.funcs = []ConsumeFunc{fn}
+	s.entries = []consumeEntry{{id: s.allocIDLocked(), fn: fn}}
 }
 
-func (s *consumeState) append(fn ConsumeFunc) {
+// append adds fn and returns a function that removes exactly this entry
+// (idempotent; safe to call after store/SetConsumeFunc replaced everything).
+func (s *consumeState) append(fn ConsumeFunc) func() {
 	if fn == nil {
-		return
+		return func() {}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.funcs = append(s.funcs, fn)
+	id := s.allocIDLocked()
+	s.entries = append(s.entries, consumeEntry{id: id, fn: fn})
+	return func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		for i, e := range s.entries {
+			if e.id == id {
+				s.entries = append(s.entries[:i], s.entries[i+1:]...)
+				return
+			}
+		}
+	}
+}
+
+func (s *consumeState) allocIDLocked() uint64 {
+	s.nextID++
+	return s.nextID
+}
+
+func (s *consumeState) count() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.entries)
 }
 
 // consumeHandler wraps an inner slog.Handler and dispatches every log record
@@ -175,7 +209,14 @@ func (h *consumeHandler) SetConsumeFunc(fn ConsumeFunc) {
 	h.consume.store(fn)
 }
 
-// AddConsumeFunc appends a consume function to this handler.
-func (h *consumeHandler) AddConsumeFunc(fn ConsumeFunc) {
-	h.consume.append(fn)
+// AddConsumeFunc appends a consume function to this handler and returns
+// a function that removes exactly this consumer.
+func (h *consumeHandler) AddConsumeFunc(fn ConsumeFunc) func() {
+	return h.consume.append(fn)
+}
+
+// ConsumeFuncCount returns the number of consume functions currently
+// registered on this handler's consume pipeline.
+func (h *consumeHandler) ConsumeFuncCount() int {
+	return h.consume.count()
 }

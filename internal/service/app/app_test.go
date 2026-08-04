@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -479,6 +480,26 @@ func freeLoopbackAddr(t *testing.T) string {
 		t.Fatalf("close free loopback listener: %v", err)
 	}
 	return addr
+}
+
+func TestRunHTTPServerOnListeningPanicReleasesListener(t *testing.T) {
+	addr := freeLoopbackAddr(t)
+	panicked := make(chan any, 1)
+	go func() {
+		defer func() { panicked <- recover() }()
+		_ = runHTTPServer(context.Background(), addr,
+			http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
+			io.Discard, nil,
+			func(string) { panic("listener callback panic") })
+	}()
+	if rec := <-panicked; rec == nil {
+		t.Fatal("OnListening panic was not recovered")
+	}
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("re-bind after OnListening panic: %v", err)
+	}
+	l.Close()
 }
 
 func firstRunSQLiteConfig(t *testing.T, addr string, dbPath string) config.Config {

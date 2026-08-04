@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,43 @@ import (
 	"moonbridge/internal/extension/codex"
 	"moonbridge/internal/service/app"
 )
+
+type fakeGatewayWaiter struct {
+	waitCalls int
+	waitErr   error
+}
+
+func (f *fakeGatewayWaiter) Wait() error {
+	f.waitCalls++
+	return f.waitErr
+}
+
+func TestFinishCanceledStartWaitCleanup(t *testing.T) {
+	var stderr bytes.Buffer
+
+	// A clean Wait must be awaited exactly once and yield exit 0.
+	clean := &fakeGatewayWaiter{}
+	if got := finishCanceledStart(&stderr, "cfg.yml", clean); got != exitOK {
+		t.Fatalf("finishCanceledStart(nil) = %d, want exitOK", got)
+	}
+	if clean.waitCalls != 1 {
+		t.Fatalf("Wait() calls = %d, want 1", clean.waitCalls)
+	}
+
+	// A failing Wait must be awaited exactly once and yield exit 1 with a
+	// startup error report.
+	failed := &fakeGatewayWaiter{waitErr: errors.New("cleanup failed")}
+	stderr.Reset()
+	if got := finishCanceledStart(&stderr, "cfg.yml", failed); got != exitRuntimeErr {
+		t.Fatalf("finishCanceledStart(error) = %d, want exitRuntimeErr", got)
+	}
+	if failed.waitCalls != 1 {
+		t.Fatalf("Wait() calls = %d, want 1", failed.waitCalls)
+	}
+	if !strings.Contains(stderr.String(), "服务停止失败") {
+		t.Fatalf("stderr = %q, want startup error title", stderr.String())
+	}
+}
 
 func TestPrintCodexConfigTomlDoesNotSetServiceTier(t *testing.T) {
 	var output bytes.Buffer
