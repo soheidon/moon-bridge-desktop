@@ -13,6 +13,8 @@ import (
 
 	"moonbridge/internal/config"
 	"moonbridge/internal/extension/codex"
+	"moonbridge/internal/service/publishrecovery"
+	"moonbridge/internal/service/recovery"
 )
 
 type Status string
@@ -29,9 +31,9 @@ const (
 type StopReason string
 
 const (
-	StopReasonGraceful     StopReason = "graceful"
-	StopReasonTimeoutForce StopReason = "timeout_force"
-	StopReasonShutdown     StopReason = "shutdown"
+	StopReasonGraceful       StopReason = "graceful"
+	StopReasonTimeoutForce   StopReason = "timeout_force"
+	StopReasonShutdown       StopReason = "shutdown"
 	StopReasonTerminalClosed StopReason = "terminal_closed"
 )
 
@@ -78,6 +80,9 @@ var discoverCodex discoverFunc = func(ctx context.Context, timeout time.Duration
 
 // Options configures a Launcher. Nil Runner/Discover/SendCtrlBreak default to
 // the platform implementations; zero durations default to the package values.
+// A nil Publisher defaults to the production crash-journaled publisher
+// (publishrecovery.Service rooted at %LOCALAPPDATA%\Moon Bridge\recovery),
+// resolved lazily per publish so an init failure surfaces as a launch error.
 type Options struct {
 	Runner              processRunner
 	Discover            discoverFunc
@@ -86,6 +91,7 @@ type Options struct {
 	ForceStopTimeout    time.Duration
 	VersionProbeTimeout time.Duration
 	Progress            ProgressFunc
+	Publisher           homePublisher
 }
 
 // Launcher owns the codex terminal process. All public methods are safe for
@@ -95,13 +101,15 @@ type Options struct {
 type Launcher struct {
 	mu sync.Mutex
 
-	runner         processRunner
-	discover       discoverFunc
-	sendCtrlBreak  func(ctx context.Context, childPID int) error
+	runner          processRunner
+	discover        discoverFunc
+	sendCtrlBreak   func(ctx context.Context, childPID int) error
 	gracefulTimeout time.Duration
-	forceTimeout   time.Duration
-	probeTimeout   time.Duration
-	progress       ProgressFunc
+	forceTimeout    time.Duration
+	probeTimeout    time.Duration
+	progress        ProgressFunc
+	publisher       homePublisher
+	recovery        *recoveryPublisher // production default behind publisher
 
 	status     Status
 	run        *runState
@@ -136,7 +144,12 @@ func New(opts Options) *Launcher {
 		forceTimeout:    opts.ForceStopTimeout,
 		probeTimeout:    opts.VersionProbeTimeout,
 		progress:        opts.Progress,
+		publisher:       opts.Publisher,
 		status:          StatusIdle,
+	}
+	if l.publisher == nil {
+		l.recovery = &recoveryPublisher{}
+		l.publisher = l.recovery
 	}
 	if l.runner == nil {
 		l.runner = newProcessRunner()
@@ -243,7 +256,7 @@ func (l *Launcher) Launch(ctx context.Context, opts LaunchOptions) (State, error
 	}
 
 	l.emitProgress("publishing_config", "")
-	if err := PublishStaged(staging, opts.CodexHome, requireAuth); err != nil {
+	if err := publishStaged(ctx, l.publisher, staging, opts.CodexHome, requireAuth); err != nil {
 		return l.failLaunch(gen, err)
 	}
 	if err := ctx.Err(); err != nil {
@@ -439,6 +452,48 @@ func generateStaging(opts LaunchOptions) GenerateConfigFunc {
 		content := strings.ReplaceAll(buf.String(), stagingQuoted, finalQuoted)
 		return os.WriteFile(filepath.Join(stagingHome, "config.toml"), []byte(content), 0o600)
 	}
+}
+
+// recoveryPublisher is the production homePublisher: a publishrecovery.Service
+// rooted at %LOCALAPPDATA%\Moon Bridge\recovery. The root is resolved and the
+// Service built lazily on first publish, so an init failure (missing/relative
+// recovery root, or a journal left in an inconsistent state) surfaces as a
+// launch error rather than being silently retried through the old non-journal
+// publish. The Service is held for the launcher's lifetime (plan E): it is
+// reused across publishes and guards the single-journal slot itself.
+type recoveryPublisher struct {
+	mu      sync.Mutex
+	svc     *publishrecovery.Service
+	initErr error
+}
+
+func (p *recoveryPublisher) Publish(ctx context.Context, in publishrecovery.PublishInput) error {
+	svc, err := p.service()
+	if err != nil {
+		return err
+	}
+	return svc.Publish(ctx, in)
+}
+
+func (p *recoveryPublisher) service() (*publishrecovery.Service, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.svc != nil || p.initErr != nil {
+		return p.svc, p.initErr
+	}
+	root, err := recovery.DefaultDir(os.Getenv)
+	if err != nil {
+		p.initErr = err
+		return nil, err
+	}
+	recoveryDir := filepath.Join(root, "recovery")
+	svc, err := publishrecovery.New(publishrecovery.ServiceOptions{RecoveryDir: recoveryDir})
+	if err != nil {
+		p.initErr = err
+		return nil, err
+	}
+	p.svc = svc
+	return svc, nil
 }
 
 // resolveProjectDir validates the caller's ProjectDirectory and returns the

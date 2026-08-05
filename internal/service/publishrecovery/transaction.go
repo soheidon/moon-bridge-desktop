@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -89,10 +90,40 @@ func (s *Service) Publish(ctx context.Context, in PublishInput) error {
 		return err
 	}
 
-	canon, err := recovery.CanonicalizeCodexHome(in.TargetHome)
-	if err != nil {
+	if in.TargetHome == "" {
+		return newError(KindConfigPathInvalid, "target home is empty")
+	}
+
+	// Determine whether the target home already exists. When it does not
+	// (first-run), the journal is written before the directory is created so
+	// that a crash between creation and the durable journal never leaves an
+	// orphaned empty directory.
+	_, statErr := os.Stat(in.TargetHome)
+	targetPreviouslyExisted := statErr == nil
+	if statErr != nil && !os.IsNotExist(statErr) {
 		return newError(KindConfigPathInvalid, "target home is not a valid codex home")
 	}
+
+	var canon string
+	var err error
+	if targetPreviouslyExisted {
+		canon, err = recovery.CanonicalizeCodexHome(in.TargetHome)
+		if err != nil {
+			return newError(KindConfigPathInvalid, "target home is not a valid codex home")
+		}
+	} else {
+		// First-run: canonicalize the parent and derive the fingerprint from
+		// the canonical parent joined with the base name. This is the stable
+		// identifier that survives a directory creation; after PrepareTargetHome
+		// succeeds, recheckTargetHome will re-canonicalize through the now-
+		// existing target and produce the same value.
+		parentCanon, perr := s.canonicalizeParent(in.TargetHome)
+		if perr != nil {
+			return perr
+		}
+		canon = parentCanon
+	}
+
 	txID := s.deps.NewID()
 	if err := ValidateTransactionID(txID); err != nil {
 		return newError(KindTransactionInvalid, "generated transaction id is invalid")
@@ -111,13 +142,21 @@ func (s *Service) Publish(ctx context.Context, in PublishInput) error {
 			{File: FileAuth, ExpectedExist: in.AuthRequired, SHA256: authHash(in.AuthRequired, in.AuthJSON)},
 			{File: FileConfig, ExpectedExist: true, SHA256: recovery.HashBytes(in.ConfigTOML)},
 		},
-		AuthRequired: in.AuthRequired,
+		AuthRequired:              in.AuthRequired,
+		TargetHomeInitiallyAbsent: !targetPreviouslyExisted,
 	}
 	if err := s.store.Write(ctx, j); err != nil {
 		return err
 	}
 	if err := s.deps.Fault.Hit(FaultAfterPreparedJournal); err != nil {
 		return err
+	}
+
+	// For first-run, create the target directory now that the journal is durable.
+	if !targetPreviouslyExisted {
+		if err := recovery.PrepareTargetHome(in.TargetHome); err != nil {
+			return newError(KindConfigPathInvalid, "target home is not a valid codex home")
+		}
 	}
 
 	canon, err = s.recheckTargetHome(in.TargetHome, j.TargetHomeFingerprint)
@@ -283,6 +322,27 @@ func (s *Service) rejectUnfinished(ctx context.Context) error {
 	default:
 		return newError(KindTransactionActive, "an unfinished publish transaction exists")
 	}
+}
+
+// canonicalizeParent canonicalizes the parent directory of targetHome and
+// returns a canonical path for the target home that will be valid once the
+// directory is created. This is used for first-run (target does not yet exist):
+// the parent is canonicalized and the target base name is joined to produce a
+// stable fingerprint. After PrepareTargetHome creates the directory,
+// recheckTargetHome will re-canonicalize through the now-existing target and
+// produce the same canonical value.
+func (s *Service) canonicalizeParent(targetHome string) (string, error) {
+	abs, err := filepath.Abs(targetHome)
+	if err != nil {
+		return "", newError(KindConfigPathInvalid, "target home is not a valid codex home")
+	}
+	parent := filepath.Dir(filepath.Clean(abs))
+	base := filepath.Base(filepath.Clean(abs))
+	parentCanon, err := recovery.CanonicalizeCodexHome(parent)
+	if err != nil {
+		return "", newError(KindConfigPathInvalid, "target home parent is not a valid directory")
+	}
+	return filepath.Join(parentCanon, strings.ToLower(base)), nil
 }
 
 // recheckTargetHome re-canonicalizes the target home immediately before a

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"moonbridge/internal/config"
+	"moonbridge/internal/service/publishrecovery"
 )
 
 const testExe = `C:\Users\test\bin\codex.exe`
@@ -36,12 +37,12 @@ func testLaunchOptions(codexHome string) LaunchOptions {
 }
 
 type fakeProcess struct {
-	pid         int
-	exited      chan struct{}
-	code        int
+	pid          int
+	exited       chan struct{}
+	code         int
 	terminateErr error // when set, Terminate fails without exiting the process
-	mu          sync.Mutex
-	closeCalls  int
+	mu           sync.Mutex
+	closeCalls   int
 }
 
 func newFakeProcess(pid int) *fakeProcess {
@@ -165,7 +166,9 @@ func fakeDiscover(ctx context.Context, timeout time.Duration) (string, error) {
 	return testExe, nil
 }
 
-func newTestLauncher(runner *fakeRunner, ctrlBreak func(ctx context.Context, pid int) error) *Launcher {
+func newTestLauncher(t *testing.T, runner *fakeRunner, ctrlBreak func(ctx context.Context, pid int) error) *Launcher {
+	t.Helper()
+	pub := recoverySvcAt(t, t.TempDir(), publishrecovery.Dependencies{})
 	return New(Options{
 		Runner:              runner,
 		Discover:            fakeDiscover,
@@ -173,6 +176,7 @@ func newTestLauncher(runner *fakeRunner, ctrlBreak func(ctx context.Context, pid
 		GracefulStopTimeout: 50 * time.Millisecond,
 		ForceStopTimeout:    50 * time.Millisecond,
 		VersionProbeTimeout: 100 * time.Millisecond,
+		Publisher:           pub,
 	})
 }
 
@@ -211,7 +215,7 @@ func launchOK(t *testing.T, l *Launcher, codexHome string) State {
 
 func TestLaunchLifecycleTerminalClosedOnSelfExit(t *testing.T) {
 	runner := &fakeRunner{}
-	l := newTestLauncher(runner, gracefulStub(runner))
+	l := newTestLauncher(t, runner, gracefulStub(runner))
 	codexHome := filepath.Join(t.TempDir(), "codex-home")
 
 	st := launchOK(t, l, codexHome)
@@ -230,7 +234,7 @@ func TestLaunchPublishesCodexHomeAndCleansStaging(t *testing.T) {
 	parent := t.TempDir()
 	codexHome := filepath.Join(parent, "codex-home")
 	runner := &fakeRunner{}
-	l := newTestLauncher(runner, gracefulStub(runner))
+	l := newTestLauncher(t, runner, gracefulStub(runner))
 
 	launchOK(t, l, codexHome)
 	for _, name := range codexHomeFiles {
@@ -286,7 +290,7 @@ func hasEnv(env []string, want string) bool {
 
 func TestLaunchDoubleLaunchRejected(t *testing.T) {
 	runner := &fakeRunner{}
-	l := newTestLauncher(runner, gracefulStub(runner))
+	l := newTestLauncher(t, runner, gracefulStub(runner))
 	codexHome := filepath.Join(t.TempDir(), "codex-home")
 
 	launchOK(t, l, codexHome)
@@ -307,7 +311,7 @@ func TestLaunchDoubleLaunchRejected(t *testing.T) {
 
 func TestStopGracefulRecordsReason(t *testing.T) {
 	runner := &fakeRunner{}
-	l := newTestLauncher(runner, gracefulStub(runner))
+	l := newTestLauncher(t, runner, gracefulStub(runner))
 	launchOK(t, l, filepath.Join(t.TempDir(), "codex-home"))
 
 	st, err := l.Stop(context.Background(), StopReasonGraceful)
@@ -324,7 +328,7 @@ func TestStopGracefulRecordsReason(t *testing.T) {
 
 func TestStopShutdownRecordsReason(t *testing.T) {
 	runner := &fakeRunner{}
-	l := newTestLauncher(runner, gracefulStub(runner))
+	l := newTestLauncher(t, runner, gracefulStub(runner))
 	launchOK(t, l, filepath.Join(t.TempDir(), "codex-home"))
 
 	st, err := l.Stop(context.Background(), StopReasonShutdown)
@@ -338,7 +342,7 @@ func TestStopShutdownRecordsReason(t *testing.T) {
 
 func TestStopForceOnHelperFailure(t *testing.T) {
 	runner := &fakeRunner{}
-	l := newTestLauncher(runner, func(ctx context.Context, pid int) error {
+	l := newTestLauncher(t, runner, func(ctx context.Context, pid int) error {
 		return errors.New("helper delivery failed")
 	})
 	launchOK(t, l, filepath.Join(t.TempDir(), "codex-home"))
@@ -358,7 +362,7 @@ func TestStopForceOnHelperFailure(t *testing.T) {
 func TestStopGracefulTimeoutFallsBackToForce(t *testing.T) {
 	runner := &fakeRunner{}
 	// SendCtrlBreak succeeds but the process never reacts to CTRL_BREAK.
-	l := newTestLauncher(runner, func(ctx context.Context, pid int) error { return nil })
+	l := newTestLauncher(t, runner, func(ctx context.Context, pid int) error { return nil })
 	launchOK(t, l, filepath.Join(t.TempDir(), "codex-home"))
 
 	start := time.Now()
@@ -376,7 +380,7 @@ func TestStopGracefulTimeoutFallsBackToForce(t *testing.T) {
 
 func TestStopIdempotentWhenNotRunning(t *testing.T) {
 	runner := &fakeRunner{}
-	l := newTestLauncher(runner, gracefulStub(runner))
+	l := newTestLauncher(t, runner, gracefulStub(runner))
 	st, err := l.Stop(context.Background(), StopReasonGraceful)
 	if err != nil {
 		t.Fatalf("Stop on idle must not error: %v", err)
@@ -388,7 +392,7 @@ func TestStopIdempotentWhenNotRunning(t *testing.T) {
 
 func TestRestartChangesPID(t *testing.T) {
 	runner := &fakeRunner{}
-	l := newTestLauncher(runner, gracefulStub(runner))
+	l := newTestLauncher(t, runner, gracefulStub(runner))
 	codexHome := filepath.Join(t.TempDir(), "codex-home")
 
 	first := launchOK(t, l, codexHome)
@@ -409,7 +413,7 @@ func TestRestartChangesPID(t *testing.T) {
 
 func TestLaunchCancelBeforeStartDoesNotStartProcess(t *testing.T) {
 	runner := &fakeRunner{}
-	l := newTestLauncher(runner, gracefulStub(runner))
+	l := newTestLauncher(t, runner, gracefulStub(runner))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -429,7 +433,7 @@ func TestRunnerStartCancelPropagatesAsCancel(t *testing.T) {
 	runner := &fakeRunner{startFn: func(ctx context.Context, opts startOptions) (ProcessHandle, error) {
 		return nil, context.Canceled
 	}}
-	l := newTestLauncher(runner, gracefulStub(runner))
+	l := newTestLauncher(t, runner, gracefulStub(runner))
 	_, err := l.Launch(context.Background(), testLaunchOptions(filepath.Join(t.TempDir(), "codex-home")))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled (not start_failed), got %v", err)
@@ -446,7 +450,7 @@ func TestLaunchCancelDuringStartCleansStaging(t *testing.T) {
 			return nil, ctx.Err()
 		},
 	}
-	l := newTestLauncher(runner, gracefulStub(runner))
+	l := newTestLauncher(t, runner, gracefulStub(runner))
 	ctx, cancel := context.WithCancel(context.Background())
 
 	done := make(chan struct{})
@@ -473,7 +477,7 @@ func TestLaunchFailureCleansStaging(t *testing.T) {
 	parent := t.TempDir()
 	codexHome := filepath.Join(parent, "codex-home")
 	runner := &fakeRunner{}
-	l := newTestLauncher(runner, gracefulStub(runner))
+	l := newTestLauncher(t, runner, gracefulStub(runner))
 
 	// Without a server auth token GenerateConfigToml skips auth.json, so
 	// verification fails after staging was created — the failure path must still
@@ -498,7 +502,7 @@ func TestLaunchFailureCleansStaging(t *testing.T) {
 
 func TestStopFailedWhenForceCannotKill(t *testing.T) {
 	runner := &fakeRunner{}
-	l := newTestLauncher(runner, func(ctx context.Context, pid int) error {
+	l := newTestLauncher(t, runner, func(ctx context.Context, pid int) error {
 		return errors.New("helper delivery failed")
 	})
 	launchOK(t, l, filepath.Join(t.TempDir(), "codex-home"))
@@ -521,7 +525,7 @@ func TestStopFailedWhenForceCannotKill(t *testing.T) {
 
 func TestHandleClosedExactlyOnce(t *testing.T) {
 	runner := &fakeRunner{}
-	l := newTestLauncher(runner, gracefulStub(runner))
+	l := newTestLauncher(t, runner, gracefulStub(runner))
 	launchOK(t, l, filepath.Join(t.TempDir(), "codex-home"))
 	p := runner.process(1)
 	if _, err := l.Stop(context.Background(), StopReasonGraceful); err != nil {
@@ -564,7 +568,7 @@ func TestLaunchPassesResolvedProjectDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner := &fakeRunner{}
-	l := newTestLauncher(runner, gracefulStub(runner))
+	l := newTestLauncher(t, runner, gracefulStub(runner))
 	opts := testLaunchOptions(filepath.Join(t.TempDir(), "codex-home"))
 	opts.ProjectDirectory = proj
 	if _, err := l.Launch(context.Background(), opts); err != nil {
@@ -584,4 +588,68 @@ func kindOf(err error) ErrorKind {
 		return ""
 	}
 	return le.Kind
+}
+
+// TestLaunchPublisherFailureFailsSafely verifies that a publish failure surfaced
+// through the injected publisher aborts the launch: the codex process is never
+// started and the target home is not left in a partial state the launcher then
+// retries through a non-journal publish (contract H).
+func TestLaunchPublisherFailureFailsSafely(t *testing.T) {
+	runner := &fakeRunner{}
+	// A publisher that represents a publishrecovery init/transaction failure.
+	pub := &testHomePublisher{err: &publishrecovery.Error{Kind: publishrecovery.KindTransactionActive, Message: "an unfinished journal exists"}}
+	codexHome := filepath.Join(t.TempDir(), "codex-home")
+	l := New(Options{
+		Runner:        runner,
+		Discover:      fakeDiscover,
+		SendCtrlBreak: gracefulStub(runner),
+		Publisher:     pub,
+	})
+
+	_, err := l.Launch(context.Background(), testLaunchOptions(codexHome))
+	if kindOf(err) != KindConfigPublishFailed {
+		t.Fatalf("expected KindConfigPublishFailed, got %v (kind=%s)", err, kindOf(err))
+	}
+	// The codex process must never have been started.
+	if n := runner.startCount(); n != 0 {
+		t.Fatalf("codex process started despite a publish failure: %d", n)
+	}
+	// The launcher is in error state.
+	if st := l.Status(); st.Status != StatusError {
+		t.Fatalf("expected error status after failed launch, got %+v", st)
+	}
+	// The error must be sanitized: no raw publish error string or transaction
+	// detail leaks through the launcher error.
+	if strings.Contains(err.Error(), "unfinished journal") {
+		t.Fatalf("raw publish error leaked into the launch error: %v", err)
+	}
+}
+
+// TestLaunchCleansStagingOnPublishFailure verifies that the launcher's deferred
+// staging removal runs even when the publish fails, so a staged auth secret
+// never survives on any launch outcome.
+func TestLaunchCleansStagingOnPublishFailure(t *testing.T) {
+	parent := t.TempDir()
+	codexHome := filepath.Join(parent, "codex-home")
+	runner := &fakeRunner{}
+	pub := &testHomePublisher{err: &publishrecovery.Error{Kind: publishrecovery.KindTransactionActive, Message: "unfinished journal"}}
+	l := New(Options{
+		Runner:        runner,
+		Discover:      fakeDiscover,
+		SendCtrlBreak: gracefulStub(runner),
+		Publisher:     pub,
+	})
+
+	if _, err := l.Launch(context.Background(), testLaunchOptions(codexHome)); err == nil {
+		t.Fatal("expected launch to fail")
+	}
+	entries, rerr := os.ReadDir(parent)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".codex-home-staging") {
+			t.Fatalf("staging dir not cleaned after launch failure: %q", e.Name())
+		}
+	}
 }

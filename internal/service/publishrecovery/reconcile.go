@@ -2,6 +2,8 @@ package publishrecovery
 
 import (
 	"context"
+	"fmt"
+	"path/filepath"
 
 	"moonbridge/internal/service/recovery"
 )
@@ -48,12 +50,27 @@ func (s *Service) ReconcileStartup(ctx context.Context, targetHome string) (Outc
 		_ = s.terminalCleanup(ctx, j)
 		return OutcomeCompleted, nil
 	case PhaseRolledBack:
+		// A first-run rollback that completed but left the empty target
+		// directory (crash between removal and terminal cleanup) is cleaned
+		// up here.
+		if j.TargetHomeInitiallyAbsent {
+			s.removeTargetForReconcile(targetHome, j)
+		}
 		_ = s.terminalCleanup(ctx, j)
 		return OutcomeDiscarded, nil
 	case PhaseDiscarded:
 		_ = s.terminalCleanup(ctx, j)
 		return OutcomeDiscarded, nil
 	case PhasePrepared:
+		// A first-run publish that crashed after creating the target but
+		// before writing any files leaves an empty orphaned directory.
+		// Remove it before discarding the journal so the removal is visible
+		// on a crash between removal and journal cleanup.
+		if j.TargetHomeInitiallyAbsent {
+			if err := s.removeTargetForReconcile(targetHome, j); err != nil {
+				return OutcomeRecoveryRequired, nil
+			}
+		}
 		if err := s.discardPrepared(ctx, j); err != nil {
 			return OutcomeNone, err
 		}
@@ -125,6 +142,22 @@ func (s *Service) ReconcileStartup(ctx context.Context, targetHome string) (Outc
 		}
 	}
 	return OutcomeRolledBack, nil
+}
+
+// removeTargetForReconcile safely removes an empty target directory during
+// startup reconciliation. The targetHome path is the caller-supplied path (not
+// yet canonicalized — PhasePrepared never reaches the canonicalization step).
+// Errors are returned so the caller can retain the journal for retry.
+func (s *Service) removeTargetForReconcile(targetHome string, j *Journal) error {
+	abs, err := filepath.Abs(targetHome)
+	if err != nil {
+		return fmt.Errorf("resolve target home: %w", err)
+	}
+	clean := filepath.Clean(abs)
+	if err := removeTargetIfEmpty(clean); err != nil {
+		return err
+	}
+	return nil
 }
 
 // complete promotes the journal to completed after re-verifying every target

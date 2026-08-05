@@ -2,6 +2,7 @@ package publishrecovery
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 )
@@ -175,6 +176,18 @@ func (s *Service) rollback(ctx context.Context, canon string) error {
 			return newError(KindRollbackFailed, "restoring the previous state failed")
 		}
 	}
+	// For first-run (target was created by this transaction), remove the now-
+	// empty target directory before advancing to rolled_back. This ensures the
+	// removal is committed to the journal and a crash between removal and the
+	// rolled_back write can be recovered on the next startup. If the target is
+	// non-empty (external modification), the rollback is marked failed and the
+	// journal is retained for retry.
+	if j.TargetHomeInitiallyAbsent {
+		if err := removeTargetIfEmpty(canon); err != nil {
+			s.markRollbackFailed(ctx, j)
+			return newError(KindRollbackFailed, "removing the created target home failed")
+		}
+	}
 	j.Phase = PhaseRolledBack
 	j.RollbackAttempted = true
 	j.UpdatedAt = s.stamp()
@@ -182,6 +195,40 @@ func (s *Service) rollback(ctx context.Context, canon string) error {
 		return err
 	}
 	return s.terminalCleanup(ctx, j)
+}
+
+// removeTargetIfEmpty safely removes an empty directory at the given canonical
+// path. It verifies the path exists, is a directory (not a symlink or reparse
+// point), and is empty before attempting removal. An error is returned for
+// non-empty directories (external modification) and for failed removals; only
+// a confirmed successful removal returns nil. This matches the durability
+// contract: target removal must succeed before the journal advances to a
+// terminal phase.
+func removeTargetIfEmpty(canon string) error {
+	fi, err := os.Lstat(canon)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("stat target home: %w", err)
+	}
+	if !fi.IsDir() {
+		return newError(KindExternalModification, "target home is not a directory")
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return newError(KindExternalModification, "target home is a symlink")
+	}
+	entries, err := os.ReadDir(canon)
+	if err != nil {
+		return fmt.Errorf("read target home: %w", err)
+	}
+	if len(entries) > 0 {
+		return newError(KindExternalModification, "target home is not empty")
+	}
+	if err := os.Remove(canon); err != nil {
+		return fmt.Errorf("remove target home: %w", err)
+	}
+	return nil
 }
 
 // restoreFile restores one target file from its backout entry. A previously

@@ -72,7 +72,14 @@ type Journal struct {
 	CommitMarkerPublished bool           `json:"commitMarkerPublished"`
 	BackoutManifestSHA256 string         `json:"backoutManifestSha256,omitempty"`
 	RollbackAttempted     bool           `json:"rollbackAttempted"`
-	RollbackFromPhase     *Phase         `json:"rollbackFromPhase,omitempty"`
+	// TargetHomeInitiallyAbsent records that the target CODEX_HOME directory
+	// did not exist when this transaction started (first-run). Rollback and
+	// startup reconciliation remove the (now-empty) target directory when this
+	// flag is set and all publish files have been restored to their pre-publish
+	// (absent) state, so a first-run crash never leaves an orphaned empty
+	// directory.
+	TargetHomeInitiallyAbsent bool   `json:"targetHomeInitiallyAbsent,omitempty"`
+	RollbackFromPhase         *Phase `json:"rollbackFromPhase,omitempty"`
 }
 
 var forwardPhases = map[Phase]bool{

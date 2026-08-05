@@ -1,6 +1,7 @@
 package codexlauncher
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,23 +10,26 @@ import (
 
 	"github.com/BurntSushi/toml"
 
-	"moonbridge/internal/service/codexconfig"
+	"moonbridge/internal/service/publishrecovery"
 )
 
 // codexHomeFiles are the files a codex-home may contain. auth.json is
 // conditional: it is published only when a server token is configured.
 var codexHomeFiles = []string{"config.toml", "models_catalog.json", "auth.json"}
 
-// configCommitOrder is the atomic-replace order. config.toml is committed last
-// so a partially published home is never mistaken for a committed one.
-var configCommitOrder = []string{"models_catalog.json", "auth.json", "config.toml"}
-
-// atomicWriteFile is a seam so tests can force a mid-transaction write failure
-// and exercise the rollback path.
-var atomicWriteFile = codexconfig.AtomicWrite
-
 // GenerateConfigFunc writes the codex-home files into stagingHome.
 type GenerateConfigFunc func(stagingHome string) error
+
+// homePublisher publishes staged codex-home bytes into a target home durably.
+// *publishrecovery.Service satisfies it: Publish runs the crash-journaled
+// transaction (durable journal + backout, fixed publish order, stale auth
+// removal, verification, immediate rollback on ordinary I/O failure). The
+// launcher builds the PublishInput from staging bytes and delegates the real
+// mutation of the target home to the publisher — it never touches the target
+// directly.
+type homePublisher interface {
+	Publish(ctx context.Context, in publishrecovery.PublishInput) error
+}
 
 // requiredFileSet returns the files a published home must contain. auth.json is
 // included only when a server token is configured; with an empty token it must
@@ -38,8 +42,8 @@ func requiredFileSet(requireAuth bool) []string {
 }
 
 // CreateStagingHome creates a sibling staging directory for a target codex-home.
-// The caller must remove it (defer os.RemoveAll) after PublishStaged so the
-// staged auth.json secret never survives.
+// The caller must remove it (defer os.RemoveAll) after publishing so the staged
+// auth.json secret never survives.
 func CreateStagingHome(targetHome string) (string, error) {
 	parent := filepath.Dir(targetHome)
 	if err := os.MkdirAll(parent, 0o755); err != nil {
@@ -58,123 +62,79 @@ func GenerateAndVerify(staging string, generate GenerateConfigFunc, requireAuth 
 	return verifyHome(staging, requireAuth)
 }
 
-// PublishStaged replaces the target codex-home's files with the staged ones,
-// committing config.toml last. Existing files are copied (not moved) to a
-// backout directory so the target never goes absent mid-transaction; on any
-// ordinary I/O or verification error the previous files are restored from the
-// backout. auth.json is conditional: with requireAuth=false it is not published
-// and any stale auth.json in the target is removed within the transaction (so
-// Codex never keeps using an old token), with rollback restoring it on failure.
-// Crash recovery (the desktop process dying mid-publish) is out of scope for
-// this package (Boundary 4).
-func PublishStaged(staging, targetHome string, requireAuth bool) error {
-	if err := os.MkdirAll(targetHome, 0o755); err != nil {
-		return publishFailure(err, "create target codex home failed", false, nil)
-	}
-	backout, err := os.MkdirTemp(filepath.Dir(targetHome), ".codex-home-backout-*")
+// publishStaged builds a publishrecovery.PublishInput from the staged bytes and
+// delegates the target mutation to pub. It is the shared staging→publish glue;
+// production uses the launcher's injected publisher, and tests drive a real
+// publishrecovery.Service rooted at a temp recovery dir. auth.json is
+// conditional: requireAuth=false passes no auth bytes and the publish
+// transaction removes any stale auth.json in the target (so codex never keeps
+// an old token), restoring it on rollback.
+//
+// The returned error maps a publishrecovery failure to a sanitized
+// KindConfigPublishFailed whose Details carry only logical, non-confidential
+// values (cause kind, rolledBack) — never paths, tokens, hashes, or raw bytes.
+func publishStaged(ctx context.Context, pub homePublisher, staging, targetHome string, requireAuth bool) error {
+	// publishrecovery is the sole authority for target CODEX_HOME mutation;
+	// codexlauncher never creates or touches the target directory directly.
+	in, err := publishInputFromStaging(staging, targetHome, requireAuth)
 	if err != nil {
-		return publishFailure(err, "create backout directory failed", false, nil)
+		return mapPublishError(err)
 	}
-	defer os.RemoveAll(backout)
+	err = pub.Publish(ctx, in)
+	if err == nil {
+		return nil
+	}
+	return mapPublishError(err)
+}
 
-	existed, err := backoutCopy(targetHome, backout)
+// publishInputFromStaging reads the publish target bytes from staging and
+// assembles the PublishInput for publishrecovery. auth.json is included only
+// when requireAuth is true; otherwise the publish expects auth to be absent.
+func publishInputFromStaging(staging, targetHome string, requireAuth bool) (publishrecovery.PublishInput, error) {
+	catalog, err := os.ReadFile(filepath.Join(staging, "models_catalog.json"))
 	if err != nil {
-		return publishFailure(err, "backup existing codex home files failed", false, nil)
+		return publishrecovery.PublishInput{}, fmt.Errorf("read staged models_catalog.json: %w", err)
 	}
-	if err := replaceAll(staging, targetHome, requireAuth); err != nil {
-		return publishFailure(err, "replace codex home files failed", true, restoreFromBackout(targetHome, backout, existed))
+	config, err := os.ReadFile(filepath.Join(staging, "config.toml"))
+	if err != nil {
+		return publishrecovery.PublishInput{}, fmt.Errorf("read staged config.toml: %w", err)
 	}
-	if err := verifyHome(targetHome, requireAuth); err != nil {
-		return publishFailure(err, "published codex home failed verification", true, restoreFromBackout(targetHome, backout, existed))
+	in := publishrecovery.PublishInput{
+		TargetHome:    targetHome,
+		ModelsCatalog: catalog,
+		ConfigTOML:    config,
+		AuthRequired:  requireAuth,
 	}
-	return nil
-}
-
-func publishFailure(cause error, msg string, rollbackAttempted bool, restoreErr error) error {
-	e := &Error{
-		Kind:    KindConfigPublishFailed,
-		Message: msg,
-		Details: map[string]any{
-			"cause": cause.Error(),
-		},
-	}
-	if rollbackAttempted {
-		if restoreErr != nil {
-			e.Details["rolledBack"] = false
-			e.Details["rollbackError"] = restoreErr.Error()
-		} else {
-			e.Details["rolledBack"] = true
-		}
-	}
-	return e
-}
-
-// backoutCopy copies existing target files (not moves) into backoutDir and
-// records which existed, so the target stays present throughout the publish and
-// the rollback can remove files that did not exist before.
-func backoutCopy(targetHome, backoutDir string) (map[string]bool, error) {
-	existed := make(map[string]bool, len(codexHomeFiles))
-	for _, name := range codexHomeFiles {
-		src := filepath.Join(targetHome, name)
-		data, err := os.ReadFile(src)
+	if requireAuth {
+		auth, err := os.ReadFile(filepath.Join(staging, "auth.json"))
 		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return nil, err
+			return publishrecovery.PublishInput{}, fmt.Errorf("read staged auth.json: %w", err)
 		}
-		existed[name] = true
-		if err := os.WriteFile(filepath.Join(backoutDir, name), data, 0o600); err != nil {
-			return nil, err
-		}
+		in.AuthJSON = auth
 	}
-	return existed, nil
+	return in, nil
 }
 
-func replaceAll(staging, targetHome string, requireAuth bool) error {
-	for _, name := range configCommitOrder {
-		if name == "auth.json" && !requireAuth {
-			// A token-less publish must not leave a stale auth.json behind: codex
-			// would keep using an old token. Remove it within the transaction; a
-			// rollback restores it from the backout copy.
-			if err := os.Remove(filepath.Join(targetHome, name)); err != nil && !os.IsNotExist(err) {
-				return fmt.Errorf("remove stale %s: %w", name, err)
-			}
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(staging, name))
-		if err != nil {
-			return fmt.Errorf("read staged %s: %w", name, err)
-		}
-		if err := atomicWriteFile(filepath.Join(targetHome, name), data); err != nil {
-			return fmt.Errorf("replace %s: %w", name, err)
-		}
-	}
-	return nil
-}
-
-// restoreFromBackout writes back the copied files and deletes files that did
-// not exist before the publish.
-func restoreFromBackout(targetHome, backoutDir string, existed map[string]bool) error {
-	var restoreErr error
-	for _, name := range codexHomeFiles {
-		target := filepath.Join(targetHome, name)
-		if !existed[name] {
-			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
-				restoreErr = errors.Join(restoreErr, fmt.Errorf("remove %s: %w", name, err))
-			}
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(backoutDir, name))
-		if err != nil {
-			restoreErr = errors.Join(restoreErr, fmt.Errorf("read backout %s: %w", name, err))
-			continue
-		}
-		if err := atomicWriteFile(target, data); err != nil {
-			restoreErr = errors.Join(restoreErr, fmt.Errorf("restore %s: %w", name, err))
+// mapPublishError converts a publish failure into a sanitized launcher *Error.
+// Details never carry paths, tokens, hashes, or raw error strings: the cause is
+// a publishrecovery kind string (non-confidential) when available.
+//
+// rolledBack is only set when the outcome is unambiguous:
+//   - KindRollbackFailed → rolledBack=false (rollback attempted but failed).
+//   - Any other kind → rolledBack omitted (unfinished journal, init failure,
+//     or pre-prepare failure means no rollback was attempted or the outcome
+//     cannot be determined from the error kind alone).
+func mapPublishError(cause error) error {
+	var pr *publishrecovery.Error
+	details := map[string]any{}
+	if errors.As(cause, &pr) {
+		details["cause"] = string(pr.Kind)
+		if pr.Kind == publishrecovery.KindRollbackFailed {
+			details["rolledBack"] = false
+			details["rollbackError"] = "rollback did not complete"
 		}
 	}
-	return restoreErr
+	return &Error{Kind: KindConfigPublishFailed, Message: "publish codex home files failed", Details: details}
 }
 
 // verifyHome checks the required files parse and hold the required fields, plus

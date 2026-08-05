@@ -13,6 +13,8 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+
+	"moonbridge/internal/service/publishrecovery"
 )
 
 // These tests exercise the real Windows process adapter (CreateProcess with
@@ -85,19 +87,22 @@ func waitNotAlive(t *testing.T, pid int) {
 	t.Fatalf("process %d still alive after stop", pid)
 }
 
-func newIntegrationLauncher(shim string) *Launcher {
+func newIntegrationLauncher(t *testing.T, shim string) *Launcher {
+	t.Helper()
+	pub := recoverySvcAt(t, t.TempDir(), publishrecovery.Dependencies{})
 	return New(Options{
 		Discover:            shimDiscover(shim),
 		SendCtrlBreak:       forceStopStub,
 		GracefulStopTimeout: 2 * time.Second,
 		ForceStopTimeout:    5 * time.Second,
+		Publisher:           pub,
 	})
 }
 
 func TestWindowsIntegrationLaunchStopRestartShutdown(t *testing.T) {
 	shim, _ := writeShim(t)
 	codexHome := filepath.Join(t.TempDir(), "codex-home")
-	l := newIntegrationLauncher(shim)
+	l := newIntegrationLauncher(t, shim)
 
 	st, err := l.Launch(context.Background(), testLaunchOptions(codexHome))
 	if err != nil {
@@ -155,7 +160,7 @@ func TestWindowsIntegrationWorkingDirectoryAndShimExecution(t *testing.T) {
 	}
 	t.Setenv("MOONBRIDGE_TEST_MARKER", marker)
 	codexHome := filepath.Join(t.TempDir(), "codex-home")
-	l := newIntegrationLauncher(shim)
+	l := newIntegrationLauncher(t, shim)
 
 	opts := testLaunchOptions(codexHome)
 	opts.ProjectDirectory = proj
