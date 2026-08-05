@@ -227,28 +227,9 @@ func (s *Store) ReadBackout(ctx context.Context, transactionID string, expectedS
 	if !hex64RE.MatchString(expectedSHA256) {
 		return nil, newError(KindTransactionInvalid, "expected manifest hash must be a sha256 hex")
 	}
-	// The recovery root, transaction root, and transaction directory are each
-	// verified to be real directories before any read, and their physical
-	// containment re-verified right before the manifest is read: a transaction
-	// directory swapped for a junction since creation must never be read through.
-	if err := validateManagedDirectory(s.recoveryDir); err != nil {
-		return nil, newError(KindBackoutFailed, "recovery directory is not a safe directory")
-	}
-	if err := validateManagedDirectory(s.txRoot); err != nil {
-		return nil, newError(KindBackoutFailed, "transactions root is not a safe directory")
-	}
-	txDir, err := transactionRoot(s.txRoot, transactionID)
+	txDir, err := s.validatedTxDir(transactionID)
 	if err != nil {
 		return nil, err
-	}
-	if err := validateManagedDirectory(txDir); err != nil {
-		return nil, newError(KindBackoutFailed, "transaction directory is not a safe directory")
-	}
-	if !pathWithinPhysical(s.recoveryDir, s.txRoot) {
-		return nil, newError(KindBackoutFailed, "transactions root escapes the recovery directory")
-	}
-	if !pathWithinPhysical(s.txRoot, txDir) {
-		return nil, newError(KindBackoutFailed, "transaction directory escapes the transactions root")
 	}
 	data, err := os.ReadFile(filepath.Join(txDir, backoutManifestFileName))
 	if err != nil {
@@ -288,6 +269,58 @@ func (s *Store) ReadBackout(ctx context.Context, transactionID string, expectedS
 		return nil, err
 	}
 	return &m, nil
+}
+
+// validatedTxDir verifies the recovery root, the transaction root, and the leaf
+// derived from the validated transactionID are all real directories (not
+// symlinks/junctions) with confirmed physical containment, and returns the leaf
+// path. It is the shared safety boundary for every transaction-directory read
+// (ReadBackout, ReadBackup); DeleteBackout keeps its own Lstat-based
+// idempotent-absent semantics instead.
+func (s *Store) validatedTxDir(transactionID string) (string, error) {
+	if err := ValidateTransactionID(transactionID); err != nil {
+		return "", err
+	}
+	if err := validateManagedDirectory(s.recoveryDir); err != nil {
+		return "", newError(KindBackoutFailed, "recovery directory is not a safe directory")
+	}
+	if err := validateManagedDirectory(s.txRoot); err != nil {
+		return "", newError(KindBackoutFailed, "transactions root is not a safe directory")
+	}
+	txDir, err := transactionRoot(s.txRoot, transactionID)
+	if err != nil {
+		return "", err
+	}
+	if err := validateManagedDirectory(txDir); err != nil {
+		return "", newError(KindBackoutFailed, "transaction directory is not a safe directory")
+	}
+	if !pathWithinPhysical(s.recoveryDir, s.txRoot) {
+		return "", newError(KindBackoutFailed, "transactions root escapes the recovery directory")
+	}
+	if !pathWithinPhysical(s.txRoot, txDir) {
+		return "", newError(KindBackoutFailed, "transaction directory escapes the transactions root")
+	}
+	return txDir, nil
+}
+
+// ReadBackup loads the backup bytes for a single publish target from a validated
+// transaction directory. The file must be a known publish target; its backup name
+// is derived internally from the FileID, never from a caller-supplied path.
+// Reading is idempotent and never modifies the transaction directory. An absent
+// or unreadable backup is KindBackoutFailed.
+func (s *Store) ReadBackup(ctx context.Context, transactionID string, file FileID) ([]byte, error) {
+	if backupFileNameFor(file) == "" {
+		return nil, newError(KindBackoutFailed, "unknown file id")
+	}
+	txDir, err := s.validatedTxDir(transactionID)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(filepath.Join(txDir, backupFileNameFor(file)))
+	if err != nil {
+		return nil, newError(KindBackoutFailed, "read backup file failed")
+	}
+	return data, nil
 }
 
 // DeleteBackout removes a transaction's backout directory. The recovery root,

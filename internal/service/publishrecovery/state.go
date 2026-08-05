@@ -27,6 +27,10 @@ const (
 	PhaseConfigPublished  Phase = "config_published"
 	PhaseVerified         Phase = "verified"
 	PhaseCompleted        Phase = "completed"
+	// Terminal discard state: the intermediate phase a discard journal is advanced
+	// to before its backout and journal are removed, so a crash mid-cleanup never
+	// leaves an orphaned backout (see discardAfterBackout).
+	PhaseDiscarded Phase = "discarded"
 	// Rollback phases.
 	PhaseRollbackRequired Phase = "rollback_required"
 	PhaseRolledBack       Phase = "rolled_back"
@@ -98,7 +102,7 @@ var rollbackFromAllowed = map[Phase]bool{
 	PhaseConfigPublished:  true,
 }
 
-func validPhase(p Phase) bool        { return forwardPhases[p] || rollbackPhases[p] }
+func validPhase(p Phase) bool        { return forwardPhases[p] || rollbackPhases[p] || p == PhaseDiscarded }
 func isRollbackPhase(p Phase) bool   { return rollbackPhases[p] }
 func validRollbackFrom(p Phase) bool { return rollbackFromAllowed[p] }
 
@@ -169,7 +173,7 @@ func (j *Journal) Validate() error {
 	if j.BackoutManifestSHA256 != "" && !hex64RE.MatchString(j.BackoutManifestSHA256) {
 		return newError(KindTransactionInvalid, "backout manifest hash must be a sha256 hex")
 	}
-	if j.Phase != PhasePrepared && j.BackoutManifestSHA256 == "" {
+	if j.Phase != PhasePrepared && j.Phase != PhaseDiscarded && j.BackoutManifestSHA256 == "" {
 		return newError(KindTransactionInvalid, "backout manifest hash is required after prepared")
 	}
 	return nil
@@ -206,6 +210,9 @@ func (j *Journal) expectedPublishFor() ([]FileID, bool, error) {
 	}
 	if j.RollbackFromPhase != nil {
 		return nil, false, newError(KindTransactionInvalid, "forward phase must not set rollbackFromPhase")
+	}
+	if j.Phase == PhaseDiscarded {
+		return nil, false, nil
 	}
 	return publishForForward(j.Phase)
 }

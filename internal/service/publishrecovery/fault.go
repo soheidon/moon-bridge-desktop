@@ -17,6 +17,10 @@ const (
 	FaultAfterConfigWrite     FaultPoint = "after_config_write"
 	FaultAfterConfigJournal   FaultPoint = "after_config_journal"
 	FaultAfterVerified        FaultPoint = "after_verified"
+	// FaultDuringRollback fires immediately before each target-file restore in the
+	// shared rollback helper, aborting it with the journal at rollback_required
+	// (RB1) — a simulated crash mid-rollback.
+	FaultDuringRollback FaultPoint = "during_rollback"
 )
 
 // FaultInjector lets tests inject deterministic failures at named seams. The

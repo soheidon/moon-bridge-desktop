@@ -1,6 +1,7 @@
 package publishrecovery
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -428,6 +429,54 @@ func TestValidateTimeFields(t *testing.T) {
 	if err := j.Validate(); err != nil {
 		t.Fatalf("completedAt equal to startedAt should be valid: %v", err)
 	}
+}
+
+func TestJournalValidateDiscardedPhase(t *testing.T) {
+	// Discarded is a terminal cleanup state: PublishedFiles=nil, CommitMarkerPublished=false,
+	// RollbackAttempted=false, RollbackFromPhase=nil, CompletedAt=nil, BackoutManifestSHA256 may be empty or non-empty.
+	j := &Journal{
+		SchemaVersion:         SchemaVersion,
+		TransactionID:         testTransactionID,
+		Phase:                 PhaseDiscarded,
+		StartedAt:             "2026-08-06T00:00:00Z",
+		UpdatedAt:             "2026-08-06T00:00:00Z",
+		TargetHomeFingerprint: testFingerprint(),
+		ExpectedFiles:         expectedAllFiles(),
+		AuthRequired:          true,
+	}
+	if err := j.Validate(); err != nil {
+		t.Fatalf("discarded with empty backout hash: %v", err)
+	}
+	// With a non-empty backout hash.
+	j.BackoutManifestSHA256 = strings.Repeat("e", 64)
+	if err := j.Validate(); err != nil {
+		t.Fatalf("discarded with non-empty backout hash: %v", err)
+	}
+	// Must not carry CompletedAt.
+	at := "2026-08-06T00:00:01Z"
+	j.CompletedAt = &at
+	if err := j.Validate(); asErrorKind(err) != KindTransactionInvalid {
+		t.Fatalf("discarded with completedAt: expected transaction_invalid, got %v", err)
+	}
+	j.CompletedAt = nil
+	// Must not carry RollbackFromPhase.
+	j.RollbackFromPhase = ptr(PhaseCatalogPublished)
+	if err := j.Validate(); asErrorKind(err) != KindTransactionInvalid {
+		t.Fatalf("discarded with rollbackFromPhase: expected transaction_invalid, got %v", err)
+	}
+}
+
+func TestRejectUnfinishedTreatsDiscardedAsTerminal(t *testing.T) {
+	svc := newTestService(t, Dependencies{})
+	j := journalFor(PhaseDiscarded, nil)
+	if err := svc.store.Write(context.Background(), j); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	home := canonicalHome(t, t.TempDir(), "codex-home")
+	if err := svc.Publish(context.Background(), testInput(home)); err != nil {
+		t.Fatalf("Publish after discarded: %v", err)
+	}
+	assertFile(t, home, FileConfig, testConfig)
 }
 
 func TestValidateRollbackAttemptedPhaseConsistency(t *testing.T) {

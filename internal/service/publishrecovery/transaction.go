@@ -69,11 +69,17 @@ type PublishInput struct {
 // but it keeps every write rooted at the home the journal was bound to.
 //
 // A fault-seam hit aborts Publish immediately (simulated crash) with the journal
-// at its last durable phase. A real operation failure likewise returns an error
-// with the journal at its last durable phase. IMPORTANT: immediate in-process
-// rollback on a real failure (journal rollback_required → restore from backout)
-// is implemented in Step 3D (rollback.go); until Step 3D lands, Publish must NOT
-// be connected to any production publish path. A successful publish removes the
+// at its last durable phase, to be resolved by startup reconciliation — faults
+// never trigger an in-process rollback. A real operation failure after the
+// backout exists triggers the shared in-process rollback (rollback.go) before
+// the error returns: the journal is advanced to rollback_required and the target
+// files are restored from the backout. When the rollback itself fails, the
+// returned Error carries the rollback error's kind and keeps the original publish
+// cause as a sanitized kind string in Details — raw error strings, paths,
+// hashes, and secrets are never included (R8-5). The config advance failure is
+// special-cased: when every file still matches its expectation no rollback runs
+// and the next reconciliation completes the publish. Production wiring of this
+// service into the publish path is Step 3E. A successful publish removes the
 // backout directory and the completed journal.
 func (s *Service) Publish(ctx context.Context, in PublishInput) error {
 	s.mu.Lock()
@@ -134,13 +140,13 @@ func (s *Service) Publish(ctx context.Context, in PublishInput) error {
 		return err
 	}
 	if err := s.deps.AtomicWrite(filepath.Join(canon, fileNameFor(FileModelsCatalog)), in.ModelsCatalog); err != nil {
-		return newError(KindBackoutFailed, "write models catalog failed")
+		return s.rollbackAndReturn(ctx, canon, newError(KindBackoutFailed, "write models catalog failed"))
 	}
 	if err := s.deps.Fault.Hit(FaultAfterCatalogWrite); err != nil {
 		return err
 	}
 	if err := s.advance(ctx, j, PhaseCatalogPublished, []FileID{FileModelsCatalog}, nil); err != nil {
-		return err
+		return s.rollbackAndReturn(ctx, canon, err)
 	}
 	if err := s.deps.Fault.Hit(FaultAfterCatalogJournal); err != nil {
 		return err
@@ -151,13 +157,13 @@ func (s *Service) Publish(ctx context.Context, in PublishInput) error {
 		return err
 	}
 	if err := s.applyAuth(ctx, canon, in); err != nil {
-		return err
+		return s.rollbackAndReturn(ctx, canon, err)
 	}
 	if err := s.deps.Fault.Hit(FaultAfterAuthWrite); err != nil {
 		return err
 	}
 	if err := s.advance(ctx, j, PhaseAuthPublished, []FileID{FileModelsCatalog, FileAuth}, nil); err != nil {
-		return err
+		return s.rollbackAndReturn(ctx, canon, err)
 	}
 	if err := s.deps.Fault.Hit(FaultAfterAuthJournal); err != nil {
 		return err
@@ -168,13 +174,24 @@ func (s *Service) Publish(ctx context.Context, in PublishInput) error {
 		return err
 	}
 	if err := s.deps.AtomicWrite(filepath.Join(canon, fileNameFor(FileConfig)), in.ConfigTOML); err != nil {
-		return newError(KindBackoutFailed, "write config failed")
+		return s.rollbackAndReturn(ctx, canon, newError(KindBackoutFailed, "write config failed"))
 	}
 	if err := s.deps.Fault.Hit(FaultAfterConfigWrite); err != nil {
 		return err
 	}
 	if err := s.advance(ctx, j, PhaseConfigPublished, []FileID{FileModelsCatalog, FileAuth, FileConfig}, func(j *Journal) { j.CommitMarkerPublished = true }); err != nil {
-		return err
+		// The config write itself succeeded but its journal advance failed. Whether
+		// a rollback is warranted depends on the current target state: if every
+		// file still matches its expectation (all TARGET) the journal on disk
+		// (auth_published) will be completed by the next reconciliation, so no
+		// rollback runs. Otherwise the shared rollback path classifies the files
+		// and refuses to overwrite an external modification (R8-3).
+		if ok, verr := allTarget(canon, j); verr != nil {
+			return verr
+		} else if ok {
+			return err
+		}
+		return s.rollbackAndReturn(ctx, canon, err)
 	}
 	if err := s.deps.Fault.Hit(FaultAfterConfigJournal); err != nil {
 		return err
@@ -185,10 +202,12 @@ func (s *Service) Publish(ctx context.Context, in PublishInput) error {
 		return err
 	}
 	for _, ef := range j.ExpectedFiles {
-		if ok, err := verifyTargetFile(canon, ef); err != nil {
-			return err
-		} else if !ok {
-			return newError(KindBackoutFailed, "publish verification failed")
+		ok, err := verifyTargetFile(canon, ef)
+		if err != nil {
+			return s.rollbackAndReturn(ctx, canon, err)
+		}
+		if !ok {
+			return s.rollbackAndReturn(ctx, canon, newError(KindBackoutFailed, "publish verification failed"))
 		}
 	}
 	if err := s.advance(ctx, j, PhaseVerified, []FileID{FileModelsCatalog, FileAuth, FileConfig}, nil); err != nil {
@@ -216,8 +235,30 @@ func (s *Service) Publish(ctx context.Context, in PublishInput) error {
 	return nil
 }
 
+// rollbackAndReturn runs the shared rollback helper after a real publish failure
+// and returns an error that preserves the publish cause. When the rollback
+// completes, the original cause is returned unchanged. When the rollback itself
+// fails, the returned Error carries the rollback error's kind as its primary kind
+// and keeps the publish cause as a sanitized kind string in Details — raw error
+// strings, paths, hashes, and secrets are never included (R8-5).
+func (s *Service) rollbackAndReturn(ctx context.Context, canon string, cause error) error {
+	rollbackErr := s.rollback(ctx, canon)
+	if rollbackErr == nil {
+		return cause
+	}
+	return &Error{
+		Kind:    asErrorKind(rollbackErr),
+		Message: "publish failed and rollback did not complete",
+		Details: map[string]any{
+			"publishCause":  string(asErrorKind(cause)),
+			"rollbackCause": string(asErrorKind(rollbackErr)),
+		},
+	}
+}
+
 // rejectUnfinished blocks a fresh publish while a previous transaction is not
-// terminal. A completed or rolled-back journal is a stale terminal record: the
+// terminal. A completed, rolled-back, or discarded journal is a stale terminal
+// record: the
 // single-journal slot is released only once BOTH the old backout and the old
 // journal are durably gone. If either removal fails the old journal must survive
 // and the new publish is rejected — writing a fresh prepared journal over an
@@ -231,7 +272,7 @@ func (s *Service) rejectUnfinished(ctx context.Context) error {
 		return nil
 	}
 	switch cur.Phase {
-	case PhaseCompleted, PhaseRolledBack:
+	case PhaseCompleted, PhaseRolledBack, PhaseDiscarded:
 		if err := s.store.DeleteBackout(ctx, cur.TransactionID); err != nil {
 			return newError(KindTransactionActive, "cannot start a publish while the previous transaction is not cleaned up")
 		}

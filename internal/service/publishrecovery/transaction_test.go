@@ -302,8 +302,20 @@ func TestVerifyTargetFile(t *testing.T) {
 }
 
 func TestPublishAuthRemovalDurableSeamFailure(t *testing.T) {
+	// DurableRemove fails only on the publish-time stale-auth removal. The rollback
+	// that follows (restoring absent targets) uses a healthy DurableRemove and thus
+	// completes: targets return to PREVIOUS and the journal/backout are cleaned up.
+	// Publish returns the original publish error (KindBackoutFailed) — the rollback
+	// did not fail.
+	var calls int
 	svc := newTestService(t, Dependencies{
-		DurableRemove: func(string) error { return errors.New("durable remove fault") },
+		DurableRemove: func(path string) error {
+			calls++
+			if calls == 1 {
+				return errors.New("durable remove fault")
+			}
+			return durableRemove(path)
+		},
 	})
 	home := canonicalHome(t, t.TempDir(), "codex-home")
 	stale := filepath.Join(home, fileNameFor(FileAuth))
@@ -313,21 +325,22 @@ func TestPublishAuthRemovalDurableSeamFailure(t *testing.T) {
 	in := testInput(home)
 	in.AuthRequired = false
 	in.AuthJSON = nil
-	if err := svc.Publish(context.Background(), in); asErrorKind(err) != KindBackoutFailed {
-		t.Fatalf("expected backout_failed, got %v", err)
+	err := svc.Publish(context.Background(), in)
+	if asErrorKind(err) != KindBackoutFailed {
+		t.Fatalf("expected backout_failed, got %v (kind=%s)", err, asErrorKind(err))
 	}
-	// The durable removal seam failed, so the auth_published advance never ran:
-	// the journal stays at catalog_published and the stale auth.json is untouched.
-	j, err := svc.store.Load(context.Background())
-	if err != nil {
-		t.Fatalf("Load: %v", err)
+	// Immediate rollback succeeded: journal and backout are gone.
+	j, jerr := svc.store.Load(context.Background())
+	if jerr != nil {
+		t.Fatalf("Load: %v", jerr)
 	}
-	if j == nil || j.Phase != PhaseCatalogPublished {
-		t.Fatalf("expected journal at catalog_published, got %+v", j)
+	if j != nil {
+		t.Fatalf("expected journal cleaned up after rollback, got %+v", j)
 	}
-	if _, err := os.Stat(stale); err != nil {
-		t.Fatalf("stale auth.json was removed despite the durable remove fault")
-	}
+	// All targets at PREVIOUS: catalog absent, auth=old "stale", config absent.
+	assertGone(t, filepath.Join(home, fileNameFor(FileModelsCatalog)))
+	assertFile(t, home, FileAuth, []byte("stale"))
+	assertGone(t, filepath.Join(home, fileNameFor(FileConfig)))
 }
 
 func TestPublishRejectsTargetHomeChangeBeforeMutation(t *testing.T) {
@@ -495,16 +508,22 @@ func TestNewServiceStoreShareNormalizedDependencies(t *testing.T) {
 }
 
 func TestPublishAuthRemovalParentSyncFailure(t *testing.T) {
-	// Partial success on the DurableRemove seam: os.Remove succeeds (auth.json is
-	// already gone on disk) but the parent-directory sync fails afterwards.
-	// Publish must error and the journal must stay at catalog_published — this is
-	// the W8 crash-window state that Step 3D reconciles from.
+	// Partial success on the DurableRemove seam: the publish-time stale-auth removal
+	// performs os.Remove (auth gone) but then fails the parent-directory sync.
+	// The rollback that follows restores auth from backup and removes the absent
+	// targets with a healthy DurableRemove, so it completes: all targets PREVIOUS,
+	// journal/backout gone, no rollback_failed.
+	var calls int
 	svc := newTestService(t, Dependencies{
 		DurableRemove: func(path string) error {
-			if err := os.Remove(path); err != nil {
-				return err
+			calls++
+			if calls == 1 {
+				if err := os.Remove(path); err != nil {
+					return err
+				}
+				return errors.New("simulated parent sync failure")
 			}
-			return errors.New("simulated parent sync failure")
+			return durableRemove(path)
 		},
 	})
 	home := canonicalHome(t, t.TempDir(), "codex-home")
@@ -515,26 +534,67 @@ func TestPublishAuthRemovalParentSyncFailure(t *testing.T) {
 	in := testInput(home)
 	in.AuthRequired = false
 	in.AuthJSON = nil
-	if err := svc.Publish(context.Background(), in); asErrorKind(err) != KindBackoutFailed {
-		t.Fatalf("expected backout_failed, got %v", err)
+	err := svc.Publish(context.Background(), in)
+	if asErrorKind(err) != KindBackoutFailed {
+		t.Fatalf("expected backout_failed, got %v (kind=%s)", err, asErrorKind(err))
 	}
-	// auth.json is gone (os.Remove succeeded); the journal never advanced to
-	// auth_published, so the durable record still says catalog_published with
-	// only the catalog published and config.toml never written.
-	assertGone(t, stale)
-	assertFile(t, home, FileModelsCatalog, testCatalog)
+	// Immediate rollback succeeded: journal and backout are gone.
+	j, jerr := svc.store.Load(context.Background())
+	if jerr != nil {
+		t.Fatalf("Load: %v", jerr)
+	}
+	if j != nil {
+		t.Fatalf("expected journal cleaned up after rollback, got %+v", j)
+	}
+	// All targets at PREVIOUS: catalog absent, auth restored to old "stale",
+	// config absent.
+	assertGone(t, filepath.Join(home, fileNameFor(FileModelsCatalog)))
+	assertFile(t, home, FileAuth, []byte("stale"))
 	assertGone(t, filepath.Join(home, fileNameFor(FileConfig)))
-	j, err := svc.store.Load(context.Background())
-	if err != nil {
-		t.Fatalf("Load: %v", err)
+}
+
+func TestPublishAuthRemovalFailureAndRollbackDurableRemoveFailure(t *testing.T) {
+	// DurableRemove fails persistently (both in publish and in the rollback's
+	// restore of absent targets). The publish error is KindBackoutFailed; the
+	// rollback fails, so the returned Error carries rollback_failed as the primary
+	// kind with the publish cause preserved as a sanitized kind in Details.
+	svc := newTestService(t, Dependencies{
+		DurableRemove: func(string) error { return errors.New("durable remove fault") },
+	})
+	home := canonicalHome(t, t.TempDir(), "codex-home")
+	stale := filepath.Join(home, fileNameFor(FileAuth))
+	if err := os.WriteFile(stale, []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	if j == nil || j.Phase != PhaseCatalogPublished {
-		t.Fatalf("expected journal at catalog_published, got %+v", j)
+	in := testInput(home)
+	in.AuthRequired = false
+	in.AuthJSON = nil
+	err := svc.Publish(context.Background(), in)
+	if err == nil {
+		t.Fatal("expected error")
 	}
-	if !fileIDsEqual(j.PublishedFiles, []FileID{FileModelsCatalog}) {
-		t.Fatalf("publishedFiles = %v, want [models_catalog]", j.PublishedFiles)
+	var te *Error
+	if !errors.As(err, &te) {
+		t.Fatalf("expected typed Error, got %v", err)
 	}
-	// The backout transaction is retained so Step 3D can restore from it.
+	if te.Kind != KindRollbackFailed {
+		t.Fatalf("expected rollback_failed, got %s", te.Kind)
+	}
+	// Cause details carry only sanitized kind strings.
+	if te.Details["publishCause"] != string(KindBackoutFailed) {
+		t.Fatalf("publishCause = %v, want %s", te.Details["publishCause"], KindBackoutFailed)
+	}
+	if te.Details["rollbackCause"] != string(KindRollbackFailed) {
+		t.Fatalf("rollbackCause = %v, want %s", te.Details["rollbackCause"], KindRollbackFailed)
+	}
+	// The rollback failure is recorded: journal stays at rollback_failed, backout retained.
+	j, jerr := svc.store.Load(context.Background())
+	if jerr != nil {
+		t.Fatalf("Load: %v", jerr)
+	}
+	if j == nil || j.Phase != PhaseRollbackFailed {
+		t.Fatalf("expected journal at rollback_failed, got %+v", j)
+	}
 	if _, err := os.Stat(filepath.Join(svc.store.TransactionRoot(), j.TransactionID)); err != nil {
 		t.Fatalf("backout not retained: %v", err)
 	}
