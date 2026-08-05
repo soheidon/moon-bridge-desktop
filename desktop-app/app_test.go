@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"moonbridge/internal/config"
 	"moonbridge/internal/service/gateway"
 )
 
@@ -172,6 +173,14 @@ func fixedIdentity(instanceID, token string) func() (string, string) {
 }
 
 func noopEmit(string, any) {}
+
+// scriptedDeriver returns a codexConfigDeriver that always produces the given
+// config and error — used to test Save/Launch without a live gateway HTTP fetch.
+func scriptedDeriver(cfg config.Config, err error) codexConfigDeriver {
+	return func(context.Context, *gatewaySession, config.LoadOptions) (config.Config, error) {
+		return cfg, err
+	}
+}
 
 type eventRecord struct {
 	name    string

@@ -8,12 +8,18 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 	"moonbridge/internal/logger"
+	"moonbridge/internal/service/codexlauncher"
 )
 
 //go:embed frontend/*
 var assets embed.FS
 
 func main() {
+	// CTRL_BREAK delivery helper: the launcher re-executes this binary with
+	// MOONBRIDGE_CTRL_BREAK_HELPER=1. Branch before any Wails / logger init.
+	if os.Getenv("MOONBRIDGE_CTRL_BREAK_HELPER") == "1" {
+		os.Exit(codexlauncher.RunCtrlBreakHelper())
+	}
 	// Initialize the process logger exactly once, before any gateway run starts.
 	// Re-running Init (e.g. per gateway restart) would rebuild the consume
 	// pipeline and drop registered consumers. Config log.level/log.format are

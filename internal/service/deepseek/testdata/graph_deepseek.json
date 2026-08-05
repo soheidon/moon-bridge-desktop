@@ -1,0 +1,106 @@
+{
+  "revision": "fixture-r1",
+  "resources": [
+    {
+      "kind": "provider",
+      "id": "deepseek",
+      "label": "deepseek",
+      "value": {
+        "base_url": "https://api.deepseek.com/anthropic",
+        "api_key": "******",
+        "version": "2023-06-01",
+        "protocol": "anthropic",
+        "user_agent": "moonbridge-desktop/0.1",
+        "extensions": {
+          "deepseek_v4": {
+            "enabled": true
+          }
+        }
+      }
+    },
+    {
+      "kind": "model",
+      "id": "deepseek-v4-pro",
+      "label": "deepseek-v4-pro",
+      "value": {
+        "context_window": 1000000,
+        "max_output_tokens": 384000,
+        "display_name": "DeepSeek V4 Pro",
+        "description": "DeepSeek V4 with model-specific low/high/max reasoning effort.",
+        "supports_reasoning": true,
+        "default_reasoning_level": "high",
+        "supported_reasoning_levels": [
+          { "effort": "high", "description": "High reasoning effort" },
+          { "effort": "max", "description": "Maximum reasoning effort" }
+        ],
+        "supports_reasoning_summaries": true,
+        "default_reasoning_summary": "auto",
+        "input_modalities": ["text"]
+      }
+    },
+    {
+      "kind": "model",
+      "id": "deepseek-v4-flash",
+      "label": "deepseek-v4-flash",
+      "value": {
+        "context_window": 1000000,
+        "max_output_tokens": 384000,
+        "display_name": "DeepSeek V4 Flash",
+        "description": "DeepSeek V4 with model-specific low/high/max reasoning effort.",
+        "supports_reasoning": true,
+        "default_reasoning_level": "high",
+        "supported_reasoning_levels": [
+          { "effort": "low", "description": "Low reasoning effort" },
+          { "effort": "high", "description": "High reasoning effort" },
+          { "effort": "max", "description": "Maximum reasoning effort" }
+        ],
+        "supports_reasoning_summaries": true,
+        "default_reasoning_summary": "auto",
+        "input_modalities": ["text"]
+      }
+    },
+    {
+      "kind": "provider_offer",
+      "id": "deepseek/deepseek-v4-pro",
+      "label": "deepseek/deepseek-v4-pro",
+      "value": {
+        "model": "deepseek-v4-pro",
+        "upstream_name": "deepseek-v4-pro",
+        "pricing": {
+          "input_price": 2.0,
+          "output_price": 8.0,
+          "cache_write_price": 1.0,
+          "cache_read_price": 0.2
+        }
+      }
+    },
+    {
+      "kind": "provider_offer",
+      "id": "deepseek/deepseek-v4-flash",
+      "label": "deepseek/deepseek-v4-flash",
+      "value": {
+        "model": "deepseek-v4-flash",
+        "upstream_name": "deepseek-v4-flash",
+        "pricing": {
+          "input_price": 1.0,
+          "output_price": 2.0,
+          "cache_write_price": 1.0,
+          "cache_read_price": 0.02
+        }
+      }
+    },
+    {
+      "kind": "route",
+      "id": "moonbridge",
+      "label": "Moon Bridge",
+      "value": {
+        "model": "deepseek-v4-pro",
+        "provider": "deepseek",
+        "display_name": "Moon Bridge"
+      }
+    }
+  ],
+  "validation": { "valid": true },
+  "runtime": { "status": "ok" },
+  "capabilities": { "autosave": true, "logs": true }
+}
