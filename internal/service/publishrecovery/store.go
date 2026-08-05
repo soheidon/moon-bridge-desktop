@@ -34,9 +34,16 @@ type Dependencies struct {
 	AtomicWrite func(path string, data []byte) error
 	Remove      func(path string) error
 	RemoveAll   func(path string) error
-	Now         func() time.Time
-	NewID       func() string
-	Fault       FaultInjector
+	// DurableRemove removes a file and then makes the removal durable: on Unix by
+	// fsyncing the parent directory, on Windows by relying on DeleteFile success
+	// as the usable boundary — there is no portable parent-directory sync API and
+	// full metadata persistence across power loss is not guaranteed. A crash
+	// window against a stale auth.json deletion is judged against this seam, so it
+	// must be distinct from a plain Remove.
+	DurableRemove func(path string) error
+	Now           func() time.Time
+	NewID         func() string
+	Fault         FaultInjector
 }
 
 // Store is a serializing flat-JSON store for the publish journal. Read-modify-
@@ -53,16 +60,12 @@ type Store struct {
 	deps        Dependencies
 }
 
-// NewStore builds a journal Store rooted at RecoveryDir. A missing or relative
-// root is an error (KindJournalWriteFailed). Unset dependencies default to the
-// production implementations.
-func NewStore(opts Options, deps Dependencies) (*Store, error) {
-	if opts.RecoveryDir == "" {
-		return nil, newError(KindJournalWriteFailed, "recovery dir is required")
-	}
-	if !filepath.IsAbs(opts.RecoveryDir) {
-		return nil, newError(KindJournalWriteFailed, "recovery dir must be absolute")
-	}
+// normalizeDependencies fills every unset seam with its production default. It
+// is the single place dependency defaults are resolved: NewStore normalizes
+// once and keeps the result in the Store, and Service shares the Store's
+// normalized value (transaction.go New). A zero-value Dependencies therefore
+// never reaches an operation as a nil function.
+func normalizeDependencies(deps Dependencies) Dependencies {
 	if deps.AtomicWrite == nil {
 		deps.AtomicWrite = codexconfig.AtomicWrite
 	}
@@ -71,6 +74,9 @@ func NewStore(opts Options, deps Dependencies) (*Store, error) {
 	}
 	if deps.RemoveAll == nil {
 		deps.RemoveAll = os.RemoveAll
+	}
+	if deps.DurableRemove == nil {
+		deps.DurableRemove = durableRemove
 	}
 	if deps.Now == nil {
 		deps.Now = time.Now
@@ -81,6 +87,20 @@ func NewStore(opts Options, deps Dependencies) (*Store, error) {
 	if deps.Fault == nil {
 		deps.Fault = NoopFaultInjector{}
 	}
+	return deps
+}
+
+// NewStore builds a journal Store rooted at RecoveryDir. A missing or relative
+// root is an error (KindJournalWriteFailed). Unset dependencies default to the
+// production implementations.
+func NewStore(opts Options, deps Dependencies) (*Store, error) {
+	if opts.RecoveryDir == "" {
+		return nil, newError(KindJournalWriteFailed, "recovery dir is required")
+	}
+	if !filepath.IsAbs(opts.RecoveryDir) {
+		return nil, newError(KindJournalWriteFailed, "recovery dir must be absolute")
+	}
+	deps = normalizeDependencies(deps)
 	return &Store{
 		recoveryDir: opts.RecoveryDir,
 		journalPath: filepath.Join(opts.RecoveryDir, journalFileName),

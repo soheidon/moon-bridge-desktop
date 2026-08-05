@@ -290,6 +290,57 @@ func (s *Store) ReadBackout(ctx context.Context, transactionID string, expectedS
 	return &m, nil
 }
 
+// DeleteBackout removes a transaction's backout directory. The recovery root,
+// transaction root, and the leaf derived from the validated transactionID are
+// each verified to be real directories (not symlinks/junctions), their physical
+// containment is re-confirmed, and the leaf path is confirmed to be derived from
+// the transactionID — so a directory swapped for a junction since creation is
+// never removed through, and no stray path is ever passed to RemoveAll. An
+// absent transaction root or directory is idempotent success. Callers (notably
+// transaction.go) must go through this API instead of calling RemoveAll with a
+// hand-built path, so cleanup stays behind the same reparse safety boundary as
+// CreateBackout and ReadBackout.
+func (s *Store) DeleteBackout(ctx context.Context, transactionID string) error {
+	if err := ValidateTransactionID(transactionID); err != nil {
+		return err
+	}
+	if err := validateManagedDirectory(s.recoveryDir); err != nil {
+		return newError(KindBackoutFailed, "recovery directory is not a safe directory")
+	}
+	if _, err := os.Lstat(s.txRoot); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return newError(KindBackoutFailed, "inspect transactions root failed")
+	}
+	if err := validateManagedDirectory(s.txRoot); err != nil {
+		return newError(KindBackoutFailed, "transactions root is not a safe directory")
+	}
+	if !pathWithinPhysical(s.recoveryDir, s.txRoot) {
+		return newError(KindBackoutFailed, "transactions root escapes the recovery directory")
+	}
+	txDir, err := transactionRoot(s.txRoot, transactionID)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Lstat(txDir); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return newError(KindBackoutFailed, "inspect transaction directory failed")
+	}
+	if err := validateManagedDirectory(txDir); err != nil {
+		return newError(KindBackoutFailed, "transaction directory is not a safe directory")
+	}
+	if !pathWithinPhysical(s.txRoot, txDir) {
+		return newError(KindBackoutFailed, "transaction directory escapes the transactions root")
+	}
+	if err := s.deps.RemoveAll(txDir); err != nil {
+		return newError(KindBackoutFailed, "remove transaction directory failed")
+	}
+	return nil
+}
+
 // verifyNoSurplusFiles enforces strict transaction-directory contents: the only
 // files allowed are the manifest and the backups referenced by a PreviousExists
 // entry. A backup present for an absent target, or any other stray file, means
