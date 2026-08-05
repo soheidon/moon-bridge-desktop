@@ -42,9 +42,12 @@ type Dependencies struct {
 // Store is a serializing flat-JSON store for the publish journal. Read-modify-
 // write is serialized by an internal mutex; persistence goes through the
 // injected AtomicWrite dependency so two writers never race and an invalid write
-// leaves the existing file untouched.
+// leaves the existing file untouched. recoveryDir is kept so backout creation and
+// reads can verify, level by level, that the recovery root and every directory
+// they descend into are real directories and not symlinks/junctions.
 type Store struct {
 	mu          sync.Mutex
+	recoveryDir string
 	journalPath string
 	txRoot      string
 	deps        Dependencies
@@ -79,6 +82,7 @@ func NewStore(opts Options, deps Dependencies) (*Store, error) {
 		deps.Fault = NoopFaultInjector{}
 	}
 	return &Store{
+		recoveryDir: opts.RecoveryDir,
 		journalPath: filepath.Join(opts.RecoveryDir, journalFileName),
 		txRoot:      filepath.Join(opts.RecoveryDir, transactionsDirName),
 		deps:        deps,

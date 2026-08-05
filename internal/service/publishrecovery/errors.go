@@ -11,6 +11,7 @@ const (
 	KindTransactionActive    ErrorKind = "publish_transaction_active"
 	KindRollbackRequired     ErrorKind = "publish_rollback_required"
 	KindRollbackFailed       ErrorKind = "publish_rollback_failed"
+	KindBackoutFailed        ErrorKind = "publish_backout_failed"
 	KindExternalModification ErrorKind = "publish_external_modification"
 	KindTargetHomeChanged    ErrorKind = "publish_target_home_changed"
 	KindConfigPathInvalid    ErrorKind = "publish_config_path_invalid"

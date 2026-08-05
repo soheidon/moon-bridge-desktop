@@ -3,6 +3,7 @@ package publishrecovery
 import (
 	"path/filepath"
 	"regexp"
+	"strings"
 )
 
 // uuidV4RE is the grammar a transactionID must satisfy: a canonical lowercase
@@ -55,4 +56,35 @@ func transactionRoot(base, id string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(base, id), nil
+}
+
+// pathWithin reports whether p is lexically inside root (or equals it). It is a
+// string check only and does not follow symlinks/junctions; use
+// pathWithinPhysical when the target may redirect outside root.
+func pathWithin(root, p string) bool {
+	rel, err := filepath.Rel(root, p)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+}
+
+// pathWithinPhysical reports whether a path resolves to a location inside root
+// after following symlinks/junctions. When the target itself exists it is fully
+// resolved first, so a leaf link pointing outside root is rejected even though
+// its parent is inside root; when it does not exist, only the existing ancestor
+// chain is resolved and the remainder is re-joined lexically.
+func pathWithinPhysical(root, target string) bool {
+	rootPhys, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return false
+	}
+	if targetPhys, err := filepath.EvalSymlinks(target); err == nil {
+		return pathWithin(rootPhys, targetPhys)
+	}
+	parentPhys, err := filepath.EvalSymlinks(filepath.Dir(target))
+	if err != nil {
+		return false
+	}
+	return pathWithin(rootPhys, parentPhys)
 }
