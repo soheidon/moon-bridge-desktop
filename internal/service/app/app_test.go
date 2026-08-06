@@ -490,7 +490,7 @@ func TestRunHTTPServerOnListeningPanicReleasesListener(t *testing.T) {
 		_ = runHTTPServer(context.Background(), addr,
 			http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
 			io.Discard, nil,
-			func(string) { panic("listener callback panic") })
+			func(string) error { panic("listener callback panic") })
 	}()
 	if rec := <-panicked; rec == nil {
 		t.Fatal("OnListening panic was not recovered")

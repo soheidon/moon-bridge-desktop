@@ -246,6 +246,24 @@ func (p *CaptureProxy) Pause() error {
 	}
 }
 
+// Resume returns a paused (passthrough) capture back to the capturing state
+// while keeping the same listener and relay connections. It is a no-op when
+// the proxy is already capturing/ready.
+func (p *CaptureProxy) Resume() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.state == "passthrough" {
+		p.state = "capturing"
+		p.recording.Store(true)
+		return nil
+	}
+	if p.state == "capturing" || p.state == "ready" {
+		return nil
+	}
+	return errors.New("capture is not resumable")
+}
+
+// Stop stops the capture listener while keeping the proxy reference alive.
 func (p *CaptureProxy) Stop(ctx context.Context) error {
 	p.mu.Lock()
 	server := p.server
@@ -346,56 +364,30 @@ func (p *CaptureProxy) Clear() {
 	}
 }
 
+// StateFailed reports whether the proxy has entered the failed state. It is
+// used by the owning Service to decide whether a failed operation should
+// release the proxy for replacement. It is safe to call concurrently.
+func (p *CaptureProxy) StateFailed() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.state == "failed"
+}
+
+// StateStopped reports whether the proxy's listener is stopped (after
+// StopCapture). It is used by the owning Service to decide whether a
+// stopped proxy can be auto-closed for restart. It is safe to call concurrently.
+func (p *CaptureProxy) StateStopped() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.state == "stopped"
+}
+
 // setPauseBarrierDelay is intentionally private and only used by package
 // tests to reproduce a stalled observation worker.
 func (p *CaptureProxy) setPauseBarrierDelay(delay time.Duration) {
 	p.mu.Lock()
 	p.pauseBarrierDelay = delay
 	p.mu.Unlock()
-}
-
-// ManagementHandler is mounted behind Desktop-control authentication on 38440.
-func (p *CaptureProxy) ManagementHandler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == managementPathPrefix+"status":
-			writeCaptureJSON(w, http.StatusOK, p.Status())
-		case r.Method == http.MethodGet && r.URL.Path == managementPathPrefix+"observations":
-			after := parseAfter(r.URL.Query().Get("after"))
-			items, dropped := p.Observations(after)
-			writeCaptureJSON(w, http.StatusOK, map[string]any{"observations": items, "dropped": dropped})
-		case r.Method == http.MethodPost && r.URL.Path == managementPathPrefix+"start":
-			if err := p.Start(); err != nil {
-				writeCaptureJSON(w, http.StatusConflict, map[string]string{"code": "capture_start_failed", "message": "Captureの開始に失敗しました"})
-				return
-			}
-			writeCaptureJSON(w, http.StatusAccepted, p.Status())
-		case r.Method == http.MethodPost && r.URL.Path == managementPathPrefix+"pause":
-			if err := p.Pause(); err != nil {
-				code := "capture_pause_failed"
-				if strings.Contains(err.Error(), "timeout") {
-					code = "capture_pause_drain_timeout"
-				}
-				writeCaptureJSON(w, http.StatusConflict, map[string]string{"code": code, "message": "観測の停止に失敗しました"})
-				return
-			}
-			writeCaptureJSON(w, http.StatusAccepted, p.Status())
-		case r.Method == http.MethodPost && r.URL.Path == managementPathPrefix+"stop":
-			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-			err := p.Stop(ctx)
-			cancel()
-			if err != nil {
-				writeCaptureJSON(w, http.StatusGatewayTimeout, map[string]string{"code": "capture_stop_failed", "message": "Captureの停止に失敗しました"})
-				return
-			}
-			writeCaptureJSON(w, http.StatusAccepted, p.Status())
-		case r.Method == http.MethodPost && r.URL.Path == managementPathPrefix+"clear":
-			p.Clear()
-			writeCaptureJSON(w, http.StatusOK, p.Status())
-		default:
-			http.NotFound(w, r)
-		}
-	})
 }
 
 func (p *CaptureProxy) consume() {

@@ -53,10 +53,55 @@ func RunServer(ctx context.Context, cfg config.Config, errors io.Writer) error {
 
 type RunOptions struct {
 	DesktopControl *desktopcontrol.Control
-	// OnListening is called once the HTTP listener is bound, with the
-	// resolved listen address (useful for :0). A panic here must not leak
-	// the listener.
-	OnListening func(addr string)
+	// Traffic provides the long-lived traffic analysis service surface
+	// (management handler + status snapshot). It is supplied by the desktop
+	// App so both the Gateway run and the external management API operate the
+	// same Capture proxy/state. When nil, the runTransform mounts no capture
+	// handler (management endpoints return not-found).
+	Traffic TrafficProvider
+	// OnListening is called synchronously once the HTTP listener is bound and
+	// before serving begins. Returning an error aborts startup and closes the
+	// listener; a successful callback is therefore the commit point for
+	// listener ownership.
+	OnListening func(addr string) error
+}
+
+// TrafficProvider is the narrow surface the App owns and hands to a Gateway
+// run. It keeps the Gateway and runTransform coupled to an interface rather
+// than to the concrete traffic analysis Service, so the Service instance can
+// be freely re-owned or re-bound across Gateway restarts.
+type TrafficProvider interface {
+	// ManagementHandler returns the authenticated capture management handler
+	// the desktopcontrol surface mounts once for the process.
+	ManagementHandler() http.Handler
+	// Status returns the current capture snapshot for the system status
+	// endpoint.
+	Status() trafficanalysis.State
+}
+
+// EndRunReason describes why a Gateway run ended.
+type EndRunReason string
+
+const (
+	EndRunStopped EndRunReason = "stopped" // graceful stop / restart / shutdown
+	EndRunFailed  EndRunReason = "failed"  // unexpected runtime error
+	EndRunPanic   EndRunReason = "panic"   // recovered panic
+)
+
+// TrafficLifecycle carries the callbacks a Gateway run uses to notify the
+// owning traffic Service of run start and finish events. It decouples the
+// gateway package from the concrete trafficanalysis.Service — the desktop
+// App wires the callbacks when building StartOptions. Token is never passed
+// through these callbacks.
+type TrafficLifecycle struct {
+	// BindRun is called from inside the run goroutine, before the server
+	// starts. It registers the run's identity so the Service can guard
+	// ownership transitions and detect stale run termination.
+	BindRun func(instanceID, address string) error
+	// EndRun is called when a Gateway run finishes. The reason distinguishes
+	// normal lifecycle (stopped) from abnormal termination (failed/panic).
+	// The Service only enters recovery_required for abnormal reasons.
+	EndRun func(instanceID string, reason EndRunReason)
 }
 
 func RunServerWithOptions(ctx context.Context, cfg config.Config, errors io.Writer, options RunOptions) error {
@@ -357,10 +402,11 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer, opti
 	if options.DesktopControl != nil {
 		options.DesktopControl.WithServerToken(cfg.AuthToken)
 	}
-	if options.DesktopControl != nil {
-		capture := trafficanalysis.NewCaptureProxy(trafficanalysis.CaptureConfig{InstanceID: options.DesktopControl.InstanceID})
-		options.DesktopControl.WithTrafficAnalysis(capture.ManagementHandler()).WithTrafficAnalysisStatus(func() any { return capture.Status() })
-		defer capture.Close()
+	if options.DesktopControl != nil && options.Traffic != nil {
+		// The App owns the long-lived traffic Service; runTransform only mounts
+		// its management surface. It never creates or closes the Capture proxy.
+		options.DesktopControl.WithTrafficAnalysis(options.Traffic.ManagementHandler()).
+			WithTrafficAnalysisStatus(func() any { return options.Traffic.Status() })
 	}
 	wrapped := http.Handler(handler)
 	wrapped = desktopcontrol.Wrap(wrapped, options.DesktopControl)
@@ -675,7 +721,7 @@ func captureAnthropicTraceConfig(enabled bool) mbtrace.Config {
 	}
 }
 
-func runHTTPServer(ctx context.Context, addr string, handler http.Handler, errors io.Writer, sessionStats *stats.SessionStats, onListening func(addr string)) error {
+func runHTTPServer(ctx context.Context, addr string, handler http.Handler, errors io.Writer, sessionStats *stats.SessionStats, onListening func(addr string) error) error {
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -689,7 +735,9 @@ func runHTTPServer(ctx context.Context, addr string, handler http.Handler, error
 	}()
 	resolvedAddr := listener.Addr().String()
 	if onListening != nil {
-		onListening(resolvedAddr)
+		if err := onListening(resolvedAddr); err != nil {
+			return err
+		}
 	}
 	errCh := make(chan error, 1)
 	go func() {

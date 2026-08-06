@@ -112,6 +112,7 @@ type scriptedController struct {
 	stopFn     func(ctx context.Context) error
 	startCalls int
 	stopCalls  int
+	startOpts  []gateway.StartOptions // captured from each Start call
 }
 
 func newScriptedController(state gateway.State) *scriptedController {
@@ -122,6 +123,7 @@ func (c *scriptedController) Start(ctx context.Context, opts gateway.StartOption
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.startCalls++
+	c.startOpts = append(c.startOpts, opts)
 	if c.startFn == nil {
 		st := gateway.State{
 			Status:     gateway.StatusRunning,
@@ -466,6 +468,67 @@ func TestSnapshotClearsRuntimeFieldsOnStop(t *testing.T) {
 	// ConfigPath is the last successful start and survives the stop.
 	if stop.Value.ConfigPath != cfg {
 		t.Fatalf("stopped configPath = %q, want %q", stop.Value.ConfigPath, cfg)
+	}
+}
+
+func TestTrafficServiceReusedAcrossGatewayRestarts(t *testing.T) {
+	cfg := writeCaptureAnthropicConfig(t, t.TempDir())
+	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
+	ids, allIDs := sequenceIdentity()
+	app := NewApp(AppOptions{
+		Service:     svc,
+		NewIdentity: ids,
+		ConfigPath:  cfg,
+		EmitEvents:  noopEmit,
+	})
+	defer app.shutdown(context.Background())
+
+	// First start.
+	r1 := app.StartGateway(StartGatewayRequest{})
+	if !r1.OK {
+		t.Fatalf("first StartGateway() = %#v", r1)
+	}
+	app.StopGateway(StopGatewayRequest{})
+
+	// Second start (restart).
+	r2 := app.StartGateway(StartGatewayRequest{})
+	if !r2.OK {
+		t.Fatalf("second StartGateway() = %#v", r2)
+	}
+	app.StopGateway(StopGatewayRequest{})
+
+	// Verify both Start calls received the same Traffic provider pointer.
+	if len(svc.startOpts) != 2 {
+		t.Fatalf("Start() calls = %d, want 2", len(svc.startOpts))
+	}
+	t1 := svc.startOpts[0].Traffic
+	t2 := svc.startOpts[1].Traffic
+	if t1 == nil || t2 == nil {
+		t.Fatal("Traffic is nil in StartOptions; want non-nil on both runs")
+	}
+	if t1 != t2 {
+		t.Fatal("Traffic pointer changed across restarts; want same instance")
+	}
+
+	// Verify both runs have non-nil TrafficLifecycle.
+	for i, opts := range svc.startOpts {
+		if opts.TrafficLifecycle == nil {
+			t.Fatalf("StartOpts[%d].TrafficLifecycle = nil, want non-nil", i)
+		}
+		if opts.TrafficLifecycle.BindRun == nil {
+			t.Fatalf("StartOpts[%d].TrafficLifecycle.BindRun = nil", i)
+		}
+		if opts.TrafficLifecycle.EndRun == nil {
+			t.Fatalf("StartOpts[%d].TrafficLifecycle.EndRun = nil", i)
+		}
+	}
+
+	// Verify distinct identities were injected.
+	if len(*allIDs) < 2 {
+		t.Fatalf("only %d identities generated, want 2", len(*allIDs))
+	}
+	if svc.startOpts[0].InstanceID == svc.startOpts[1].InstanceID {
+		t.Fatalf("same InstanceID across restarts: %q", svc.startOpts[0].InstanceID)
 	}
 }
 

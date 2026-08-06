@@ -17,6 +17,7 @@ import (
 	"moonbridge/internal/service/codexlauncher"
 	"moonbridge/internal/service/deepseek"
 	"moonbridge/internal/service/gateway"
+	"moonbridge/internal/service/trafficanalysis"
 )
 
 const (
@@ -144,18 +145,19 @@ type App struct {
 	codexMu          sync.Mutex // Codex terminal process
 	configMu         sync.Mutex // ユーザー実 Codex config
 	svc              gatewayController
+	traffic          *trafficanalysis.Service
 	configuredPath   string // AppOptions で指定された Start 候補
 	activeConfigPath string // 最後に成功した Start の path（snapshot にのみ表示）
 	newIdentity      func() (string, string)
 	emitEvents       func(name string, payload any)
 	closed           atomic.Bool
 
-	session      *gatewaySession
-	codex        codexController
-	codexConfig  codexConfigController
-	newDeepSeek  deepSeekFactory
-	deriveCodex  codexConfigDeriver
-	codexOp      string // current codex operation for progress events（codexMu で保護）
+	session     *gatewaySession
+	codex       codexController
+	codexConfig codexConfigController
+	newDeepSeek deepSeekFactory
+	deriveCodex codexConfigDeriver
+	codexOp     string // current codex operation for progress events（codexMu で保護）
 }
 
 type AppOptions struct {
@@ -167,6 +169,7 @@ type AppOptions struct {
 	CodexConfig codexConfigController          // nil → codexconfig.New(codexconfig.Options{})
 	NewDeepSeek deepSeekFactory                // nil → NewHTTPClient ベースの既定 factory
 	DeriveCodex codexConfigDeriver             // nil → 稼働中 Gateway の effective config から導出
+	Traffic     *trafficanalysis.Service       // nil → 長寿命 Service を新規生成・所有
 }
 
 func NewApp(opts AppOptions) *App {
@@ -192,11 +195,16 @@ func NewApp(opts AppOptions) *App {
 	if deriveCodex == nil {
 		deriveCodex = deriveCodexLive
 	}
+	traffic := opts.Traffic
+	if traffic == nil {
+		traffic = trafficanalysis.NewService()
+	}
 	appCtx, cancel := context.WithCancel(context.Background())
 	a := &App{
 		appCtx:         appCtx,
 		cancel:         cancel,
 		svc:            svc,
+		traffic:        traffic,
 		configuredPath: opts.ConfigPath,
 		newIdentity:    newIdentity,
 		emitEvents:     opts.EmitEvents,
@@ -351,6 +359,16 @@ func (a *App) startGatewayLocked(requestPath string) GatewayCommandResult {
 		InstanceID:  instanceID,
 		Token:       token,
 		ServerToken: cfg.AuthToken,
+		Traffic:     a.traffic,
+		TrafficLifecycle: &app.TrafficLifecycle{
+			BindRun: func(id, address string) error {
+				_, err := a.traffic.BindGatewayRun(id, address)
+				return err
+			},
+			EndRun: func(id string, reason app.EndRunReason) {
+				a.traffic.MarkGatewayLost(id, reason != app.EndRunStopped)
+			},
+		},
 	})
 	if err != nil {
 		return a.startError("gateway.start", err)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -242,6 +243,360 @@ func TestServiceLoggerConsumerBaseline(t *testing.T) {
 
 	if after := logger.ConsumeFuncCount(); after != before {
 		t.Fatalf("plugin consumer leaked across restarts: before=%d after=%d", before, after)
+	}
+}
+
+func TestTrafficLifecycleCallbacksFireOnStartAndFinish(t *testing.T) {
+	svc := NewService(ServiceOptions{Errors: io.Discard})
+
+	var bound []string
+	type endCall struct {
+		id     string
+		reason app.EndRunReason
+	}
+	var ended []endCall
+	lifecycle := &app.TrafficLifecycle{
+		BindRun: func(instanceID, address string) error {
+			bound = append(bound, instanceID)
+			return nil
+		},
+		EndRun: func(instanceID string, reason app.EndRunReason) {
+			ended = append(ended, endCall{id: instanceID, reason: reason})
+		},
+	}
+
+	_, err := svc.Start(context.Background(), StartOptions{
+		Config:           captureConfig(t, "127.0.0.1:0"),
+		DesktopMode:      true,
+		InstanceID:       "run-1",
+		Token:            "tok-1",
+		TrafficLifecycle: lifecycle,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if len(bound) != 1 || bound[0] != "run-1" {
+		t.Fatalf("BindRun calls = %v, want [run-1]", bound)
+	}
+	if len(ended) != 0 {
+		t.Fatalf("EndRun called before stop: %v", ended)
+	}
+
+	stopService(t, svc)
+
+	if len(ended) != 1 || ended[0].id != "run-1" {
+		t.Fatalf("EndRun calls = %v, want [run-1/stopped]", ended)
+	}
+	if ended[0].reason != app.EndRunStopped {
+		t.Fatalf("EndRun reason = %q, want stopped", ended[0].reason)
+	}
+}
+
+func TestTrafficLifecycleRestartUpdatesIdentity(t *testing.T) {
+	svc := NewService(ServiceOptions{Errors: io.Discard})
+
+	var bound []string
+	var ended []string
+	lifecycle := &app.TrafficLifecycle{
+		BindRun: func(instanceID, address string) error {
+			bound = append(bound, instanceID)
+			return nil
+		},
+		EndRun: func(instanceID string, reason app.EndRunReason) {
+			ended = append(ended, instanceID)
+		},
+	}
+
+	for _, id := range []string{"run-1", "run-2"} {
+		_, err := svc.Start(context.Background(), StartOptions{
+			Config:           captureConfig(t, "127.0.0.1:0"),
+			DesktopMode:      true,
+			InstanceID:       id,
+			Token:            "tok-" + id,
+			TrafficLifecycle: lifecycle,
+		})
+		if err != nil {
+			t.Fatalf("Start(%q) error = %v", id, err)
+		}
+		stopService(t, svc)
+	}
+
+	if len(bound) != 2 || bound[0] != "run-1" || bound[1] != "run-2" {
+		t.Fatalf("BindRun calls = %v, want [run-1 run-2]", bound)
+	}
+	if len(ended) != 2 || ended[0] != "run-1" || ended[1] != "run-2" {
+		t.Fatalf("EndRun calls = %v, want [run-1 run-2]", ended)
+	}
+}
+
+func TestTrafficLifecycleEndRunWithStaleIDIsForwarded(t *testing.T) {
+	// The Gateway always forwards EndRun with the opts.InstanceID it started
+	// with. The Service's MarkGatewayLost is responsible for stale detection.
+	svc := NewService(ServiceOptions{Errors: io.Discard})
+
+	type endCall struct {
+		id     string
+		reason app.EndRunReason
+	}
+	var ended []endCall
+	lifecycle := &app.TrafficLifecycle{
+		BindRun: func(instanceID, address string) error { return nil },
+		EndRun: func(instanceID string, reason app.EndRunReason) {
+			ended = append(ended, endCall{id: instanceID, reason: reason})
+		},
+	}
+
+	_, err := svc.Start(context.Background(), StartOptions{
+		Config:           captureConfig(t, "127.0.0.1:0"),
+		DesktopMode:      true,
+		InstanceID:       "stale-run",
+		Token:            "tok",
+		TrafficLifecycle: lifecycle,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopService(t, svc)
+
+	if len(ended) != 1 || ended[0].id != "stale-run" {
+		t.Fatalf("EndRun calls = %v, want [stale-run/stopped]", ended)
+	}
+	if ended[0].reason != app.EndRunStopped {
+		t.Fatalf("EndRun reason = %q, want stopped", ended[0].reason)
+	}
+}
+
+func TestTrafficLifecycleStartupFailureNoRecovery(t *testing.T) {
+	// A startup failure before the listener binds: BindRun is never called
+	// (it only fires after onListening), so neither BindRun nor EndRun fires.
+	// The traffic Service never enters recovery for a pre-bind failure.
+	svc := NewService(ServiceOptions{Errors: io.Discard})
+	svc.runServer = func(context.Context, config.Config, io.Writer, app.RunOptions) error {
+		return fmt.Errorf("startup boom")
+	}
+
+	var bound int
+	type endCall struct {
+		id     string
+		reason app.EndRunReason
+	}
+	var ended []endCall
+	lifecycle := &app.TrafficLifecycle{
+		BindRun: func(instanceID, address string) error {
+			bound++
+			return nil
+		},
+		EndRun: func(instanceID string, reason app.EndRunReason) {
+			ended = append(ended, endCall{id: instanceID, reason: reason})
+		},
+	}
+
+	_, err := svc.Start(context.Background(), StartOptions{
+		Config:           captureConfig(t, "127.0.0.1:0"),
+		DesktopMode:      true,
+		InstanceID:       "fail-run",
+		Token:            "tok",
+		TrafficLifecycle: lifecycle,
+	})
+	if err == nil {
+		t.Fatal("Start() error = nil, want failure")
+	}
+
+	// Give the goroutine time to finish.
+	time.Sleep(100 * time.Millisecond)
+
+	if bound != 0 {
+		t.Fatalf("BindRun calls = %d, want 0 (listener never bound)", bound)
+	}
+	if len(ended) != 0 {
+		t.Fatalf("EndRun calls = %d, want 0 (no recovery on pre-bind failure)", len(ended))
+	}
+}
+
+func TestTrafficLifecycleNormalStopReasonIsStopped(t *testing.T) {
+	svc := NewService(ServiceOptions{Errors: io.Discard})
+
+	var reasons []app.EndRunReason
+	lifecycle := &app.TrafficLifecycle{
+		BindRun: func(instanceID, address string) error { return nil },
+		EndRun: func(instanceID string, reason app.EndRunReason) {
+			reasons = append(reasons, reason)
+		},
+	}
+
+	_, err := svc.Start(context.Background(), StartOptions{
+		Config:           captureConfig(t, "127.0.0.1:0"),
+		DesktopMode:      true,
+		InstanceID:       "stop-run",
+		Token:            "tok",
+		TrafficLifecycle: lifecycle,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopService(t, svc)
+
+	if len(reasons) != 1 || reasons[0] != app.EndRunStopped {
+		t.Fatalf("EndRun reasons = %v, want [stopped]", reasons)
+	}
+}
+
+func TestTrafficLifecycleBindRunPanicIsIsolated(t *testing.T) {
+	// BindRun panics inside onListening — the listener must be closed and the
+	// startup failure must be returned without publishing a running gateway.
+	svc := NewService(ServiceOptions{Errors: io.Discard})
+
+	endCalled := make(chan bool, 1)
+	lifecycle := &app.TrafficLifecycle{
+		BindRun: func(instanceID, address string) error {
+			panic("bind callback boom")
+		},
+		EndRun: func(instanceID string, reason app.EndRunReason) {
+			endCalled <- true
+		},
+	}
+
+	st, err := svc.Start(context.Background(), StartOptions{
+		Config:           captureConfig(t, "127.0.0.1:0"),
+		DesktopMode:      true,
+		InstanceID:       "panic-bind",
+		Token:            "tok",
+		TrafficLifecycle: lifecycle,
+	})
+	if err == nil || !strings.Contains(err.Error(), "traffic bind failed") {
+		t.Fatalf("Start() error = %v, want sanitized bind failure", err)
+	}
+	if st.Status != StatusFailed {
+		t.Fatalf("Status = %v, want failed", st.Status)
+	}
+
+	// Bind never succeeded, so EndRun must not fire.
+	select {
+	case <-endCalled:
+		t.Fatal("EndRun called after BindRun panic; want no call")
+	case <-time.After(100 * time.Millisecond):
+		// expected: no EndRun since bindCalled was not set
+	}
+}
+
+func TestTrafficLifecycleBindRunErrorClosesListenerAndFailsStartup(t *testing.T) {
+	svc := NewService(ServiceOptions{Errors: io.Discard})
+	var boundAddr string
+	endCalls := 0
+	lifecycle := &app.TrafficLifecycle{
+		BindRun: func(_, address string) error {
+			boundAddr = address
+			return errors.New("injected bind rejection")
+		},
+		EndRun: func(string, app.EndRunReason) { endCalls++ },
+	}
+	st, err := svc.Start(context.Background(), StartOptions{
+		Config:           captureConfig(t, "127.0.0.1:0"),
+		DesktopMode:      true,
+		InstanceID:       "bind-error",
+		Token:            "tok",
+		TrafficLifecycle: lifecycle,
+	})
+	if err == nil || !strings.Contains(err.Error(), "traffic bind failed") {
+		t.Fatalf("Start() error = %v, want bind failure", err)
+	}
+	if st.Status != StatusFailed {
+		t.Fatalf("Start() state = %v, want failed", st.Status)
+	}
+	if endCalls != 0 {
+		t.Fatalf("EndRun calls = %d, want 0 for unsuccessful bind", endCalls)
+	}
+	if boundAddr == "" {
+		t.Fatal("BindRun did not receive resolved listener address")
+	}
+	listener, listenErr := net.Listen("tcp", boundAddr)
+	if listenErr != nil {
+		t.Fatalf("listener remained bound after callback error: %v", listenErr)
+	}
+	listener.Close()
+}
+
+func TestTrafficLifecycleBindSuccessDuringStopDoesNotPublishRunning(t *testing.T) {
+	svc := NewService(ServiceOptions{Errors: io.Discard})
+	bindEntered := make(chan struct{})
+	bindRelease := make(chan struct{})
+	endCalls := make(chan app.EndRunReason, 1)
+	lifecycle := &app.TrafficLifecycle{
+		BindRun: func(string, string) error {
+			close(bindEntered)
+			<-bindRelease
+			return nil
+		},
+		EndRun: func(_ string, reason app.EndRunReason) { endCalls <- reason },
+	}
+	startDone := make(chan error, 1)
+	go func() {
+		_, err := svc.Start(context.Background(), StartOptions{
+			Config:           captureConfig(t, "127.0.0.1:0"),
+			DesktopMode:      true,
+			InstanceID:       "race-run",
+			Token:            "tok",
+			TrafficLifecycle: lifecycle,
+		})
+		startDone <- err
+	}()
+	<-bindEntered
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- svc.Stop(context.Background()) }()
+	// Stop transitions the run to stopping before canceling the context.
+	deadline := time.After(time.Second)
+	for svc.Status().Status != StatusStopping {
+		select {
+		case <-deadline:
+			t.Fatal("gateway did not enter stopping state")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	close(bindRelease)
+	if err := <-startDone; err == nil {
+		t.Fatal("Start() error = nil, want canceled startup")
+	}
+	if err := <-stopDone; err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if got := svc.Status().Status; got == StatusRunning {
+		t.Fatal("gateway published running after stop won bind callback race")
+	}
+	select {
+	case <-endCalls:
+		// Bind succeeded, so cleanup was intentionally delivered.
+	case <-time.After(time.Second):
+		t.Fatal("successful bind did not converge through EndRun cleanup")
+	}
+}
+
+func TestTrafficLifecycleEndRunPanicIsIsolated(t *testing.T) {
+	// EndRun panics — must not prevent gateway cleanup from completing.
+	svc := NewService(ServiceOptions{Errors: io.Discard})
+
+	lifecycle := &app.TrafficLifecycle{
+		BindRun: func(instanceID, address string) error { return nil },
+		EndRun: func(instanceID string, reason app.EndRunReason) {
+			panic("end callback boom")
+		},
+	}
+
+	_, err := svc.Start(context.Background(), StartOptions{
+		Config:           captureConfig(t, "127.0.0.1:0"),
+		DesktopMode:      true,
+		InstanceID:       "panic-end",
+		Token:            "tok",
+		TrafficLifecycle: lifecycle,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	// Stop must succeed even though EndRun panics.
+	stopService(t, svc)
+	if got := svc.Status().Status; got != StatusStopped {
+		t.Fatalf("Status() after stop = %v, want stopped (EndRun panic isolated)", got)
 	}
 }
 
@@ -649,13 +1004,14 @@ func TestServiceStartCanceledClassification(t *testing.T) {
 func TestServiceOnListeningGuards(t *testing.T) {
 	svc := NewService(ServiceOptions{Errors: io.Discard})
 	run := &runState{id: 1, started: make(chan startResult, 1)}
+	opts := StartOptions{}
 
 	// A delayed onListening while stopping must not regress to running.
 	svc.mu.Lock()
 	svc.current = run
 	svc.state = State{Status: StatusStopping}
 	svc.mu.Unlock()
-	svc.onListening(run, "127.0.0.1:1234")
+	svc.onListening(run, opts, "127.0.0.1:1234")
 	if got := svc.Status().Status; got != StatusStopping {
 		t.Fatalf("Status() after stopping onListening = %v, want stopping", got)
 	}
@@ -667,7 +1023,7 @@ func TestServiceOnListeningGuards(t *testing.T) {
 	svc.mu.Lock()
 	svc.state.Status = StatusStarting
 	svc.mu.Unlock()
-	svc.onListening(run, "127.0.0.1:1234")
+	svc.onListening(run, opts, "127.0.0.1:1234")
 	st := svc.Status()
 	if st.Status != StatusRunning {
 		t.Fatalf("Status() after starting onListening = %v, want running", st.Status)
@@ -686,7 +1042,7 @@ func TestServiceOnListeningGuards(t *testing.T) {
 
 	// A stale callback from a different run must be ignored.
 	other := &runState{id: 2}
-	svc.onListening(other, "127.0.0.1:9999")
+	svc.onListening(other, opts, "127.0.0.1:9999")
 	if got := svc.Status().Addr; got != "127.0.0.1:1234" {
 		t.Fatalf("stale run mutated Addr to %q", got)
 	}

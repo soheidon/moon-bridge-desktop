@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -34,6 +35,15 @@ type StartOptions struct {
 	InstanceID  string // required when DesktopMode
 	Token       string // required when DesktopMode
 	ServerToken string // cfg.AuthToken, forwarded to /api/v1/* requests
+	// Traffic is the App-owned traffic analysis surface mounted for the run.
+	// It is forwarded into the run's app.RunOptions so runTransform mounts the
+	// same management handler/status the external API uses. May be nil.
+	Traffic app.TrafficProvider
+	// TrafficLifecycle carries the callbacks the Gateway run uses to notify
+	// the owning traffic Service of run start and finish events. The
+	// callbacks are called without the gateway lock held. Token is never
+	// forwarded through these callbacks. May be nil (no lifecycle hooks).
+	TrafficLifecycle *app.TrafficLifecycle
 }
 
 // Status is the lifecycle state of a gateway run.
@@ -83,6 +93,14 @@ type runState struct {
 
 	startupOnce sync.Once        // the startup outcome is reported exactly once
 	started     chan startResult // buffered(1)
+
+	// bindCalled is set by onListening after the listener binds successfully.
+	// It gates EndRun: EndRun is only sent when bindCalled is true, so that
+	// pre-bind failures never trigger traffic Service recovery.
+	// Uses atomic.Bool because onListening (writer) and notifyTrafficEndSafe
+	// (reader) may run on different goroutines depending on the runServer
+	// implementation.
+	bindCalled atomic.Bool
 }
 
 func (r *runState) completeStartup(state State, err error) {
@@ -166,6 +184,10 @@ func (s *Service) Start(ctx context.Context, opts StartOptions) (State, error) {
 	}
 	s.mu.Unlock()
 
+	// BindRun is called inside runGoroutine (after the goroutine starts,
+	// before the server runs) so that startup failures before the server
+	// binds do not trigger recovery. See runGoroutine.
+
 	go s.runGoroutine(run, opts)
 
 	select {
@@ -184,20 +206,55 @@ func (s *Service) Start(ctx context.Context, opts StartOptions) (State, error) {
 
 // runGoroutine owns the run's lifecycle: it recovers panics into a failed
 // state and reports the startup outcome exactly once.
+//
+// BindRun is NOT called here — it is called from onListening after the
+// listener binds successfully. This ensures that pre-bind failures (port
+// occupied, config error) never trigger BindRun or EndRun, and therefore
+// never cause the traffic Service to enter recovery.
+//
+// The defer/recover is registered before any callback-invoking code so that
+// panics in callbacks themselves are caught.
 func (s *Service) runGoroutine(run *runState, opts StartOptions) {
 	var runErr error
 	defer func() {
 		if rec := recover(); rec != nil {
 			runErr = fmt.Errorf("gateway run panic: %v", rec)
+			s.notifyTrafficEndSafe(run, opts, app.EndRunPanic)
 			s.finishRun(run, runErr)
 			run.completeStartup(s.stateSnapshot(), runErr)
 		}
 	}()
 	runErr = s.run(run, opts)
+	s.notifyTrafficEndSafe(run, opts, reasonFromError(runErr))
+	// Publish the terminal run state only after EndRun has completed. Stop
+	// waits on run.done; closing it earlier allowed a restart to begin while
+	// the previous traffic ownership callback was still mutating its state.
 	s.finishRun(run, runErr)
-	// Classify a run that ended before the listener bound. completeStartup
-	// is guarded by sync.Once, so a bind that already won stays authoritative.
 	run.completeStartup(s.classifyStartup(run, runErr))
+}
+
+// notifyTrafficEndSafe calls the TrafficLifecycle.EndRun callback only if
+// bindCalled is true (the listener bound successfully). It isolates callback
+// panics so they never propagate into the gateway cleanup path.
+func (s *Service) notifyTrafficEndSafe(run *runState, opts StartOptions, reason app.EndRunReason) {
+	if !run.bindCalled.Load() {
+		return
+	}
+	if opts.TrafficLifecycle != nil && opts.TrafficLifecycle.EndRun != nil {
+		func() {
+			defer func() { recover() }()
+			opts.TrafficLifecycle.EndRun(opts.InstanceID, reason)
+		}()
+	}
+}
+
+// reasonFromError maps a run error to an EndRunReason. A nil error means
+// the run stopped normally.
+func reasonFromError(err error) app.EndRunReason {
+	if err != nil {
+		return app.EndRunFailed
+	}
+	return app.EndRunStopped
 }
 
 // classifyStartup decides the startup outcome for a run that has finished.
@@ -221,24 +278,52 @@ func (s *Service) run(run *runState, opts StartOptions) error {
 	}
 	return s.runServer(run.ctx, opts.Config, s.opts.Errors, app.RunOptions{
 		DesktopControl: control,
-		OnListening:    func(addr string) { s.onListening(run, addr) },
+		Traffic:        opts.Traffic,
+		OnListening:    func(addr string) error { return s.onListening(run, opts, addr) },
 	})
 }
 
-// onListening transitions starting -> running, and only while the run is
-// still current and starting. A delayed callback from a stopped run (or one
-// that is already stopping) is ignored, so stopping can never regress to
-// running.
-func (s *Service) onListening(run *runState, addr string) {
+// onListening binds traffic ownership before publishing the Gateway as
+// running. The listener has already been created by app; returning an error
+// causes app to close it without starting HTTP serving.
+func (s *Service) onListening(run *runState, opts StartOptions, addr string) (err error) {
+	s.mu.Lock()
+	if s.current != run || s.state.Status != StatusStarting {
+		s.mu.Unlock()
+		return ErrStartCanceled
+	}
+	s.mu.Unlock()
+
+	// BindRun is called without the Gateway lock because the callback may
+	// acquire the traffic Service lock. A callback panic is converted into a
+	// sanitized startup error and does not count as a successful bind.
+	if opts.TrafficLifecycle != nil && opts.TrafficLifecycle.BindRun != nil {
+		err = func() (callbackErr error) {
+			defer func() {
+				if recover() != nil {
+					callbackErr = errors.New("gateway traffic bind failed")
+				}
+			}()
+			return opts.TrafficLifecycle.BindRun(opts.InstanceID, addr)
+		}()
+		if err != nil {
+			return fmt.Errorf("gateway traffic bind failed")
+		}
+	}
+
+	// The run may have been stopped while the callback was executing. A
+	// successful bind is still owned and must receive normal EndRun cleanup,
+	// but it must never publish a stale running state.
+	run.bindCalled.Store(true)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.current != run || s.state.Status != StatusStarting {
-		return
+		return ErrStartCanceled
 	}
 	s.state.Status = StatusRunning
 	s.state.Addr = addr
-	st := s.state
-	run.completeStartup(st, nil)
+	run.completeStartup(s.state, nil)
+	return nil
 }
 
 // finishRun records the terminal state and keeps the run as lastRun so that
