@@ -34,6 +34,8 @@ const (
 	KindCaptureStartSuperseded       ErrorKind = "traffic_capture_start_superseded"
 	KindGatewayMismatch              ErrorKind = "traffic_gateway_mismatch"
 	KindGatewayNotBound              ErrorKind = "traffic_gateway_not_bound"
+	KindCaptureGenerationMismatch    ErrorKind = "traffic_capture_generation_mismatch"
+	KindCaptureOperationSuperseded   ErrorKind = "traffic_capture_operation_superseded"
 	KindIntegrationManagedByDesktop  ErrorKind = "traffic_integration_managed_by_desktop"
 	KindRecoveryConfirmationRequired ErrorKind = "recovery_confirmation_required"
 )
@@ -119,6 +121,7 @@ type proxyOperation struct {
 	kind       proxyOperationKind
 	proxy      captureProxy
 	generation uint64
+	ownerID    string
 	done       chan struct{}
 }
 
@@ -152,6 +155,9 @@ type Service struct {
 	gatewayAddr string
 	listenAddr  string
 	lastError   string
+	// desktopOwnerID is private ownership evidence for the current desktop
+	// transaction. It is never included in State, errors, or logs.
+	desktopOwnerID string
 
 	// startSeq is a monotonically increasing counter used to generate unique
 	// reservation IDs for each StartCapture attempt. activeStartID records
@@ -453,6 +459,7 @@ func (s *Service) reserveProxyOperationLocked(kind proxyOperationKind, proxy cap
 		kind:       kind,
 		proxy:      proxy,
 		generation: s.generation,
+		ownerID:    s.desktopOwnerID,
 		done:       make(chan struct{}),
 	}
 	s.activeOp = op
@@ -460,7 +467,7 @@ func (s *Service) reserveProxyOperationLocked(kind proxyOperationKind, proxy cap
 }
 
 func (s *Service) ownsProxyOperationLocked(op *proxyOperation) bool {
-	return s.activeOp == op && s.proxy == op.proxy && s.generation == op.generation
+	return s.activeOp == op && s.proxy == op.proxy && s.generation == op.generation && s.desktopOwnerID == op.ownerID
 }
 
 func (s *Service) finishProxyOperationLocked(op *proxyOperation) {
@@ -622,7 +629,283 @@ func (s *Service) ClaimDesktop(gatewayInstanceID, gatewayAddress string) (State,
 		return s.snapshotLocked(), newError(KindGatewayMismatch, "gateway identity does not match the capture")
 	}
 	s.mode = ModeDesktop
+	s.desktopOwnerID = ""
 	return s.snapshotLocked(), nil
+}
+
+// ClaimDesktopExpected promotes a capture_only capture to desktop_managed
+// using a generation and Gateway identity compare-and-swap. It is additive to
+// ClaimDesktop so the existing public management contract is unchanged.
+func (s *Service) ClaimDesktopExpected(expectedGeneration uint64, gatewayInstanceID, gatewayAddress, ownerID string) (State, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closeOp != nil {
+		return State{}, newError(KindCaptureClosing, "capture close is in progress")
+	}
+	if ownerID == "" {
+		return s.snapshotLocked(), newError(KindCaptureOperationSuperseded, "desktop ownership is invalid")
+	}
+	if s.activeStartID != 0 || s.activeOp != nil {
+		return s.snapshotLocked(), newError(KindCaptureAlreadyActive, "capture operation is in progress")
+	}
+	if s.mode == ModeRecovery {
+		return s.snapshotLocked(), newError(KindRecoveryConfirmationRequired, "capture requires recovery confirmation")
+	}
+	if s.mode != ModeCaptureOnly {
+		return s.snapshotLocked(), newError(KindCaptureNotActive, "capture is not capture-only")
+	}
+	if s.generation != expectedGeneration {
+		return s.snapshotLocked(), newError(KindCaptureGenerationMismatch, "capture generation does not match")
+	}
+	if s.gatewayID != gatewayInstanceID || s.gatewayAddr != gatewayAddress {
+		return s.snapshotLocked(), newError(KindGatewayMismatch, "gateway identity does not match the capture")
+	}
+	if s.proxy == nil {
+		return State{}, newError(KindCaptureNotActive, "no capture is active")
+	}
+	if !isCapturing(s.proxy.Status().State) {
+		return s.snapshotLocked(), newError(KindCaptureNotActive, "capture is not capturing")
+	}
+	s.mode = ModeDesktop
+	s.desktopOwnerID = ownerID
+	return s.snapshotLocked(), nil
+}
+
+// ValidateCaptureExpected performs the non-mutating half of the Desktop
+// adoption CAS. It checks the same generation, identity, mode, close, start,
+// and proxy-operation guards that ClaimDesktopExpected will check again. The
+// returned State never exposes the private Desktop owner ID.
+func (s *Service) ValidateCaptureExpected(expectedGeneration uint64, gatewayInstanceID, gatewayAddress string) (State, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closeOp != nil {
+		return State{}, newError(KindCaptureClosing, "capture close is in progress")
+	}
+	if s.activeStartID != 0 || s.activeOp != nil {
+		return s.snapshotLocked(), newError(KindCaptureAlreadyActive, "capture operation is in progress")
+	}
+	if s.mode != ModeCaptureOnly {
+		return s.snapshotLocked(), newError(KindCaptureNotActive, "capture is not capture-only")
+	}
+	if s.generation != expectedGeneration {
+		return s.snapshotLocked(), newError(KindCaptureGenerationMismatch, "capture generation does not match")
+	}
+	if s.gatewayID != gatewayInstanceID || s.gatewayAddr != gatewayAddress {
+		return s.snapshotLocked(), newError(KindGatewayMismatch, "capture Gateway identity does not match")
+	}
+	if s.proxy == nil || !isCapturing(s.proxy.Status().State) {
+		return s.snapshotLocked(), newError(KindCaptureNotActive, "capture is not capturing")
+	}
+	return s.snapshotLocked(), nil
+}
+
+// ValidateCaptureOnlyExpected verifies the non-desktop, passthrough side of
+// the Disable final CAS without exposing the private owner ID.
+func (s *Service) ValidateCaptureOnlyExpected(expectedGeneration uint64, gatewayInstanceID, gatewayAddress, expectedListener string) (State, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closeOp != nil {
+		return State{}, newError(KindCaptureClosing, "capture close is in progress")
+	}
+	if s.activeStartID != 0 || s.activeOp != nil {
+		return s.snapshotLocked(), newError(KindCaptureAlreadyActive, "capture operation is in progress")
+	}
+	if s.mode != ModeCaptureOnly || s.desktopOwnerID != "" || s.generation != expectedGeneration || s.gatewayID != gatewayInstanceID || s.gatewayAddr != gatewayAddress {
+		return s.snapshotLocked(), newError(KindGatewayMismatch, "capture ownership evidence does not match")
+	}
+	if s.proxy == nil {
+		return s.snapshotLocked(), newError(KindCaptureNotActive, "no capture is active")
+	}
+	ps := s.proxy.Status()
+	if ps.State != "passthrough" || ps.CaptureAddress != expectedListener {
+		return s.snapshotLocked(), newError(KindCaptureNotActive, "capture is not in passthrough")
+	}
+	return s.snapshotLocked(), nil
+}
+
+// ValidateIdleExpected verifies that CloseCapture completed the relay teardown
+// and that no proxy, listener, or operation remains. CloseCapture advances the
+// generation when it commits the idle state, so the expected value is the
+// generation observed before Finish began.
+func (s *Service) ValidateIdleExpected(expectedGeneration uint64) (State, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closeOp != nil {
+		return State{}, newError(KindCaptureClosing, "capture close is in progress")
+	}
+	if s.activeStartID != 0 || s.activeOp != nil {
+		return s.snapshotLocked(), newError(KindCaptureAlreadyActive, "capture operation is in progress")
+	}
+	if s.mode != ModeIdle || s.proxy != nil || s.listenAddr != "" || s.desktopOwnerID != "" || s.generation <= expectedGeneration {
+		return s.snapshotLocked(), newError(KindCaptureNotActive, "capture is not fully idle")
+	}
+	if s.gatewayID != "" || s.gatewayAddr != "" {
+		return s.snapshotLocked(), newError(KindGatewayMismatch, "idle capture retains gateway identity")
+	}
+	return s.snapshotLocked(), nil
+}
+
+// ValidateDesktopOwnershipExpected is a private-owner evidence check for the
+// transaction coordinator. It returns only a boolean and never exposes the
+// owner ID through State, errors, logs, or bindings.
+func (s *Service) ValidateDesktopOwnershipExpected(expectedGeneration uint64, gatewayInstanceID, gatewayAddress, ownerID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closeOp != nil || s.activeStartID != 0 || s.activeOp != nil || ownerID == "" {
+		return false
+	}
+	if s.mode != ModeDesktop || s.desktopOwnerID != ownerID || s.generation != expectedGeneration {
+		return false
+	}
+	if s.gatewayID != gatewayInstanceID || s.gatewayAddr != gatewayAddress || s.proxy == nil {
+		return false
+	}
+	return isCapturing(s.proxy.Status().State)
+}
+
+// ValidateDesktopIntegrationExpected atomically validates the complete live
+// Traffic ownership evidence under the Service mutex. It is the final
+// transaction success gate; callers must not combine separate Status and
+// owner reads for this decision.
+func (s *Service) ValidateDesktopIntegrationExpected(expectedGeneration uint64, gatewayInstanceID, gatewayAddress, ownerID, expectedListener string) (State, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closeOp != nil {
+		return State{}, newError(KindCaptureClosing, "capture close is in progress")
+	}
+	if s.activeStartID != 0 || s.activeOp != nil {
+		return s.snapshotLocked(), newError(KindCaptureAlreadyActive, "capture operation is in progress")
+	}
+	if s.mode != ModeDesktop || s.desktopOwnerID == "" || s.desktopOwnerID != ownerID {
+		return s.snapshotLocked(), newError(KindCaptureOperationSuperseded, "desktop ownership was superseded")
+	}
+	if s.generation != expectedGeneration {
+		return s.snapshotLocked(), newError(KindCaptureGenerationMismatch, "capture generation does not match")
+	}
+	if s.gatewayID != gatewayInstanceID || s.gatewayAddr != gatewayAddress {
+		return s.snapshotLocked(), newError(KindGatewayMismatch, "capture Gateway identity does not match")
+	}
+	if s.proxy == nil {
+		return s.snapshotLocked(), newError(KindCaptureNotActive, "no capture is active")
+	}
+	ps := s.proxy.Status()
+	if !isCapturing(ps.State) || ps.CaptureAddress != expectedListener {
+		return s.snapshotLocked(), newError(KindCaptureNotActive, "capture listener or state does not match")
+	}
+	return s.snapshotLocked(), nil
+}
+
+// ValidateDesktopPassthroughExpected atomically validates the paused side of
+// the Disable transaction while retaining the private Desktop owner.
+func (s *Service) ValidateDesktopPassthroughExpected(expectedGeneration uint64, gatewayInstanceID, gatewayAddress, ownerID, expectedListener string) (State, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closeOp != nil {
+		return State{}, newError(KindCaptureClosing, "capture close is in progress")
+	}
+	if s.activeStartID != 0 || s.activeOp != nil {
+		return s.snapshotLocked(), newError(KindCaptureAlreadyActive, "capture operation is in progress")
+	}
+	if s.mode != ModeDesktop || s.desktopOwnerID == "" || s.desktopOwnerID != ownerID {
+		return s.snapshotLocked(), newError(KindCaptureOperationSuperseded, "desktop ownership was superseded")
+	}
+	if s.generation != expectedGeneration {
+		return s.snapshotLocked(), newError(KindCaptureGenerationMismatch, "capture generation does not match")
+	}
+	if s.gatewayID != gatewayInstanceID || s.gatewayAddr != gatewayAddress {
+		return s.snapshotLocked(), newError(KindGatewayMismatch, "capture Gateway identity does not match")
+	}
+	if s.proxy == nil {
+		return State{}, newError(KindCaptureNotActive, "no capture is active")
+	}
+	ps := s.proxy.Status()
+	if ps.State != "passthrough" || ps.CaptureAddress != expectedListener {
+		return s.snapshotLocked(), newError(KindCaptureNotActive, "capture is not in passthrough")
+	}
+	return s.snapshotLocked(), nil
+}
+
+// PauseDesktopExpected pauses observation while retaining desktop ownership.
+// The public PauseCapture path continues to reject desktop_managed captures;
+// this method is the narrowly-scoped transaction primitive for Disable.
+func (s *Service) PauseDesktopExpected(ctx context.Context, expectedGeneration uint64, gatewayInstanceID, gatewayAddress, ownerID string) (State, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return State{}, err
+		}
+		s.mu.Lock()
+		if s.closeOp != nil {
+			s.mu.Unlock()
+			return State{}, newError(KindCaptureClosing, "capture close is in progress")
+		}
+		if ownerID == "" || s.desktopOwnerID != ownerID {
+			s.mu.Unlock()
+			return State{}, newError(KindCaptureOperationSuperseded, "desktop ownership was superseded")
+		}
+		if s.activeStartID != 0 || s.activeOp != nil {
+			s.mu.Unlock()
+			return State{}, newError(KindCaptureAlreadyActive, "capture operation is in progress")
+		}
+		if s.mode == ModeRecovery {
+			s.mu.Unlock()
+			return State{}, newError(KindRecoveryConfirmationRequired, "capture requires recovery confirmation")
+		}
+		if s.mode != ModeDesktop {
+			st := s.snapshotLocked()
+			s.mu.Unlock()
+			return st, newError(KindIntegrationManagedByDesktop, "capture is not desktop-managed")
+		}
+		if s.generation != expectedGeneration {
+			st := s.snapshotLocked()
+			s.mu.Unlock()
+			return st, newError(KindCaptureGenerationMismatch, "capture generation does not match")
+		}
+		if s.gatewayID != gatewayInstanceID || s.gatewayAddr != gatewayAddress {
+			st := s.snapshotLocked()
+			s.mu.Unlock()
+			return st, newError(KindGatewayMismatch, "gateway identity does not match the capture")
+		}
+		if s.proxy == nil {
+			s.mu.Unlock()
+			return State{}, newError(KindCaptureNotActive, "no capture is active")
+		}
+		proxy := s.proxy
+		proxyState := proxy.Status().State
+		if proxyState == "passthrough" {
+			st := s.snapshotLocked()
+			s.mu.Unlock()
+			return st, nil
+		}
+		if !isCapturing(proxyState) {
+			st := s.snapshotLocked()
+			s.mu.Unlock()
+			return st, newError(KindCaptureNotActive, "capture is not capturing")
+		}
+		op := s.reserveProxyOperationLocked(proxyOperationPause, proxy)
+		s.mu.Unlock()
+
+		pauseErr := proxy.Pause()
+
+		s.mu.Lock()
+		ownsOperation := s.ownsProxyOperationLocked(op)
+		if ownsOperation && pauseErr != nil {
+			s.mode = ModeRecovery
+			s.lastError = "capture pause failed"
+		}
+		if ownsOperation {
+			s.finishProxyOperationLocked(op)
+			st := s.snapshotLocked()
+			s.mu.Unlock()
+			if pauseErr != nil {
+				return st, newError(KindCaptureStopFailed, "capture pause failed")
+			}
+			return st, nil
+		}
+		st := s.snapshotLocked()
+		s.finishProxyOperationLocked(op)
+		s.mu.Unlock()
+		return st, newError(KindCaptureOperationSuperseded, "capture pause was superseded")
+	}
 }
 
 // ReleaseDesktop returns an active desktop-managed capture to the caller's
@@ -642,6 +925,40 @@ func (s *Service) ReleaseDesktop(next ManagementMode) (State, error) {
 	default:
 		return s.snapshotLocked(), newError(KindCaptureNotActive, "invalid release target mode")
 	}
+	s.desktopOwnerID = ""
+	return s.snapshotLocked(), nil
+}
+
+// ReleaseDesktopExpected returns desktop ownership to capture_only without
+// touching the proxy, listener, generation, identity, or observations. The
+// expected generation and owner ID prevent a stale transaction from releasing
+// a newer Desktop ownership. Idle is reached only through CloseCapture.
+func (s *Service) ReleaseDesktopExpected(expectedGeneration uint64, ownerID string) (State, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closeOp != nil {
+		return State{}, newError(KindCaptureClosing, "capture close is in progress")
+	}
+	if ownerID == "" || s.desktopOwnerID != ownerID {
+		return s.snapshotLocked(), newError(KindCaptureOperationSuperseded, "desktop ownership was superseded")
+	}
+	if s.activeStartID != 0 || s.activeOp != nil {
+		return s.snapshotLocked(), newError(KindCaptureAlreadyActive, "capture operation is in progress")
+	}
+	if s.mode != ModeDesktop {
+		return s.snapshotLocked(), newError(KindCaptureNotActive, "capture is not desktop-managed")
+	}
+	if s.generation != expectedGeneration {
+		return s.snapshotLocked(), newError(KindCaptureGenerationMismatch, "capture generation does not match")
+	}
+	if s.proxy == nil {
+		return State{}, newError(KindCaptureNotActive, "no capture is active")
+	}
+	if ownerID == "" || s.desktopOwnerID != ownerID {
+		return s.snapshotLocked(), newError(KindCaptureOperationSuperseded, "desktop ownership was superseded")
+	}
+	s.mode = ModeCaptureOnly
+	s.desktopOwnerID = ""
 	return s.snapshotLocked(), nil
 }
 
@@ -666,6 +983,7 @@ func (s *Service) ClearRecovery(next ManagementMode) (State, error) {
 	switch next {
 	case ModeIdle, ModeCaptureOnly:
 		s.mode = next
+		s.desktopOwnerID = ""
 	default:
 		return s.snapshotLocked(), newError(KindCaptureNotActive, "invalid recovery target mode")
 	}

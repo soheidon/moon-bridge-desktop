@@ -670,6 +670,322 @@ func TestReleaseDesktopReturnsToChosenModeWithoutStopping(t *testing.T) {
 	}
 }
 
+func TestClaimDesktopExpectedChangesOnlyModeAndNeverRestarts(t *testing.T) {
+	var proxy *fakeProxy
+	svc := newService(func(cfg CaptureConfig) captureProxy {
+		proxy = newFakeProxy(cfg)
+		return proxy
+	})
+	before := svcBindAndStart(t, svc)
+	claimed, err := svc.ClaimDesktopExpected(before.Generation, "gateway-1", "127.0.0.1:38440", "owner-a")
+	if err != nil {
+		t.Fatalf("ClaimDesktopExpected() error = %v", err)
+	}
+	if claimed.Mode != ModeDesktop || claimed.Generation != before.Generation || claimed.GatewayInstanceID != before.GatewayInstanceID || claimed.GatewayAddress != before.GatewayAddress || claimed.ListeningAddress != before.ListeningAddress || claimed.CaptureState != before.CaptureState {
+		t.Fatalf("ClaimDesktopExpected changed more than mode: before=%+v after=%+v", before, claimed)
+	}
+	proxy.mu.Lock()
+	startCalls := proxy.startCalls
+	proxy.mu.Unlock()
+	if startCalls != 1 {
+		t.Fatalf("CaptureProxy.Start calls = %d, want 1 total and 0 for claim", startCalls)
+	}
+}
+
+func TestClaimDesktopExpectedRejectsGenerationAndIdentityWithoutMutation(t *testing.T) {
+	svc := NewService()
+	before := svcBindAndStart(t, svc)
+	mustErrKind(t, func() error {
+		_, err := svc.ClaimDesktopExpected(before.Generation+1, "gateway-1", "127.0.0.1:38440", "owner-a")
+		return err
+	}(), KindCaptureGenerationMismatch)
+	mustErrKind(t, func() error {
+		_, err := svc.ClaimDesktopExpected(before.Generation, "other", "127.0.0.1:38440", "owner-a")
+		return err
+	}(), KindGatewayMismatch)
+	after := svc.Status()
+	if after.Mode != ModeCaptureOnly || after.Generation != before.Generation || after.GatewayInstanceID != before.GatewayInstanceID || after.ListeningAddress != before.ListeningAddress {
+		t.Fatalf("failed expected claims changed state: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestClaimDesktopExpectedRejectsWhileCloseIsInProgress(t *testing.T) {
+	var proxy *fakeProxy
+	svc := newService(func(cfg CaptureConfig) captureProxy {
+		proxy = newFakeProxy(cfg)
+		return proxy
+	})
+	before := svcBindAndStart(t, svc)
+	proxy.closeEntered = make(chan struct{})
+	proxy.closeRelease = make(chan struct{})
+	closeDone := make(chan error, 1)
+	go func() {
+		_, err := svc.CloseCapture(context.Background())
+		closeDone <- err
+	}()
+	select {
+	case <-proxy.closeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("CloseCapture did not reach fake proxy")
+	}
+	mustErrKind(t, func() error {
+		_, err := svc.ClaimDesktopExpected(before.Generation, "gateway-1", "127.0.0.1:38440", "owner-a")
+		return err
+	}(), KindCaptureClosing)
+	close(proxy.closeRelease)
+	if err := <-closeDone; err != nil {
+		t.Fatalf("CloseCapture error = %v", err)
+	}
+}
+
+func TestPauseDesktopExpectedPreservesOwnershipAndExternalGuard(t *testing.T) {
+	svc := NewService()
+	claimed := svcBindAndStart(t, svc)
+	claimed, err := svc.ClaimDesktopExpected(claimed.Generation, "gateway-1", "127.0.0.1:38440", "owner-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	paused, err := svc.PauseDesktopExpected(context.Background(), claimed.Generation, "gateway-1", "127.0.0.1:38440", "owner-a")
+	if err != nil {
+		t.Fatalf("PauseDesktopExpected() error = %v", err)
+	}
+	if paused.Mode != ModeDesktop || paused.CaptureState != "passthrough" || paused.Generation != claimed.Generation || paused.GatewayInstanceID != claimed.GatewayInstanceID || paused.ListeningAddress != claimed.ListeningAddress {
+		t.Fatalf("unexpected paused state: %+v", paused)
+	}
+	mustErrKind(t, func() error {
+		_, err := svc.PauseCapture(context.Background())
+		return err
+	}(), KindIntegrationManagedByDesktop)
+}
+
+func TestPauseDesktopExpectedFailureEntersRecovery(t *testing.T) {
+	var proxy *fakeProxy
+	svc := newService(func(cfg CaptureConfig) captureProxy {
+		proxy = newFakeProxy(cfg)
+		proxy.pauseErr = errors.New("injected pause failure")
+		return proxy
+	})
+	st := svcBindAndStart(t, svc)
+	st, err := svc.ClaimDesktopExpected(st.Generation, "gateway-1", "127.0.0.1:38440", "owner-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := svc.PauseDesktopExpected(context.Background(), st.Generation, "gateway-1", "127.0.0.1:38440", "owner-a")
+	mustErrKind(t, err, KindCaptureStopFailed)
+	if got.Mode != ModeRecovery || got.GatewayInstanceID != "gateway-1" || got.CaptureState != "capturing" {
+		t.Fatalf("pause failure state = %+v", got)
+	}
+}
+
+func TestPauseDesktopExpectedStaleCompletionDoesNotMutateReplacement(t *testing.T) {
+	var proxy *fakeProxy
+	svc := newService(func(cfg CaptureConfig) captureProxy {
+		proxy = newFakeProxy(cfg)
+		return proxy
+	})
+	st := svcBindAndStart(t, svc)
+	st, err := svc.ClaimDesktopExpected(st.Generation, "gateway-1", "127.0.0.1:38440", "owner-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy.pauseEntered = make(chan struct{})
+	proxy.pauseRelease = make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		_, err := svc.PauseDesktopExpected(context.Background(), st.Generation, "gateway-1", "127.0.0.1:38440", "owner-a")
+		result <- err
+	}()
+	select {
+	case <-proxy.pauseEntered:
+	case <-time.After(time.Second):
+		t.Fatal("PauseDesktopExpected did not reach fake proxy")
+	}
+	replacement := newFakeProxy(CaptureConfig{ListenAddr: "127.0.0.1:38441"})
+	replacement.st.State = "capturing"
+	svc.mu.Lock()
+	oldOp := svc.activeOp
+	svc.activeOp = nil
+	svc.proxy = replacement
+	svc.generation++
+	svc.mode = ModeDesktop
+	svc.gatewayID = "gateway-new"
+	svc.gatewayAddr = "127.0.0.1:48440"
+	svc.lastError = "replacement-state"
+	svc.desktopOwnerID = "owner-b"
+	svc.mu.Unlock()
+	close(proxy.pauseRelease)
+	if err := <-result; errorKind(err) != KindCaptureOperationSuperseded {
+		t.Fatalf("stale pause error = %v, want operation superseded", err)
+	}
+	svc.mu.Lock()
+	if svc.activeOp != nil || oldOp == nil {
+		t.Fatalf("stale pause left operation state: active=%v old=%v", svc.activeOp, oldOp)
+	}
+	svc.mu.Unlock()
+	current := svc.Status()
+	if current.Mode != ModeDesktop || current.GatewayInstanceID != "gateway-new" || current.GatewayAddress != "127.0.0.1:48440" || current.LastError != "replacement-state" || current.ListeningAddress != "127.0.0.1:38441" {
+		t.Fatalf("stale pause mutated replacement state: %+v", current)
+	}
+}
+
+func TestExpectedOwnershipMutationsRejectActivePauseOperation(t *testing.T) {
+	var proxy *fakeProxy
+	svc := newService(func(cfg CaptureConfig) captureProxy {
+		proxy = newFakeProxy(cfg)
+		return proxy
+	})
+	st := svcBindAndStart(t, svc)
+	claimed, err := svc.ClaimDesktopExpected(st.Generation, "gateway-1", "127.0.0.1:38440", "owner-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy.pauseEntered = make(chan struct{})
+	proxy.pauseRelease = make(chan struct{})
+	pauseDone := make(chan error, 1)
+	go func() {
+		_, err := svc.PauseDesktopExpected(context.Background(), claimed.Generation, "gateway-1", "127.0.0.1:38440", "owner-a")
+		pauseDone <- err
+	}()
+	select {
+	case <-proxy.pauseEntered:
+	case <-time.After(time.Second):
+		t.Fatal("PauseDesktopExpected did not reach fake proxy")
+	}
+	mustErrKind(t, func() error { _, err := svc.ReleaseDesktopExpected(claimed.Generation, "owner-a"); return err }(), KindCaptureAlreadyActive)
+	mustErrKind(t, func() error {
+		_, err := svc.ClaimDesktopExpected(claimed.Generation, "gateway-1", "127.0.0.1:38440", "owner-a")
+		return err
+	}(), KindCaptureAlreadyActive)
+	close(proxy.pauseRelease)
+	if err := <-pauseDone; err != nil {
+		t.Fatalf("PauseDesktopExpected error = %v", err)
+	}
+}
+
+func TestReleaseDesktopExpectedChangesOnlyMode(t *testing.T) {
+	svc := NewService()
+	st := svcBindAndStart(t, svc)
+	claimed, err := svc.ClaimDesktopExpected(st.Generation, "gateway-1", "127.0.0.1:38440", "owner-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	released, err := svc.ReleaseDesktopExpected(claimed.Generation, "owner-a")
+	if err != nil {
+		t.Fatalf("ReleaseDesktopExpected() error = %v", err)
+	}
+	if released.Mode != ModeCaptureOnly || released.Generation != claimed.Generation || released.GatewayInstanceID != claimed.GatewayInstanceID || released.ListeningAddress != claimed.ListeningAddress || released.CaptureState != claimed.CaptureState {
+		t.Fatalf("release changed more than mode: claimed=%+v released=%+v", claimed, released)
+	}
+}
+
+func TestReleaseDesktopExpectedRejectsStaleGeneration(t *testing.T) {
+	svc := NewService()
+	st := svcBindAndStart(t, svc)
+	if _, err := svc.ClaimDesktopExpected(st.Generation, "gateway-1", "127.0.0.1:38440", "owner-a"); err != nil {
+		t.Fatal(err)
+	}
+	mustErrKind(t, func() error {
+		_, err := svc.ReleaseDesktopExpected(st.Generation+1, "owner-a")
+		return err
+	}(), KindCaptureGenerationMismatch)
+	if current := svc.Status(); current.Mode != ModeDesktop {
+		t.Fatalf("stale release changed ownership: %+v", current)
+	}
+}
+
+func TestStaleDesktopReleaseCannotClearNewOwner(t *testing.T) {
+	svc := NewService()
+	st := svcBindAndStart(t, svc)
+	if _, err := svc.ClaimDesktopExpected(st.Generation, "gateway-1", "127.0.0.1:38440", "owner-a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.ReleaseDesktopExpected(st.Generation, "owner-a"); err != nil {
+		t.Fatalf("owner A release error = %v", err)
+	}
+	if _, err := svc.ClaimDesktopExpected(st.Generation, "gateway-1", "127.0.0.1:38440", "owner-b"); err != nil {
+		t.Fatalf("owner B claim error = %v", err)
+	}
+	mustErrKind(t, func() error {
+		_, err := svc.ReleaseDesktopExpected(st.Generation, "owner-a")
+		return err
+	}(), KindCaptureOperationSuperseded)
+	if current := svc.Status(); current.Mode != ModeDesktop {
+		t.Fatalf("stale owner A release changed owner B mode: %+v", current)
+	}
+	mustErrKind(t, func() error {
+		_, err := svc.PauseDesktopExpected(context.Background(), st.Generation, "gateway-1", "127.0.0.1:38440", "owner-a")
+		return err
+	}(), KindCaptureOperationSuperseded)
+	if current := svc.Status(); current.Mode != ModeDesktop || current.CaptureState != "capturing" {
+		t.Fatalf("stale owner A pause changed owner B state: %+v", current)
+	}
+}
+
+func TestDesktopOwnerIsPrivateAndRecoveryPreservesThenClearsIt(t *testing.T) {
+	svc := NewService()
+	st := svcBindAndStart(t, svc)
+	if _, err := svc.ClaimDesktopExpected(st.Generation, "gateway-1", "127.0.0.1:38440", "owner-secret"); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(svc.Status())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "owner-secret") {
+		t.Fatalf("desktop owner leaked into State JSON: %s", encoded)
+	}
+	if _, err := svc.MarkRecovery(); err != nil {
+		t.Fatal(err)
+	}
+	svc.mu.Lock()
+	if svc.desktopOwnerID != "owner-secret" {
+		t.Fatalf("Recovery cleared owner ID before explicit recovery: %q", svc.desktopOwnerID)
+	}
+	svc.mu.Unlock()
+	if _, err := svc.ClearRecovery(ModeCaptureOnly); err != nil {
+		t.Fatal(err)
+	}
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+	if svc.desktopOwnerID != "" {
+		t.Fatalf("ClearRecovery retained desktop owner ID: %q", svc.desktopOwnerID)
+	}
+}
+
+func TestExpectedOwnershipMutationsRejectCloseInProgress(t *testing.T) {
+	var proxy *fakeProxy
+	svc := newService(func(cfg CaptureConfig) captureProxy {
+		proxy = newFakeProxy(cfg)
+		return proxy
+	})
+	st := svcBindAndStart(t, svc)
+	proxy.closeEntered = make(chan struct{})
+	proxy.closeRelease = make(chan struct{})
+	closeDone := make(chan error, 1)
+	go func() {
+		_, err := svc.CloseCapture(context.Background())
+		closeDone <- err
+	}()
+	select {
+	case <-proxy.closeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("CloseCapture did not reach fake proxy")
+	}
+	mustErrKind(t, func() error {
+		_, err := svc.ClaimDesktopExpected(st.Generation, "gateway-1", "127.0.0.1:38440", "owner-a")
+		return err
+	}(), KindCaptureClosing)
+	mustErrKind(t, func() error {
+		_, err := svc.PauseDesktopExpected(context.Background(), st.Generation, "gateway-1", "127.0.0.1:38440", "owner-a")
+		return err
+	}(), KindCaptureClosing)
+	mustErrKind(t, func() error { _, err := svc.ReleaseDesktopExpected(st.Generation, "owner-a"); return err }(), KindCaptureClosing)
+	close(proxy.closeRelease)
+	if err := <-closeDone; err != nil {
+		t.Fatalf("CloseCapture error = %v", err)
+	}
+}
+
 func TestRecoveryMarksExplicitAndNeverAutoClears(t *testing.T) {
 	svc := NewService()
 	svcBindAndStart(t, svc)
