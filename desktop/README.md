@@ -1,6 +1,6 @@
 # Moon Bridge Desktop
 
-Moon Bridge Desktop is a thin Tauri shell around the existing Go Moon Bridge
+Moon Bridge Desktop is a Wails/Go desktop shell around the existing Go Moon Bridge
 gateway. The UI currently includes the DeepSeek routing card and a Windows-only
 Codex launcher.
 
@@ -10,9 +10,7 @@ From `desktop/`:
 
 ```powershell
 npm install
-..\scripts\build-desktop-sidecar.ps1
-npm run build:web
-npm run tauri:dev
+npm run build:wails
 ```
 
 Codex launcher prerequisites:
@@ -27,11 +25,7 @@ selected directory is passed as the process working directory; it is not
 embedded in a shell command string.
 
 `npm run build` and `npm run build:web` validate and build the web frontend.
-Use `npm run build:desktop` for the distributable Tauri application after the
-Go sidecar has been built.
-
-The sidecar is kept outside the repository's normal Go binary output because
-Tauri requires a target-triple suffix under `src-tauri/binaries/`.
+Use `npm run build:wails` before running the Wails build from `desktop-app/`.
 
 The initial provider scope is intentionally limited to DeepSeek. The card
 configures the DeepSeek V4 Pro or V4 Flash model and routes the fixed
@@ -74,3 +68,14 @@ can fail when the Desktop-managed Gateway is no longer available.
 - Codex installation and authentication are not managed by Desktop.
 - Multiple named Codex sessions, session history, and embedded terminals are
   outside the current scope.
+
+## Stored API keys
+
+API keys saved through the DeepSeek card are encrypted with Windows DPAPI for
+the current Windows user before they are written to the SQLite store. The key
+is only decrypted in memory when the Gateway builds a provider client; it is
+never returned to the UI, API, logs, or errors. Because encryption is tied to
+the current user, copying the database to another PC or another Windows user
+will make stored keys unusable — re-enter the key (or use the
+`DEEPSEEK_API_KEY` environment variable) after such a move. On non-Windows
+platforms stored keys are not supported; use the environment variable instead.

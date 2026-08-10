@@ -94,3 +94,56 @@ func TestStoreWriteNormalizationFailureKeepsOldState(t *testing.T) {
 		t.Fatal("rejected write must not alter the persisted state")
 	}
 }
+
+// stripVerbatimPrefix converts the two Windows extended-length forms that denote
+// an ordinary file — `\\?\C:\...` and `\\?\UNC\server\share\...` — back to their
+// canonical DOS/UNC spelling. These are pure string checks valid on every OS.
+func TestStripVerbatimPrefixDrive(t *testing.T) {
+	got := stripVerbatimPrefix(`\\?\C:\Users\sohei\.codex\config.toml`)
+	want := `C:\Users\sohei\.codex\config.toml`
+	if got != want {
+		t.Fatalf("strip = %q, want %q", got, want)
+	}
+}
+
+func TestStripVerbatimPrefixUNCPreservesShare(t *testing.T) {
+	got := stripVerbatimPrefix(`\\?\UNC\server\share\config.toml`)
+	want := `\\server\share\config.toml`
+	if got != want {
+		t.Fatalf("strip = %q, want %q", got, want)
+	}
+}
+
+func TestStripVerbatimPrefixUNCMatchesCaseInsensitively(t *testing.T) {
+	got := stripVerbatimPrefix(`\\?\unc\server\share\config.toml`)
+	want := `\\server\share\config.toml`
+	if got != want {
+		t.Fatalf("strip = %q, want %q", got, want)
+	}
+}
+
+func TestStripVerbatimPrefixLeavesOrdinaryPaths(t *testing.T) {
+	for _, p := range []string{
+		`C:\Users\sohei\.codex\config.toml`,
+		`config.toml`,
+		`./config.toml`,
+		`/home/sohei/.codex/config.toml`,
+		``,
+	} {
+		if got := stripVerbatimPrefix(p); got != p {
+			t.Fatalf("strip(%q) = %q, want unchanged", p, got)
+		}
+	}
+}
+
+func TestStripVerbatimPrefixLeavesUnsupportedNamespaces(t *testing.T) {
+	for _, p := range []string{
+		`\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\config.toml`,
+		`\\?\pipe\moonbridge`,
+		`\\.\pipe\moonbridge`,
+	} {
+		if got := stripVerbatimPrefix(p); got != p {
+			t.Fatalf("strip(%q) = %q, want unchanged", p, got)
+		}
+	}
+}

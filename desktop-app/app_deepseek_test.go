@@ -22,12 +22,19 @@ type scriptedDeepSeek struct {
 	snapshot    *deepseek.Snapshot
 	loadErr     error
 	saveErr     error
+	clearErr    error
 	validateErr error
+	testResult  deepseek.ConnectionTestResult
+	testErr     error
 }
 
 func (d *scriptedDeepSeek) Load(context.Context) (*deepseek.Snapshot, error) { return d.snapshot, d.loadErr }
 func (d *scriptedDeepSeek) Save(context.Context, deepseek.Input) (*deepseek.Snapshot, error) {
 	return d.snapshot, d.saveErr
+}
+func (d *scriptedDeepSeek) Clear(context.Context) (*deepseek.Snapshot, error) { return d.snapshot, d.clearErr }
+func (d *scriptedDeepSeek) TestProvider(context.Context) (deepseek.ConnectionTestResult, error) {
+	return d.testResult, d.testErr
 }
 func (d *scriptedDeepSeek) Validate(deepseek.Input) error { return d.validateErr }
 
@@ -70,6 +77,7 @@ func (c *scriptedController) setStatus(st gateway.State) {
 // ---- Load ----
 
 func TestLoadDeepSeekSettingsGatewayNotRunning(t *testing.T) {
+	t.Setenv("DEEPSEEK_API_KEY", "")
 	cfg := writeCaptureAnthropicConfig(t, t.TempDir())
 	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
 	app := NewApp(AppOptions{
@@ -80,18 +88,20 @@ func TestLoadDeepSeekSettingsGatewayNotRunning(t *testing.T) {
 	})
 	defer app.shutdown(context.Background())
 
+	// While stopped, Load reads the persisted config directly so the UI can
+	// still show the saved key state; an empty config resolves none/missing.
 	res := app.LoadDeepSeekSettings()
-	if res.OK {
-		t.Fatalf("LoadDeepSeekSettings() ok=true, want false: %#v", res)
+	if !res.OK || res.Error != nil {
+		t.Fatalf("LoadDeepSeekSettings() = %#v, want an ok stopped-state snapshot", res)
 	}
-	if res.Value != nil {
-		t.Fatalf("LoadDeepSeekSettings() value=%#v, want nil", res.Value)
+	if res.Value.DeepSeek == nil {
+		t.Fatalf("LoadDeepSeekSettings() value=%#v, want a DeepSeek snapshot", res.Value)
 	}
-	if res.Error == nil || res.Error.Code != "deepseek_gateway_not_running" {
-		t.Fatalf("LoadDeepSeekSettings() error=%#v, want deepseek_gateway_not_running", res.Error)
+	if res.Value.DeepSeek.GatewayRunning || res.Value.DeepSeek.ProviderExists {
+		t.Fatalf("stopped snapshot must not report running/existing: %#v", res.Value.DeepSeek)
 	}
-	if res.Error.Stage != "gateway_check" {
-		t.Fatalf("LoadDeepSeekSettings() stage=%q, want gateway_check", res.Error.Stage)
+	if res.Value.DeepSeek.CredentialSource != "none" || res.Value.DeepSeek.CredentialState != "missing" {
+		t.Fatalf("empty stopped config must resolve none/missing, got %q/%q", res.Value.DeepSeek.CredentialSource, res.Value.DeepSeek.CredentialState)
 	}
 }
 
@@ -119,8 +129,11 @@ func TestLoadDeepSeekSettingsStaleSessionCleared(t *testing.T) {
 	svc.setStatus(gateway.State{Status: gateway.StatusRunning, Addr: "127.0.0.1:38440", PID: os.Getpid(), InstanceID: "inst-OTHER"})
 
 	res := app.LoadDeepSeekSettings()
-	if res.OK || res.Error == nil || res.Error.Code != "deepseek_gateway_not_running" {
-		t.Fatalf("LoadDeepSeekSettings() = %#v, want deepseek_gateway_not_running", res)
+	if !res.OK || res.Error != nil {
+		t.Fatalf("LoadDeepSeekSettings() = %#v, want an ok stopped-state snapshot", res)
+	}
+	if res.Value.DeepSeek == nil || res.Value.DeepSeek.GatewayRunning {
+		t.Fatalf("LoadDeepSeekSettings() value=%#v, want a stopped-state DeepSeek snapshot", res.Value)
 	}
 	if app.session != nil {
 		t.Fatal("stale session not cleared")
@@ -569,5 +582,124 @@ func TestDesktopEnvelopeAndNoSecretInSnapshot(t *testing.T) {
 	}
 	if strings.Contains(string(bdata), `"value"`) {
 		t.Fatalf("error envelope carries a value: %s", bdata)
+	}
+}
+
+// ---- TestDeepSeekConnection ----
+
+func TestDeepSeekConnectionSuccess(t *testing.T) {
+	cfg := writeCaptureAnthropicConfig(t, t.TempDir())
+	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
+	app := NewApp(AppOptions{
+		Service:     svc,
+		NewIdentity: fixedIdentity("inst-1", "token-1"),
+		ConfigPath:  cfg,
+		EmitEvents:  noopEmit,
+		NewDeepSeek: func(_, _ string) deepSeekController {
+			return &scriptedDeepSeek{testResult: deepseek.ConnectionTestResult{
+				Success: true, Code: "ok", Message: "connection succeeded",
+				Model: "claude-sonnet-20241022", Duration: "120ms",
+			}}
+		},
+	})
+	defer app.shutdown(context.Background())
+	if !app.StartGateway(StartGatewayRequest{}).OK {
+		t.Fatal("StartGateway() not ok")
+	}
+
+	res := app.TestDeepSeekConnection("op-1")
+	if !res.OK || res.Error != nil {
+		t.Fatalf("TestDeepSeekConnection() = %#v, want ok with nil error", res)
+	}
+	v := res.Value
+	if v == nil {
+		t.Fatal("value = nil")
+	}
+	if v.ConnectionTestOperationID != "op-1" {
+		t.Fatalf("operationId = %q, want op-1", v.ConnectionTestOperationID)
+	}
+	if v.ConnectionTest == nil {
+		t.Fatal("result = nil")
+	}
+	if !v.ConnectionTest.OK || v.ConnectionTest.Code != "ok" {
+		t.Fatalf("result = %+v, want ok/code ok", *v.ConnectionTest)
+	}
+	if v.ConnectionTest.Message != "connection succeeded" || v.ConnectionTest.Model != "claude-sonnet-20241022" {
+		t.Fatalf("result = %+v, want message/model echoed", *v.ConnectionTest)
+	}
+	if !v.ConnectionGatewayLeftRunning {
+		t.Fatal("gatewayLeftRunning = false, want true (probe must not stop the gateway)")
+	}
+	if v.ConnectionGatewaySnapshot == nil {
+		t.Fatal("gatewaySnapshot = nil, want a live snapshot")
+	}
+	if v.ConnectionTestWarning == nil {
+		t.Fatal("warning = nil, want an empty warning slot")
+	}
+
+	// The structured DTO must never carry a key, a token, or a raw error body.
+	data, err := json.Marshal(res)
+	if err != nil {
+		t.Fatalf("Marshal error = %v", err)
+	}
+	for _, forbidden := range []string{"sk-", "token-1", "Bearer", "x-api-key", "invalid api key"} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("connection test result leaked %q: %s", forbidden, data)
+		}
+	}
+}
+
+func TestDeepSeekConnectionGatewayNotRunning(t *testing.T) {
+	cfg := writeCaptureAnthropicConfig(t, t.TempDir())
+	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
+	app := NewApp(AppOptions{
+		Service:     svc,
+		NewIdentity: fixedIdentity("inst-1", "token-1"),
+		ConfigPath:  cfg,
+		EmitEvents:  noopEmit,
+	})
+	defer app.shutdown(context.Background())
+
+	res := app.TestDeepSeekConnection("op-1")
+	if res.OK {
+		t.Fatalf("TestDeepSeekConnection() ok=true while stopped, want false")
+	}
+	if res.Value != nil {
+		t.Fatalf("value = %#v, want nil", res.Value)
+	}
+	if res.Error == nil || res.Error.Code != "deepseek_gateway_not_running" {
+		t.Fatalf("error = %#v, want deepseek_gateway_not_running", res.Error)
+	}
+}
+
+func TestDeepSeekConnectionTransportError(t *testing.T) {
+	cfg := writeCaptureAnthropicConfig(t, t.TempDir())
+	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
+	app := NewApp(AppOptions{
+		Service:     svc,
+		NewIdentity: fixedIdentity("inst-1", "token-1"),
+		ConfigPath:  cfg,
+		EmitEvents:  noopEmit,
+		NewDeepSeek: func(_, _ string) deepSeekController {
+			return &scriptedDeepSeek{testErr: errors.New("management api unreachable")}
+		},
+	})
+	defer app.shutdown(context.Background())
+	if !app.StartGateway(StartGatewayRequest{}).OK {
+		t.Fatal("StartGateway() not ok")
+	}
+
+	res := app.TestDeepSeekConnection("op-1")
+	if res.OK {
+		t.Fatal("TestDeepSeekConnection() ok=true, want false")
+	}
+	if res.Value != nil {
+		t.Fatalf("value = %#v, want nil", res.Value)
+	}
+	if res.Error == nil || res.Error.Code != "deepseek_test_failed" {
+		t.Fatalf("error = %#v, want deepseek_test_failed", res.Error)
+	}
+	if strings.Contains(res.Error.Message, "management api unreachable") {
+		t.Fatalf("error message leaked transport detail: %q", res.Error.Message)
 	}
 }

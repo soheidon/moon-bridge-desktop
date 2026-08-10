@@ -2,6 +2,7 @@ package trafficanalysis
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"sync"
 
@@ -36,6 +37,7 @@ const (
 	KindGatewayNotBound              ErrorKind = "traffic_gateway_not_bound"
 	KindCaptureGenerationMismatch    ErrorKind = "traffic_capture_generation_mismatch"
 	KindCaptureOperationSuperseded   ErrorKind = "traffic_capture_operation_superseded"
+	KindModelMappingInvalid          ErrorKind = "traffic_model_mapping_invalid"
 	KindIntegrationManagedByDesktop  ErrorKind = "traffic_integration_managed_by_desktop"
 	KindRecoveryConfirmationRequired ErrorKind = "recovery_confirmation_required"
 )
@@ -64,16 +66,20 @@ func newError(kind ErrorKind, message string) error {
 // State is a thread-safe external snapshot of the Service. It never carries
 // secrets (opts.GatewayToken), absolute paths, hashes, or raw relay bodies.
 type State struct {
-	Generation          uint64         `json:"generation"`
-	Mode                ManagementMode `json:"mode"`
-	CaptureState        string         `json:"captureState"`
-	GatewayInstanceID   string         `json:"gatewayInstanceId,omitempty"`
-	GatewayAddress      string         `json:"gatewayAddress,omitempty"`
-	ListeningAddress    string         `json:"listeningAddress,omitempty"`
-	ObservationCount    uint64         `json:"observationCount"`
-	DroppedObservations uint64         `json:"droppedObservations"`
-	LastError           string         `json:"lastError,omitempty"`
-	Operation           OperationState `json:"operation,omitempty"`
+	Generation           uint64         `json:"generation"`
+	Mode                 ManagementMode `json:"mode"`
+	CaptureState         string         `json:"captureState"`
+	GatewayInstanceID    string         `json:"gatewayInstanceId,omitempty"`
+	GatewayAddress       string         `json:"gatewayAddress,omitempty"`
+	ListeningAddress     string         `json:"listeningAddress,omitempty"`
+	ObservationCount     uint64         `json:"observationCount"`
+	ObservationCapacity  uint64         `json:"observationCapacity"`
+	HTTPRequests         uint64         `json:"httpRequests"`
+	SSEStreams           uint64         `json:"sseStreams"`
+	WebSocketConnections uint64         `json:"websocketConnections"`
+	DroppedObservations  uint64         `json:"droppedObservations"`
+	LastError            string         `json:"lastError,omitempty"`
+	Operation            OperationState `json:"operation,omitempty"`
 }
 
 // captureProxy is the narrow seam used by Service. Production uses the real
@@ -125,6 +131,49 @@ type proxyOperation struct {
 	done       chan struct{}
 }
 
+// modelMapping is process-local routing evidence. It is intentionally not
+// part of State or any persisted recovery representation.
+type modelMapping struct {
+	sourceModel    string
+	sourceBound    bool
+	targetRoute    string
+	generation     uint64
+	gatewayID      string
+	gatewayAddress string
+	ownerID        string
+}
+
+// modelMappingDiag is a secret-free tri-state observation of the mapping
+// guards. It exists only for diagnostic logging and never feeds back into
+// resolution. Model names, target aliases, and config contents are never
+// rendered; each field is "true", "false", or "n/a" (not evaluable).
+type modelMappingDiag struct {
+	mappingPresent    string // "true"/"false"
+	sourceState       string // "unbound"/"bound"/"n/a"
+	sourceModelMatch  string // "true"/"false"/"n/a"
+	generationMatch   string // "true"/"false"/"n/a"
+	gatewayMatch      string // "true"/"false"/"n/a"
+	relayActive       string // "true"/"false"/"n/a"
+	ownerMatch        string // "true"/"false"/"n/a"
+	lazyBindAttempted string // "true"/"false"/"n/a"
+	lazyBindSuccess   string // "true"/"false"/"n/a"
+}
+
+const (
+	triNA      = "n/a"
+	triTrue    = "true"
+	triFalse   = "false"
+	triUnbound = "unbound"
+	triBound   = "bound"
+)
+
+func boolToTri(b bool) string {
+	if b {
+		return triTrue
+	}
+	return triFalse
+}
+
 // StartOptions describe one Capture start. Gateway identity (instance ID,
 // address) is never carried in StartOptions — it is always set via
 // BindGatewayRun before StartCapture is called. GatewayToken is used only in
@@ -158,6 +207,7 @@ type Service struct {
 	// desktopOwnerID is private ownership evidence for the current desktop
 	// transaction. It is never included in State, errors, or logs.
 	desktopOwnerID string
+	modelMapping   *modelMapping
 
 	// startSeq is a monotonically increasing counter used to generate unique
 	// reservation IDs for each StartCapture attempt. activeStartID records
@@ -211,6 +261,10 @@ func (s *Service) snapshotLocked() State {
 		st.CaptureState = normalizeCaptureState(ps.State)
 		st.ListeningAddress = ps.CaptureAddress
 		st.ObservationCount = ps.ObservationCount
+		st.ObservationCapacity = ps.ObservationCapacity
+		st.HTTPRequests = ps.HTTPRequests
+		st.SSEStreams = ps.SSEStreams
+		st.WebSocketConnections = ps.WebSocketConnections
 		st.DroppedObservations = ps.DroppedObservations
 	}
 	return st
@@ -278,6 +332,7 @@ func (s *Service) StartCapture(opts StartOptions) (State, error) {
 				// Proxy is stopped (after StopCapture): reserve the restart.
 				old := s.proxy
 				s.proxy = nil
+				s.modelMapping = nil
 				s.activeStartID = myStartID
 				s.mu.Unlock()
 				_ = old.Close()
@@ -335,6 +390,7 @@ func (s *Service) StartCapture(opts StartOptions) (State, error) {
 		}
 		s.proxy = proxy
 		s.generation++
+		s.modelMapping = nil
 		s.mode = ModeCaptureOnly
 		s.listenAddr = cfg.ListenAddr
 		s.lastError = ""
@@ -381,6 +437,7 @@ func (s *Service) CloseCapture(ctx context.Context) (State, error) {
 			if s.activeStartID != 0 {
 				s.activeStartID = 0
 				s.generation++
+				s.modelMapping = nil
 			}
 			s.gatewayID = ""
 			s.gatewayAddr = ""
@@ -396,6 +453,10 @@ func (s *Service) CloseCapture(ctx context.Context) (State, error) {
 			done:       make(chan struct{}),
 		}
 		s.closeOp = op
+		// Close invalidates routing evidence immediately. If proxy cleanup fails
+		// and the service enters recovery, no request may use a closing relay's
+		// stale model mapping.
+		s.modelMapping = nil
 		s.mu.Unlock()
 
 		// CaptureProxy.Close has its own bounded cleanup timeout. It must not use
@@ -411,6 +472,7 @@ func (s *Service) CloseCapture(ctx context.Context) (State, error) {
 		} else if s.proxy == op.proxy && s.generation == op.generation {
 			s.proxy = nil
 			s.generation++
+			s.modelMapping = nil
 			s.activeStartID = 0
 			s.mode = ModeIdle
 			s.gatewayID = ""
@@ -962,6 +1024,195 @@ func (s *Service) ReleaseDesktopExpected(expectedGeneration uint64, ownerID stri
 	return s.snapshotLocked(), nil
 }
 
+// SetDesktopModelMappingExpected registers the target and ownership evidence
+// for one owned Traffic relay as an unbound (pending) mapping. The exact source
+// model is lazily bound from the first observed relay request; the sourceModel
+// argument is informational and not stored. The mapping is accepted only after
+// all current generation, Gateway identity, and Desktop ownership evidence
+// matches.
+func (s *Service) SetDesktopModelMappingExpected(expectedGeneration uint64, gatewayInstanceID, gatewayAddress, ownerID, sourceModel, targetRoute string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if targetRoute == "" || ownerID == "" {
+		return newError(KindModelMappingInvalid, "model mapping is invalid")
+	}
+	if s.closeOp != nil || s.activeStartID != 0 || s.activeOp != nil {
+		return newError(KindCaptureOperationSuperseded, "capture operation is in progress")
+	}
+	if s.mode != ModeDesktop || s.desktopOwnerID != ownerID {
+		return newError(KindCaptureOperationSuperseded, "desktop ownership was superseded")
+	}
+	if s.generation != expectedGeneration {
+		return newError(KindCaptureGenerationMismatch, "capture generation does not match")
+	}
+	if s.gatewayID != gatewayInstanceID || s.gatewayAddr != gatewayAddress {
+		return newError(KindGatewayMismatch, "gateway identity does not match the capture")
+	}
+	if s.proxy == nil || !isCapturing(s.proxy.Status().State) {
+		return newError(KindCaptureNotActive, "capture is not capturing")
+	}
+	if s.modelMapping != nil {
+		// Pending registrations carry no source, so redeclaration is compared
+		// on identity and target only; the source is lazily bound later.
+		if s.modelMapping.targetRoute == targetRoute && s.modelMapping.generation == expectedGeneration &&
+			s.modelMapping.gatewayID == gatewayInstanceID && s.modelMapping.gatewayAddress == gatewayAddress &&
+			s.modelMapping.ownerID == ownerID {
+			return nil
+		}
+		return newError(KindCaptureOperationSuperseded, "model mapping is already claimed")
+	}
+	s.modelMapping = &modelMapping{
+		sourceBound: false, targetRoute: targetRoute, generation: expectedGeneration,
+		gatewayID: gatewayInstanceID, gatewayAddress: gatewayAddress, ownerID: ownerID,
+	}
+	return nil
+}
+
+// ClearDesktopModelMappingExpected clears the process-local mapping during a
+// transaction backout. It is idempotent for an absent mapping, but refuses to
+// clear a mapping belonging to another generation, Gateway, or owner.
+func (s *Service) ClearDesktopModelMappingExpected(expectedGeneration uint64, gatewayInstanceID, gatewayAddress, ownerID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.modelMapping == nil {
+		return nil
+	}
+	m := s.modelMapping
+	if m.generation != expectedGeneration || m.gatewayID != gatewayInstanceID || m.gatewayAddress != gatewayAddress || m.ownerID != ownerID {
+		return newError(KindCaptureOperationSuperseded, "model mapping ownership was superseded")
+	}
+	s.modelMapping = nil
+	return nil
+}
+
+// modelMappingDiagnosticLocked renders the mapping guard states as tri-state
+// strings. It must be called with s.mu held. It is read-only observational:
+// its output never influences ModelMappingFor's own decision.
+func (s *Service) modelMappingDiagnosticLocked(sourceModel string) modelMappingDiag {
+	d := modelMappingDiag{
+		mappingPresent:    triFalse,
+		sourceState:       triNA,
+		sourceModelMatch:  triNA,
+		generationMatch:   triNA,
+		gatewayMatch:      triNA,
+		relayActive:       triNA,
+		ownerMatch:        triNA,
+		lazyBindAttempted: triNA,
+		lazyBindSuccess:   triNA,
+	}
+	m := s.modelMapping
+	if m == nil {
+		return d
+	}
+	d.mappingPresent = triTrue
+	if m.sourceBound {
+		d.sourceState = triBound
+		d.sourceModelMatch = boolToTri(m.sourceModel == sourceModel)
+	} else {
+		d.sourceState = triUnbound
+	}
+	d.generationMatch = boolToTri(m.generation == s.generation)
+	d.gatewayMatch = boolToTri(m.gatewayID == s.gatewayID && m.gatewayAddress == s.gatewayAddr)
+	if s.proxy != nil {
+		state := s.proxy.Status().State
+		relayOK := state == "capturing" || state == "passthrough"
+		if s.mode == ModeCaptureOnly {
+			relayOK = state == "passthrough"
+		}
+		d.relayActive = boolToTri(relayOK)
+	} else {
+		d.relayActive = triFalse
+	}
+	if s.mode == ModeDesktop {
+		d.ownerMatch = boolToTri(s.desktopOwnerID == m.ownerID)
+	}
+	return d
+}
+
+// logMappingDiag renders the secret-free tri-state routing diagnostic. It
+// contains no model names, target aliases, gateway identities, or URLs.
+func logMappingDiag(d modelMappingDiag) {
+	log.Printf("traffic model routing: mapping_present=%s source_state=%s source_model_match=%s generation_match=%s gateway_match=%s relay_active=%s owner_match=%s lazy_bind_attempted=%s lazy_bind_success=%s",
+		d.mappingPresent, d.sourceState, d.sourceModelMatch, d.generationMatch, d.gatewayMatch, d.relayActive, d.ownerMatch, d.lazyBindAttempted, d.lazyBindSuccess)
+}
+
+// mappingExactMatchLocked returns the target route for an exact source match on
+// a bound mapping. It must be called with s.mu held and mirrors the relay
+// contract: Desktop requires owner match, CaptureOnly requires passthrough.
+func (s *Service) mappingExactMatchLocked(sourceModel string) (string, bool) {
+	m := s.modelMapping
+	if sourceModel == "" || m == nil || !m.sourceBound || m.sourceModel != sourceModel ||
+		m.generation != s.generation || m.gatewayID != s.gatewayID ||
+		m.gatewayAddress != s.gatewayAddr || s.proxy == nil {
+		return "", false
+	}
+	state := s.proxy.Status().State
+	switch s.mode {
+	case ModeDesktop:
+		if s.desktopOwnerID != m.ownerID {
+			return "", false
+		}
+	case ModeCaptureOnly:
+		if state != "passthrough" {
+			return "", false
+		}
+	default:
+		return "", false
+	}
+	if state != "capturing" && state != "passthrough" {
+		return "", false
+	}
+	return m.targetRoute, true
+}
+
+// ModelMappingFor returns a target route only for an active exact mapping.
+// It is an in-process read surface for the Gateway resolver; model names are
+// never included in public Traffic state, recovery JSON, or logs.
+func (s *Service) ModelMappingFor(sourceModel string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	logMappingDiag(s.modelMappingDiagnosticLocked(sourceModel))
+	return s.mappingExactMatchLocked(sourceModel)
+}
+
+// ObservedModelFor routes an observed request model through the active relay
+// mapping. On an unbound (pending) mapping it lazily binds the first request
+// that provably traversed the Capture relay — relayMarker must equal the owning
+// Gateway instance ID — while capturing. On a bound mapping it only ever exact
+// matches, in capturing or passthrough, and never rebinds. The first request is
+// resolved within the same call so it is never a 404-then-success.
+func (s *Service) ObservedModelFor(sourceModel, relayMarker string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m := s.modelMapping
+	if m == nil {
+		logMappingDiag(s.modelMappingDiagnosticLocked(sourceModel))
+		return "", false
+	}
+	if !m.sourceBound {
+		bound := sourceModel != "" && relayMarker == s.gatewayID && s.mode == ModeDesktop &&
+			s.desktopOwnerID == m.ownerID && s.generation == m.generation &&
+			s.gatewayID == m.gatewayID && s.gatewayAddr == m.gatewayAddress &&
+			s.proxy != nil && isCapturing(s.proxy.Status().State)
+		if bound {
+			m.sourceModel = sourceModel
+			m.sourceBound = true
+		}
+		diag := s.modelMappingDiagnosticLocked(sourceModel)
+		if bound {
+			diag.lazyBindAttempted = triTrue
+			diag.lazyBindSuccess = triTrue
+		}
+		logMappingDiag(diag)
+		if bound {
+			return m.targetRoute, true
+		}
+		return "", false
+	}
+	logMappingDiag(s.modelMappingDiagnosticLocked(sourceModel))
+	return s.mappingExactMatchLocked(sourceModel)
+}
+
 // MarkRecovery moves any mode into recovery_required, recording that an
 // explicit confirmation is needed before capture is touched again. It never
 // auto-clears.
@@ -1046,6 +1297,9 @@ func (s *Service) MarkGatewayLost(instanceID string, abnormal bool) State {
 			s.mu.Unlock()
 			return st
 		}
+		// A Gateway run ending invalidates all in-process routing evidence before
+		// any proxy cleanup, including abnormal/recovery transitions.
+		s.modelMapping = nil
 
 		proxy := s.proxy
 		if proxy == nil {

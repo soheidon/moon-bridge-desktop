@@ -8,6 +8,8 @@ import (
 	"moonbridge/internal/service/codexconfig"
 	"moonbridge/internal/service/codexlauncher"
 	"moonbridge/internal/service/deepseek"
+	"moonbridge/internal/service/routingprofile"
+	"moonbridge/internal/service/trafficanalysis"
 )
 
 // DesktopCommandResult is the single envelope for the DeepSeek / Codex config /
@@ -21,10 +23,262 @@ type DesktopCommandResult struct {
 }
 
 type DesktopSnapshot struct {
-	Codex    *CodexState          `json:"codex,omitempty"`
-	Config   *CodexConfigSnapshot `json:"config,omitempty"`
-	DeepSeek *DeepSeekSnapshot    `json:"deepseek,omitempty"`
-	Backups  []CodexBackupInfo    `json:"backups,omitempty"`
+	Gateway             *SafeGatewaySnapshot     `json:"gateway,omitempty"`
+	Codex               *CodexState              `json:"codex,omitempty"`
+	Config              *CodexConfigSnapshot     `json:"config,omitempty"`
+	DeepSeek            *DeepSeekSnapshot        `json:"deepseek,omitempty"`
+	TrafficAnalysis     *TrafficAnalysisSnapshot `json:"trafficAnalysis,omitempty"`
+	SaveDialog          *SaveDialogSnapshot      `json:"saveDialog,omitempty"`
+	Export              *TrafficExportSnapshot   `json:"export,omitempty"`
+	RevealExport        *TrafficRevealSnapshot   `json:"revealExport,omitempty"`
+	Recovery            *RecoverySnapshot        `json:"recovery,omitempty"`
+	App                 *AppLifecycleSnapshot    `json:"app,omitempty"`
+	Backups             []CodexBackupInfo        `json:"backups,omitempty"`
+	TrafficObservations []TrafficObservation     `json:"trafficObservations,omitempty"`
+	RoutingProfiles     *RoutingProfileSnapshot  `json:"routingProfiles,omitempty"`
+	// Connection-test fields are flat because the command envelope unwraps Value
+	// (a *DesktopSnapshot) and the hook reads operationId/result/warning/gatewaySnapshot
+	// at the top level. They are present only on a TestDeepSeekConnection result.
+	ConnectionTestOperationID     string               `json:"operationId,omitempty"`
+	ConnectionTest                *DeepSeekConnectionTest `json:"result,omitempty"`
+	ConnectionTestWarning         *string              `json:"warning,omitempty"`
+	ConnectionGatewaySnapshot     *GatewaySnapshot     `json:"gatewaySnapshot,omitempty"`
+	ConnectionGatewayLeftRunning  bool                 `json:"gatewayLeftRunning,omitempty"`
+}
+
+// DeepSeekConnectionTest is the structured, secret-free connection probe result.
+// Code is allowlisted by the gateway; Message is gateway-authored, never an
+// upstream error body.
+type DeepSeekConnectionTest struct {
+	OK      bool   `json:"ok"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	Model   string `json:"model"`
+}
+
+type SafeGatewaySnapshot struct {
+	State     string `json:"state"`
+	Listening bool   `json:"listening"`
+}
+
+// TrafficAnalysisSnapshot is the deliberately reduced Wails view of the
+// long-lived Capture service. It contains state and counts only; identities,
+// addresses, hashes, transaction IDs, and raw errors are never exposed.
+type TrafficAnalysisSnapshot struct {
+	Mode                 string `json:"mode"`
+	CaptureState         string `json:"captureState"`
+	Operation            string `json:"operation,omitempty"`
+	Generation           uint64 `json:"generation"`
+	GatewayMatches       bool   `json:"gatewayMatches"`
+	RelayActive          bool   `json:"relayActive"`
+	IntegrationActive    bool   `json:"integrationActive"`
+	Listening            bool   `json:"listening"`
+	HTTPRequests         uint64 `json:"httpRequests"`
+	SSEStreams           uint64 `json:"sseStreams"`
+	WebSocketConnections uint64 `json:"websocketConnections"`
+	ObservationCount     uint64 `json:"observationCount"`
+	ObservationCapacity  uint64 `json:"observationCapacity"`
+	DroppedObservations  uint64 `json:"droppedObservations"`
+	UnsavedObservations  bool   `json:"unsavedObservations"`
+	AutoSaveStatus       string `json:"autoSaveStatus,omitempty"`
+}
+
+// SaveDialogSnapshot is the result of the native Save File Dialog: Path is
+// empty and Canceled is true when the user cancelled.
+type SaveDialogSnapshot struct {
+	Path     string `json:"path"`
+	Canceled bool   `json:"canceled"`
+}
+
+// TrafficExportSnapshot describes a completed ログを保存 export.
+type TrafficExportSnapshot struct {
+	OperationID      string `json:"operationId,omitempty"`
+	Destination      string `json:"destination"`
+	ObservationCount uint64 `json:"observationCount"`
+}
+
+// TrafficRevealSnapshot describes a 保存先フォルダーを開く reveal request.
+type TrafficRevealSnapshot struct {
+	OperationID string `json:"operationId,omitempty"`
+	Destination string `json:"destination"`
+}
+
+// TrafficObservation is the deliberately reduced, secret-free Desktop summary
+// of one recorded observation. Prompts, bodies, responses, headers, URL
+// paths/query, API keys, and model/provider names are dropped at the backend
+// boundary — they never exist on this type or cross the Wails layer.
+type TrafficObservation struct {
+	Sequence               uint64                   `json:"sequence"`
+	Timestamp              string                   `json:"timestamp"`
+	Direction              string                   `json:"direction,omitempty"`
+	Transport              string                   `json:"transport"`
+	Method                 string                   `json:"method,omitempty"`
+	StatusCode             int                      `json:"statusCode,omitempty"`
+	PayloadKind            string                   `json:"payloadKind"`
+	SSEEventType           string                   `json:"sseEventType,omitempty"`
+	ContentEncoding        string                   `json:"contentEncoding,omitempty"`
+	RawPayloadSize         int                      `json:"rawPayloadSize"`
+	DecodedObservationSize int                      `json:"decodedObservationSize"`
+	DecodingStatus         string                   `json:"decodingStatus"`
+	PayloadShape           *TrafficPayloadShape     `json:"payloadShape,omitempty"`
+	Identifiers            TrafficIdentifierSummary `json:"identifiers,omitempty"`
+	Partial                bool                     `json:"partial,omitempty"`
+	Truncated              bool                     `json:"truncated,omitempty"`
+	Disposition            string                   `json:"disposition"`
+	ErrorClass             string                   `json:"errorClass,omitempty"`
+	Usage                  *TrafficUsageSummary     `json:"usage,omitempty"`
+}
+
+type TrafficUsageSummary struct {
+	InputTokens       *int `json:"inputTokens,omitempty"`
+	OutputTokens      *int `json:"outputTokens,omitempty"`
+	TotalTokens       *int `json:"totalTokens,omitempty"`
+	CachedInputTokens *int `json:"cachedInputTokens,omitempty"`
+	ReasoningTokens   *int `json:"reasoningTokens,omitempty"`
+}
+
+type TrafficPayloadShape struct {
+	TopLevelFields        []string           `json:"topLevelFields,omitempty"`
+	RequestModel          string             `json:"requestModel,omitempty"`
+	TopLevelTypes         map[string]string  `json:"topLevelTypes,omitempty"`
+	ArrayLengths          map[string]int     `json:"arrayLengths,omitempty"`
+	ObjectFieldCounts     map[string]int     `json:"objectFieldCounts,omitempty"`
+	InputItemCount        int                `json:"inputItemCount,omitempty"`
+	InputItemTypeCounts   map[string]int     `json:"inputItemTypeCounts,omitempty"`
+	InputRoleCounts       map[string]int     `json:"inputRoleCounts,omitempty"`
+	InputItemFingerprints []TrafficInputItem `json:"inputItemFingerprints,omitempty"`
+	HasPreviousResponseID bool               `json:"hasPreviousResponseId,omitempty"`
+	ToolCount             int                `json:"toolCount,omitempty"`
+	ToolTypes             []string           `json:"toolTypes,omitempty"`
+	EventType             string             `json:"eventType,omitempty"`
+	ObjectType            string             `json:"objectType,omitempty"`
+	Status                string             `json:"status,omitempty"`
+	ShapeTruncated        bool               `json:"shapeTruncated,omitempty"`
+}
+
+type TrafficInputItem struct {
+	Index        int                      `json:"index"`
+	Fields       []string                 `json:"fields,omitempty"`
+	Type         string                   `json:"type,omitempty"`
+	Role         string                   `json:"role,omitempty"`
+	ContentCount int                      `json:"contentCount,omitempty"`
+	ObjectCount  int                      `json:"objectCount,omitempty"`
+	ArrayCount   int                      `json:"arrayCount,omitempty"`
+	Identifiers  TrafficIdentifierSummary `json:"identifiers,omitempty"`
+}
+
+type TrafficIdentifierSummary struct {
+	ResponseIDAliases         []string `json:"responseIdAliases,omitempty"`
+	PreviousResponseIDAliases []string `json:"previousResponseIdAliases,omitempty"`
+	ItemIDAliases             []string `json:"itemIdAliases,omitempty"`
+	CallIDAliases             []string `json:"callIdAliases,omitempty"`
+	ConversationIDAliases     []string `json:"conversationIdAliases,omitempty"`
+	OtherIDAliases            []string `json:"otherIdAliases,omitempty"`
+}
+
+func safeTrafficShape(shape *trafficanalysis.PayloadShape) *TrafficPayloadShape {
+	if shape == nil {
+		return nil
+	}
+	return &TrafficPayloadShape{
+		TopLevelFields:        append([]string(nil), shape.TopLevelFields...),
+		RequestModel:          shape.RequestModel,
+		TopLevelTypes:         cloneStringMap(shape.TopLevelTypes),
+		ArrayLengths:          cloneIntMap(shape.ArrayLengths),
+		ObjectFieldCounts:     cloneIntMap(shape.ObjectFieldCounts),
+		InputItemCount:        shape.InputItemCount,
+		InputItemTypeCounts:   cloneIntMap(shape.InputItemTypeCounts),
+		InputRoleCounts:       cloneIntMap(shape.InputRoleCounts),
+		InputItemFingerprints: safeTrafficInputItems(shape.InputItemFingerprints),
+		HasPreviousResponseID: shape.HasPreviousResponseID,
+		ToolCount:             shape.ToolCount,
+		ToolTypes:             append([]string(nil), shape.ToolTypes...),
+		EventType:             shape.EventType,
+		ObjectType:            shape.ObjectType,
+		Status:                shape.Status,
+		ShapeTruncated:        shape.ShapeTruncated,
+	}
+}
+
+func safeTrafficInputItems(items []trafficanalysis.InputItemFingerprint) []TrafficInputItem {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]TrafficInputItem, len(items))
+	for index, item := range items {
+		out[index] = TrafficInputItem{
+			Index: item.Index, Fields: append([]string(nil), item.Fields...), Type: item.Type, Role: item.Role,
+			ContentCount: item.ContentCount, ObjectCount: item.ObjectCount, ArrayCount: item.ArrayCount,
+			Identifiers: safeTrafficIdentifiers(item.Identifiers),
+		}
+	}
+	return out
+}
+
+func safeTrafficIdentifiers(ids trafficanalysis.IdentifierSummary) TrafficIdentifierSummary {
+	return TrafficIdentifierSummary{
+		ResponseIDAliases:         append([]string(nil), ids.ResponseIDAliases...),
+		PreviousResponseIDAliases: append([]string(nil), ids.PreviousResponseIDAliases...),
+		ItemIDAliases:             append([]string(nil), ids.ItemIDAliases...),
+		CallIDAliases:             append([]string(nil), ids.CallIDAliases...),
+		ConversationIDAliases:     append([]string(nil), ids.ConversationIDAliases...),
+		OtherIDAliases:            append([]string(nil), ids.OtherIDAliases...),
+	}
+}
+
+func safeTrafficUsage(usage *trafficanalysis.UsageSummary) *TrafficUsageSummary {
+	if usage == nil {
+		return nil
+	}
+	return &TrafficUsageSummary{
+		InputTokens:       usage.InputTokens,
+		OutputTokens:      usage.OutputTokens,
+		TotalTokens:       usage.TotalTokens,
+		CachedInputTokens: usage.CachedInputTokens,
+		ReasoningTokens:   usage.ReasoningTokens,
+	}
+}
+
+func cloneStringMap(value map[string]string) map[string]string {
+	if len(value) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(value))
+	for key, item := range value {
+		out[key] = item
+	}
+	return out
+}
+
+func cloneIntMap(value map[string]int) map[string]int {
+	if len(value) == 0 {
+		return nil
+	}
+	out := make(map[string]int, len(value))
+	for key, item := range value {
+		out[key] = item
+	}
+	return out
+}
+
+type RecoverySnapshot struct {
+	Exists               bool   `json:"exists"`
+	Phase                string `json:"phase,omitempty"`
+	ReconciliationStatus string `json:"reconciliationStatus,omitempty"`
+	IntegrationActive    bool   `json:"integrationActive"`
+	RestoreRequired      bool   `json:"restoreRequired"`
+	RecoveryRequired     bool   `json:"recoveryRequired"`
+	Conflict             bool   `json:"conflict"`
+	ConfirmationRequired bool   `json:"confirmationRequired"`
+	RestartAttempted     bool   `json:"restartAttempted"`
+	UnsavedObservations  bool   `json:"unsavedObservations"`
+}
+
+type AppLifecycleSnapshot struct {
+	Started bool `json:"started"`
+	Ready   bool `json:"ready"`
+	Closing bool `json:"closing"`
+	Closed  bool `json:"closed"`
 }
 
 // CodexStatus is the terminal-session lifecycle status.
@@ -37,8 +291,8 @@ type CodexState struct {
 	Status     CodexStatus `json:"status"` // idle|starting|running|stopping|stopped|error
 	PID        int         `json:"pid"`
 	CodexHome  string      `json:"codexHome"`
-	StartedAt  time.Time   `json:"startedAt,omitempty"`
-	StoppedAt  time.Time   `json:"stoppedAt,omitempty"`
+	StartedAt  string      `json:"startedAt,omitempty"`
+	StoppedAt  string      `json:"stoppedAt,omitempty"`
 	ExitCode   *int        `json:"exitCode,omitempty"`
 	StopReason string      `json:"stopReason,omitempty"`
 	Error      string      `json:"error,omitempty"`
@@ -59,6 +313,10 @@ type DeepSeekSnapshot struct {
 	ProviderExists                bool                `json:"providerExists"`
 	APIKeySet                     bool                `json:"apiKeySet"`
 	APIKeyMasked                  string              `json:"apiKeyMasked,omitempty"`
+	APIKeyEnv                     string              `json:"apiKeyEnv"`
+	CredentialSource              string              `json:"credentialSource"`
+	CredentialState               string              `json:"credentialState"`
+	CredentialErrorCode           string              `json:"credentialErrorCode,omitempty"`
 	Configured                    bool                `json:"configured"`
 	Active                        bool                `json:"active"`
 	SelectedModel                 string              `json:"selectedModel,omitempty"`
@@ -77,12 +335,45 @@ type DeepSeekModelConfig struct {
 	Supported []string `json:"supported"`
 }
 
+// RoutingProfileSnapshot is the secret-free Wails view of the Codex routing
+// profile table. ActiveProfileID comes from routing_profiles config.active_profile
+// (the moonbridge route provider only as a bootstrap fallback when the extension
+// is absent); "" means no profile is active. Profiles is never null.
+type RoutingProfileSnapshot struct {
+	Profiles        []RoutingProfileCard `json:"profiles"`
+	ActiveProfileID string               `json:"activeProfileId"`
+	GatewayRunning  bool                 `json:"gatewayRunning"`
+}
+
+// RoutingProfileCard is one routing profile. Active is backend-confirmed from
+// the graph's active profile (config.active_profile, or the route provider only
+// for bootstrap), never a local selection.
+type RoutingProfileCard struct {
+	ID          string        `json:"id"`
+	DisplayName string        `json:"displayName"`
+	Active      bool          `json:"active"`
+	Configured  bool          `json:"configured"`
+	Slots       []RoutingSlot `json:"slots"`
+}
+
+// RoutingSlot is one Codex routing slot (sol/terra/luna). Reasoning is omitted
+// (undefined on the wire) when the slot carries no override (Luna).
+type RoutingSlot struct {
+	ID            string  `json:"id"`
+	DisplayName   string  `json:"displayName"`
+	ProviderID    string  `json:"providerId"`
+	ProviderLabel string  `json:"providerLabel"`
+	UpstreamModel string  `json:"upstreamModel"`
+	Mode          string  `json:"mode"`
+	Reasoning     *string `json:"reasoning,omitempty"`
+}
+
 type CodexBackupInfo struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Path      string    `json:"path"`
-	CreatedAt time.Time `json:"createdAt"`
-	Size      int64     `json:"size"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Path      string `json:"path"`
+	CreatedAt string `json:"createdAt"`
+	Size      int64  `json:"size"`
 }
 
 // ---- envelope constructors ----
@@ -115,12 +406,19 @@ func desktopCodexState(st codexlauncher.State) *CodexState {
 		Status:     CodexStatus(st.Status),
 		PID:        st.PID,
 		CodexHome:  st.CodexHome,
-		StartedAt:  st.StartedAt,
-		StoppedAt:  st.StoppedAt,
+		StartedAt:  publicTime(st.StartedAt),
+		StoppedAt:  publicTime(st.StoppedAt),
 		ExitCode:   st.ExitCode,
 		StopReason: string(st.StopReason),
 		Error:      st.Error,
 	}
+}
+
+func publicTime(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.UTC().Format(time.RFC3339Nano)
 }
 
 func desktopCodexConfig(s codexconfig.Snapshot) *CodexConfigSnapshot {
@@ -142,6 +440,10 @@ func desktopDeepSeek(s *deepseek.Snapshot) *DeepSeekSnapshot {
 		ProviderExists:                s.ProviderExists,
 		APIKeySet:                     s.APIKeySet,
 		APIKeyMasked:                  s.APIKeyMasked,
+		APIKeyEnv:                     s.APIKeyEnv,
+		CredentialSource:              s.CredentialSource,
+		CredentialState:               s.CredentialState,
+		CredentialErrorCode:           s.CredentialErrorCode,
 		Configured:                    s.Configured,
 		Active:                        s.Active,
 		SelectedModel:                 s.SelectedModel,
@@ -159,6 +461,51 @@ func desktopDeepSeekModel(m deepseek.ModelConfig) DeepSeekModelConfig {
 	return DeepSeekModelConfig{ModelID: m.ModelID, Reasoning: m.Reasoning, Supported: m.Supported}
 }
 
+// desktopRoutingProfiles maps the routingprofile service snapshot to the
+// Desktop DTO. The service snapshot is already secret-free; this copy keeps the
+// Wails boundary owned by the desktop package so the wire shape can evolve
+// without touching the service.
+func desktopRoutingProfiles(snap *routingprofile.Snapshot) *RoutingProfileSnapshot {
+	if snap == nil {
+		return nil
+	}
+	profiles := make([]RoutingProfileCard, 0, len(snap.Profiles))
+	for _, p := range snap.Profiles {
+		profiles = append(profiles, RoutingProfileCard{
+			ID:          p.ID,
+			DisplayName: p.DisplayName,
+			Active:      p.Active,
+			Configured:  p.Configured,
+			Slots:       desktopRoutingSlots(p.Slots),
+		})
+	}
+	return &RoutingProfileSnapshot{
+		Profiles:        profiles,
+		ActiveProfileID: snap.ActiveProfileID,
+		GatewayRunning:  snap.GatewayRunning,
+	}
+}
+
+func desktopRoutingSlots(slots []routingprofile.Slot) []RoutingSlot {
+	out := make([]RoutingSlot, 0, len(slots))
+	for _, s := range slots {
+		slot := RoutingSlot{
+			ID:            s.ID,
+			DisplayName:   s.DisplayName,
+			ProviderID:    s.ProviderID,
+			ProviderLabel: s.ProviderLabel,
+			UpstreamModel: s.UpstreamModel,
+			Mode:          s.Mode,
+		}
+		if s.Reasoning != nil {
+			r := *s.Reasoning
+			slot.Reasoning = &r
+		}
+		out = append(out, slot)
+	}
+	return out
+}
+
 func desktopBackups(bs []codexconfig.BackupInfo) []CodexBackupInfo {
 	out := make([]CodexBackupInfo, 0, len(bs))
 	for _, b := range bs {
@@ -166,8 +513,40 @@ func desktopBackups(bs []codexconfig.BackupInfo) []CodexBackupInfo {
 			ID:        b.ID,
 			Name:      b.Name,
 			Path:      b.Path,
-			CreatedAt: b.CreatedAt,
+			CreatedAt: publicTime(b.CreatedAt),
 			Size:      b.Size,
+		})
+	}
+	return out
+}
+
+// desktopObservations maps internal Observations to the secret-free Desktop
+// summary DTO. Fields that could carry prompts, bodies, responses, header
+// values, URL paths/query, API keys, or model/provider names are dropped here
+// at the backend boundary.
+func desktopObservations(items []trafficanalysis.Observation) []TrafficObservation {
+	out := make([]TrafficObservation, 0, len(items))
+	for _, o := range items {
+		out = append(out, TrafficObservation{
+			Sequence:               o.Sequence,
+			Timestamp:              publicTime(o.Timestamp),
+			Direction:              string(o.Direction),
+			Transport:              string(o.Transport),
+			Method:                 o.Method,
+			StatusCode:             o.StatusCode,
+			PayloadKind:            string(o.PayloadKind),
+			SSEEventType:           o.SSEEventType,
+			ContentEncoding:        o.ContentEncoding,
+			RawPayloadSize:         o.RawPayloadSize,
+			PayloadShape:           safeTrafficShape(o.PayloadShape),
+			Identifiers:            safeTrafficIdentifiers(o.Identifiers),
+			DecodedObservationSize: o.DecodedObservationSize,
+			DecodingStatus:         string(o.DecodingStatus),
+			Partial:                o.Partial,
+			Truncated:              o.Truncated,
+			Disposition:            string(o.Disposition),
+			ErrorClass:             o.ErrorClass,
+			Usage:                  safeTrafficUsage(o.Usage),
 		})
 	}
 	return out
@@ -313,4 +692,47 @@ func codexError(operation, stage string, err error) DesktopCommandResult {
 // deepSeekGatewayNotRunning is the no-session error for DeepSeek read/write.
 func deepSeekGatewayNotRunning(operation string) DesktopCommandResult {
 	return errDesktop(operation, "gateway_check", "deepseek_gateway_not_running", "gateway is not running", false)
+}
+
+// routingProfileError maps a routingprofile.ServiceError to the CommandError
+// envelope. defaultCode is the fallback for kind classes without a dedicated
+// code (e.g. routing_profile_load_failed for Load).
+func routingProfileError(operation, stage, defaultCode string, err error) DesktopCommandResult {
+	var se *routingprofile.ServiceError
+	if !errors.As(err, &se) {
+		return errDesktop(operation, stage, defaultCode, "routing profile operation failed", true)
+	}
+	code := defaultCode
+	switch se.Kind {
+	case routingprofile.KindInvalidInput:
+		code = "routing_profile_validate_failed"
+	case routingprofile.KindSaveRejected, routingprofile.KindRevisionConflictExceeded, routingprofile.KindVerifyFailed:
+		code = "routing_profile_save_failed"
+	}
+	msg := se.Message
+	if msg == "" {
+		msg = "routing profile operation failed"
+	}
+	e := &CommandError{
+		Operation:       operation,
+		Stage:           stage,
+		Code:            code,
+		Message:         msg,
+		Retryable:       se.Retryable,
+		MutationStarted: se.MutationStarted,
+	}
+	if se.Field != nil {
+		f := *se.Field
+		e.Field = &f
+	}
+	if len(se.Details) > 0 {
+		e.Details = se.Details
+	}
+	return DesktopCommandResult{OK: false, Error: e}
+}
+
+// routingProfileGatewayNotRunning is the no-session error for routing profile
+// read/write (the graph is only reachable through a live gateway session).
+func routingProfileGatewayNotRunning(operation string) DesktopCommandResult {
+	return errDesktop(operation, "gateway_check", "routing_profile_gateway_not_running", "gateway is not running", false)
 }

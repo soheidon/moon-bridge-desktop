@@ -1,11 +1,14 @@
 package trafficanalysis
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -86,6 +89,67 @@ func TestCaptureHTTPForwardsPayloadAndSanitizesObservation(t *testing.T) {
 	}
 }
 
+func TestCaptureStampsSingleRelayMarkerAndRejectsClientSpoof(t *testing.T) {
+	var markerValues []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		markerValues = r.Header.Values(RelayMarkerHeader)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	// Capture owns gateway-1: the upstream must see exactly one Capture-generated
+	// marker value, never the client-spoofed one.
+	proxy := NewCaptureProxy(CaptureConfig{ListenAddr: "127.0.0.1:0", UpstreamBase: upstream.URL, InstanceID: "gateway-1", HTTPClient: upstream.Client(), QueueSize: 16})
+	defer proxy.Close()
+	if err := proxy.Start(); err != nil {
+		t.Fatal(err)
+	}
+	address := proxy.Status().CaptureAddress
+	request, err := http.NewRequest(http.MethodPost, "http://"+address+"/responses", strings.NewReader(`{"input":"ok"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set(RelayMarkerHeader, "client-spoofed-value")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", response.StatusCode)
+	}
+	if len(markerValues) != 1 || markerValues[0] != "gateway-1" {
+		t.Fatalf("upstream marker = %v, want [gateway-1]", markerValues)
+	}
+
+	// Without an InstanceID the Capture strips any client marker and adds none.
+	markerValues = nil
+	proxy2 := NewCaptureProxy(CaptureConfig{ListenAddr: "127.0.0.1:0", UpstreamBase: upstream.URL, HTTPClient: upstream.Client(), QueueSize: 16})
+	defer proxy2.Close()
+	if err := proxy2.Start(); err != nil {
+		t.Fatal(err)
+	}
+	request2, err := http.NewRequest(http.MethodPost, "http://"+proxy2.Status().CaptureAddress+"/responses", strings.NewReader(`{"input":"ok"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request2.Header.Set(RelayMarkerHeader, "client-spoofed-value")
+	response2, err := http.DefaultClient.Do(request2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(response2.Body)
+	_ = response2.Body.Close()
+	if response2.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", response2.StatusCode)
+	}
+	if len(markerValues) != 0 {
+		t.Fatalf("upstream marker without InstanceID = %v, want none", markerValues)
+	}
+}
+
 func TestCaptureRejectsUnsafeTargetsAndDoesNotDialUpstream(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/%2e%2e/secret", nil)
 	if _, err := composeUpstreamURL(DefaultUpstreamBase, request); err == nil {
@@ -102,6 +166,396 @@ func TestCaptureRejectsUnsafeTargetsAndDoesNotDialUpstream(t *testing.T) {
 	}
 	if upstream.String() != "https://chatgpt.com/backend-api/codex/v1/responses?stream=true" {
 		t.Fatalf("upstream URL = %q", upstream.String())
+	}
+}
+
+// Tests 1, 2, 9, 10: POST /responses and /v1/responses are accepted over an
+// http loopback upstream, forwarded verbatim, and the client-supplied Host
+// header never changes the forwarding target (fixed to the configured base).
+func TestCaptureHTTPForwardsResponsesOverHTTPLoopback(t *testing.T) {
+	var sawPath string
+	var sawHost string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawPath = r.URL.Path
+		sawHost = r.Host
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	proxy := NewCaptureProxy(CaptureConfig{ListenAddr: "127.0.0.1:0", UpstreamBase: upstream.URL, HTTPClient: upstream.Client(), QueueSize: 16})
+	defer proxy.Close()
+	if err := proxy.Start(); err != nil {
+		t.Fatal(err)
+	}
+	address := proxy.Status().CaptureAddress
+
+	for _, path := range []string{"/responses", "/v1/responses"} {
+		request, err := http.NewRequest(http.MethodPost, "http://"+address+path, strings.NewReader(`{"input":"ok"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Host = "evil.example.com"
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		responseBody, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusOK || string(responseBody) != `{"ok":true}` {
+			t.Fatalf("%s response = %d %q", path, response.StatusCode, responseBody)
+		}
+		if sawPath != path {
+			t.Fatalf("upstream path = %q, want %q", sawPath, path)
+		}
+		wantHost := upstream.URL[len("http://"):]
+		if sawHost != wantHost {
+			t.Fatalf("upstream Host = %q, want the configured base %q", sawHost, wantHost)
+		}
+	}
+}
+
+// Tests 3, 4: GET /models and /v1/models are accepted over an http loopback
+// base and the raw query is preserved.
+func TestComposeUpstreamURLAcceptsHTTPLoopbackPaths(t *testing.T) {
+	base := "http://127.0.0.1:38440"
+	for _, target := range []string{"/responses", "/v1/responses", "/models", "/v1/models"} {
+		if _, err := composeUpstreamURL(base, httptest.NewRequest(http.MethodPost, target, nil)); err != nil {
+			t.Fatalf("%s rejected over http loopback: %v", target, err)
+		}
+	}
+	query := httptest.NewRequest(http.MethodPost, "/v1/responses?stream=true", nil)
+	upstream, err := composeUpstreamURL(base, query)
+	if err != nil {
+		t.Fatalf("query target rejected: %v", err)
+	}
+	if upstream.RawQuery != "stream=true" {
+		t.Fatalf("raw query = %q, want stream=true", upstream.RawQuery)
+	}
+}
+
+// Tests 5, 6, 7: dot-segment traversal, percent-encoded traversal, absolute-form
+// and authority-form request targets are all rejected even over an http loopback
+// base.
+func TestComposeUpstreamURLRejectsUnsafeTargetsOverHTTPLoopback(t *testing.T) {
+	base := "http://127.0.0.1:38440"
+	for name, target := range map[string]string{
+		"traversal":         "/v1/../secret",
+		"encoded traversal": "/v1/%2e%2e/secret",
+		"absolute form":     "http://127.0.0.1:38440/v1/responses",
+	} {
+		if _, err := composeUpstreamURL(base, httptest.NewRequest(http.MethodGet, target, nil)); err == nil {
+			t.Fatalf("%s accepted: %q", name, target)
+		}
+	}
+	authority := httptest.NewRequest(http.MethodGet, "/responses", nil)
+	authority.URL = &url.URL{Host: "127.0.0.1:38440", Path: "/responses"}
+	if _, err := composeUpstreamURL(base, authority); err == nil {
+		t.Fatal("authority-form target accepted")
+	}
+}
+
+// bodyForwardingFixture returns a running loopback capture proxy whose upstream
+// records the exact request body bytes it received, so tests can assert the
+// byte-for-byte forwarding contract.
+func bodyForwardingFixture(t *testing.T) (*CaptureProxy, *[]byte) {
+	t.Helper()
+	var received []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			got, _ := io.ReadAll(r.Body)
+			received = append(received, got...)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(upstream.Close)
+	proxy := NewCaptureProxy(CaptureConfig{ListenAddr: "127.0.0.1:0", UpstreamBase: upstream.URL, HTTPClient: upstream.Client(), QueueSize: 16})
+	t.Cleanup(func() { _ = proxy.Close() })
+	if err := proxy.Start(); err != nil {
+		t.Fatal(err)
+	}
+	return proxy, &received
+}
+
+func findClientObservation(t *testing.T, proxy *CaptureProxy) Observation {
+	t.Helper()
+	obs := waitForObservations(t, proxy, 1)
+	for _, o := range obs {
+		if o.Direction == DirectionClientToUpstream {
+			return o
+		}
+	}
+	t.Fatal("no client-to-upstream observation recorded")
+	return Observation{}
+}
+
+// L1: a POST body with ContentLength == -1 (unknown, framed as chunked by Go)
+// must be forwarded to the upstream byte-for-byte, and the observation's raw
+// size/HMAC must match the actually-forwarded bytes.
+func TestCaptureForwardsChunkedBodyByteForByte(t *testing.T) {
+	proxy, received := bodyForwardingFixture(t)
+	payload := []byte(`{"model":"gpt-5.6-luna","input":"chunked-request"}`)
+	request, err := http.NewRequest(http.MethodPost, "http://"+proxy.Status().CaptureAddress+"/responses", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.ContentLength = -1 // force unknown length → chunked framing
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || string(responseBody) != `{}` {
+		t.Fatalf("response = %d %q", response.StatusCode, responseBody)
+	}
+	if !bytes.Equal(*received, payload) {
+		t.Fatalf("upstream received %q, want byte-for-byte %q", *received, payload)
+	}
+	obs := findClientObservation(t, proxy)
+	if obs.RawPayloadSize != len(payload) {
+		t.Fatalf("observation rawPayloadSize = %d, want %d", obs.RawPayloadSize, len(payload))
+	}
+	proxy.mu.Lock()
+	analyzer := proxy.analyzer
+	proxy.mu.Unlock()
+	if analyzer == nil {
+		t.Fatal("analyzer is nil")
+	}
+	if want := hmacHex(analyzer.key, payload); obs.RawPayloadHMAC != want {
+		t.Fatalf("observation rawPayloadHmac = %q, want the forwarded bytes' HMAC %q", obs.RawPayloadHMAC, want)
+	}
+}
+
+// L2: a body whose first byte is `(` (not JSON) must still be forwarded
+// byte-for-byte. This is the back-to-back guarantee that a `(` observed at the
+// Gateway is not introduced by the Capture Proxy.
+func TestCaptureForwardsLeadingParenBodyByteForByte(t *testing.T) {
+	proxy, received := bodyForwardingFixture(t)
+	payload := []byte(`(not-json)`)
+	request, err := http.NewRequest(http.MethodPost, "http://"+proxy.Status().CaptureAddress+"/responses", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if !bytes.Equal(*received, payload) {
+		t.Fatalf("leading-paren body forwarded %q, want %q", *received, payload)
+	}
+	if got := bodyFirstByteClass(payload); got != "other" {
+		t.Fatalf("bodyFirstByteClass(%q) = %q, want other", payload, got)
+	}
+}
+
+// L3: a clean JSON object body is forwarded byte-for-byte (regression) and is
+// classified as an object.
+func TestCaptureForwardsCleanJSONByteForByte(t *testing.T) {
+	proxy, received := bodyForwardingFixture(t)
+	payload := []byte(`{"model":"gpt-5.6-luna","input":"ok"}`)
+	request, err := http.NewRequest(http.MethodPost, "http://"+proxy.Status().CaptureAddress+"/responses", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if !bytes.Equal(*received, payload) {
+		t.Fatalf("clean JSON body forwarded %q, want %q", *received, payload)
+	}
+	if got := bodyFirstByteClass(payload); got != "object" {
+		t.Fatalf("bodyFirstByteClass(%q) = %q, want object", payload, got)
+	}
+}
+
+// L4: a Codex-compatible normal Responses request shape (POST /responses,
+// application/json, object body with a model field) is forwarded byte-for-byte
+// and the observation digest matches. This anchors the claim that a leading `(`
+// seen at the Gateway is not attributable to a normal JSON request body.
+func TestCaptureForwardsCodexCompatibleRequestByteForByte(t *testing.T) {
+	proxy, received := bodyForwardingFixture(t)
+	payload := []byte(`{"model":"gpt-5.6-luna","input":"Return exactly: OK","stream":true}`)
+	request, err := http.NewRequest(http.MethodPost, "http://"+proxy.Status().CaptureAddress+"/responses", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if !bytes.Equal(*received, payload) {
+		t.Fatalf("Codex-compatible body forwarded %q, want %q", *received, payload)
+	}
+	obs := findClientObservation(t, proxy)
+	if obs.RawPayloadSize != len(payload) {
+		t.Fatalf("observation rawPayloadSize = %d, want %d", obs.RawPayloadSize, len(payload))
+	}
+	proxy.mu.Lock()
+	analyzer := proxy.analyzer
+	proxy.mu.Unlock()
+	if analyzer == nil {
+		t.Fatal("analyzer is nil")
+	}
+	if want := hmacHex(analyzer.key, payload); obs.RawPayloadHMAC != want {
+		t.Fatalf("Codex-compatible observation rawPayloadHmac = %q, want the forwarded bytes' HMAC %q", obs.RawPayloadHMAC, want)
+	}
+	if got := bodyFirstByteClass(payload); got != "object" {
+		t.Fatalf("bodyFirstByteClass(%q) = %q, want object", payload, got)
+	}
+}
+
+// L5: bodyFirstByteClass classifies only the first significant byte.
+func TestBodyFirstByteClass(t *testing.T) {
+	cases := map[string]string{
+		`{`:       "object",
+		` {`:      "object",
+		"\n{":     "object",
+		`[`:       "array",
+		`(`:       "other",
+		`(:`:      "other",
+		`":":`:    "other",
+		``:        "empty",
+		"   \r\n": "empty",
+	}
+	for input, want := range cases {
+		if got := bodyFirstByteClass([]byte(input)); got != want {
+			t.Fatalf("bodyFirstByteClass(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+// Test 8: an http upstream base that is not a loopback host is rejected
+// (never forwarded to), while loopback http bases and the fixed https default
+// remain accepted.
+func TestComposeUpstreamURLRejectsExternalHTTPUpstream(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/responses", nil)
+	for _, base := range []string{
+		"http://example.com:38440",
+		"http://192.168.1.1:38440",
+		"http://10.0.0.1:38440",
+		"http://0.0.0.0:38440",
+		"http://169.254.1.1:38440",
+	} {
+		if _, err := composeUpstreamURL(base, request); err == nil {
+			t.Fatalf("external http upstream accepted: %q", base)
+		}
+	}
+	if _, err := composeUpstreamURL("ftp://127.0.0.1:21", request); err == nil {
+		t.Fatal("unsupported scheme accepted")
+	}
+	for _, base := range []string{"http://127.0.0.1:38440", "http://localhost:38440", "http://[::1]:38440"} {
+		if _, err := composeUpstreamURL(base, request); err != nil {
+			t.Fatalf("loopback http upstream rejected: %q: %v", base, err)
+		}
+	}
+}
+
+// Test 11: an http upstream is dialed as ws:// (not wss) — proves the scheme is
+// derived from the upstream base rather than hardcoded.
+func TestCaptureWebSocketRoundTripOverHTTPUpstream(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connection, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		for {
+			kind, payload, err := connection.ReadMessage()
+			if err != nil {
+				return
+			}
+			_ = connection.WriteMessage(kind, payload)
+		}
+	}))
+	defer upstream.Close()
+	proxy := NewCaptureProxy(CaptureConfig{ListenAddr: "127.0.0.1:0", UpstreamBase: upstream.URL, QueueSize: 16})
+	defer proxy.Close()
+	if err := proxy.Start(); err != nil {
+		t.Fatal(err)
+	}
+	client, _, err := (&websocket.Dialer{}).Dial("ws://"+proxy.Status().CaptureAddress+"/socket", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	payload := []byte(`{"model":"gpt-5.6-luna"}`)
+	if err := client.WriteMessage(websocket.TextMessage, payload); err != nil {
+		t.Fatal(err)
+	}
+	kind, echoed, err := client.ReadMessage()
+	if err != nil || kind != websocket.TextMessage || string(echoed) != string(payload) {
+		t.Fatalf("websocket echo = %d %q %v", kind, echoed, err)
+	}
+}
+
+// Test 12: the loopback determination contract, including the full 127.0.0.0/8
+// range and IPv4-mapped loopback via net.IP.IsLoopback.
+func TestIsLoopbackHost(t *testing.T) {
+	allowed := []string{"localhost", "127.0.0.1", "127.0.0.2", "127.8.8.8", "::1", "::ffff:127.0.0.1"}
+	for _, host := range allowed {
+		if !isLoopbackHost(host) {
+			t.Fatalf("isLoopbackHost(%q) = false, want true", host)
+		}
+	}
+	rejected := []string{"example.com", "0.0.0.0", "192.168.1.1", "10.0.0.1", "169.254.1.1", ""}
+	for _, host := range rejected {
+		if isLoopbackHost(host) {
+			t.Fatalf("isLoopbackHost(%q) = true, want false", host)
+		}
+	}
+}
+
+// Test 13: sentinel errors map to safe enum strings; anything else (including
+// nil) maps to unknown so raw error text is never logged.
+func TestCaptureTargetReason(t *testing.T) {
+	cases := map[error]string{
+		errAbsoluteRequestTarget:       "absolute_request_target",
+		errUnsafeRequestPath:           "unsafe_request_path",
+		errInvalidEscapedPath:          "invalid_escaped_path",
+		errTraversalPath:               "traversal_path",
+		errInvalidUpstreamBase:         "invalid_upstream_base",
+		errHTTPUpstreamOutsideLoopback: "http_upstream_outside_loopback",
+		errUnsupportedUpstreamScheme:   "unsupported_upstream_scheme",
+	}
+	for sentinel, want := range cases {
+		if got := captureTargetReason(sentinel); got != want {
+			t.Fatalf("captureTargetReason(%v) = %q, want %q", sentinel, got, want)
+		}
+	}
+	if got := captureTargetReason(errors.New("boom")); got != "unknown" {
+		t.Fatalf("captureTargetReason(unknown) = %q, want unknown", got)
+	}
+	if got := captureTargetReason(nil); got != "unknown" {
+		t.Fatalf("captureTargetReason(nil) = %q, want unknown", got)
+	}
+}
+
+// Test 14: safeCapturePath echoes only known diagnostic paths and folds the
+// rest to <other> — log sanitization only, not a forwarding allowlist.
+func TestSafeCapturePath(t *testing.T) {
+	for _, path := range []string{"/responses", "/v1/responses", "/models", "/v1/models", "/socket"} {
+		if got := safeCapturePath(path); got != path {
+			t.Fatalf("safeCapturePath(%q) = %q, want verbatim", path, got)
+		}
+	}
+	for _, path := range []string{"/", "/unknown/codex/path", "/v1/responses/../x", "/%2e%2e/secret"} {
+		if got := safeCapturePath(path); got != "<other>" {
+			t.Fatalf("safeCapturePath(%q) = %q, want <other>", path, got)
+		}
 	}
 }
 

@@ -3,18 +3,17 @@ import { trafficActionDisabled } from "./trafficAnalysisActions";
 
 describe("traffic action availability", () => {
   it("keeps stop enabled while capture has no observations", () => {
-    expect(trafficActionDisabled(0, {})).toMatchObject({ stop: false, export: true, clear: true });
+    expect(trafficActionDisabled(0, {})).toMatchObject({ stop: false, clear: true });
   });
 
-  it("enables export and clear during capture when observations exist", () => {
-    expect(trafficActionDisabled(1, {})).toMatchObject({ stop: false, export: false, clear: false });
+  it("enables clear during capture when observations exist", () => {
+    expect(trafficActionDisabled(1, {})).toMatchObject({ stop: false, clear: false });
   });
 
   it("disables only the operation that is currently running", () => {
-    expect(trafficActionDisabled(1, { exporting: true })).toMatchObject({ stop: false, export: true, clear: false });
-    expect(trafficActionDisabled(1, { clearing: true })).toMatchObject({ stop: false, export: false, clear: true });
-    expect(trafficActionDisabled(1, { stopping: true })).toMatchObject({ stop: true, export: false, clear: false });
-    expect(trafficActionDisabled(1, { finalizing: true })).toMatchObject({ finalize: true, stop: false, export: false, clear: false });
+    expect(trafficActionDisabled(1, { clearing: true })).toMatchObject({ clear: true });
+    expect(trafficActionDisabled(1, { stopping: true })).toMatchObject({ stop: true, clear: false });
+    expect(trafficActionDisabled(1, { finalizing: true })).toMatchObject({ finalize: true, stop: false, clear: false });
   });
 
   it("disables finalize while stop is still running", () => {

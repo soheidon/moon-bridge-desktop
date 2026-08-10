@@ -25,8 +25,15 @@ type Service struct {
 	mu      sync.Mutex
 	active  *activeTransaction
 	ownerID string
-	deps    Dependencies
-	ids     IDGenerator
+	// Recovery v2 intentionally does not persist the in-process Gateway
+	// identity or Capture generation. Keep those as private same-process
+	// evidence so Disable/Finish can validate an Enable completed in this
+	// Service; after a process restart the evidence is absent and operations
+	// fail closed instead of guessing ownership.
+	lastGateway    GatewaySnapshot
+	lastGeneration uint64
+	deps           Dependencies
+	ids            IDGenerator
 }
 
 func New(deps Dependencies) *Service {
@@ -40,6 +47,17 @@ func New(deps Dependencies) *Service {
 // NewService is the conventional constructor name used by the other Go
 // services; New remains as a concise alias for tests and adapters.
 func NewService(deps Dependencies) *Service { return New(deps) }
+
+// OwnerID returns the transaction identity that currently claims Desktop
+// capture ownership in this process, or "" when none is held. Enable stores the
+// same identity in s.ownerID and the capture's desktopOwnerID, and a failed
+// Disable keeps both, so a live restore can prove same-process ownership. A
+// restarted process has a fresh Service with no owner and fails closed.
+func (s *Service) OwnerID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ownerID
+}
 
 // Enable executes only the Desktop enable transaction. Disable, Recovery,
 // Wails binding, and startup reconciliation are separate later boundaries.
@@ -74,6 +92,19 @@ func (s *Service) Enable(ctx context.Context) (Snapshot, error) {
 	if unresolved {
 		return Snapshot{}, safeError(KindRecoveryRequired, "recovery confirmation is required", false)
 	}
+	// An integration journal from a previous process is not an enableable
+	// starting point: its private owner/generation evidence is unavailable.
+	// The only active journal that can coexist with Enable is one owned by this
+	// in-process Service, and the traffic-mode guard below will reject it as
+	// already desktop-managed.
+	if journal, journalErr := s.deps.Recovery.Current(ctx); journalErr == nil && journal.IntegrationActive {
+		s.mu.Lock()
+		ownedHere := s.ownerID != ""
+		s.mu.Unlock()
+		if !ownedHere {
+			return Snapshot{}, safeError(KindRecoveryRequired, "recovery confirmation is required", false)
+		}
+	}
 
 	traffic := s.deps.Traffic.Status()
 	started := false
@@ -96,6 +127,17 @@ func (s *Service) Enable(ctx context.Context) (Snapshot, error) {
 	before, err := s.deps.Config.ReadRootURL(ctx)
 	if err != nil {
 		return Snapshot{}, safeError(KindConfigReadFailed, "codex configuration could not be read", true)
+	}
+	routingModel := ""
+	if gw.RoutingAvailable {
+		routing, routingErr := s.deps.Config.ReadRoutingIdentity(ctx)
+		if routingErr != nil || routing.ConfigHash != before.ConfigHash || (routing.ModelProvider != "" && routing.ModelProvider != "openai") {
+			return Snapshot{}, safeError(KindConfigReadFailed, "codex model routing identity could not be read", true)
+		}
+		if gw.DefaultModelAlias == "" {
+			return Snapshot{}, safeError(KindConfigReadFailed, "gateway default route is unavailable", true)
+		}
+		routingModel = routing.Model
 	}
 	prepared, err := s.deps.Config.PrepareRootURLChange(ctx, stringPtr(captureURL), before.ConfigHash)
 	if err != nil {
@@ -171,6 +213,15 @@ func (s *Service) Enable(ctx context.Context) (Snapshot, error) {
 	if err := s.verifyGateway(ctx, gw); err != nil {
 		return s.backout(ctx, txID, prepared, backup, gw, claimed, state, CauseGatewayLost, safeError(KindGatewayNotRunning, "gateway changed before configuration write", true))
 	}
+	if gw.RoutingAvailable {
+		// Registers the mapping with source pending; the observed first real
+		// POST /responses model is lazily bound by the Service (routingModel is
+		// now informational only and not used as the source).
+		if err := s.deps.Traffic.SetDesktopModelMappingExpected(claimed.Generation, gw.InstanceID, gw.Address, txID, routingModel, gw.DefaultModelAlias); err != nil {
+			return s.backout(ctx, txID, prepared, backup, gw, claimed, state, CauseOwnershipClaim, safeError(KindOwnershipClaimFailed, "desktop model mapping registration failed", true))
+		}
+		state.ModelMappingClaimed = true
+	}
 
 	if err := s.deps.Config.CommitPreparedRootURLChange(ctx, prepared); err != nil {
 		cause := CauseConfigSave
@@ -221,6 +272,8 @@ func (s *Service) Enable(ctx context.Context) (Snapshot, error) {
 	}
 	s.mu.Lock()
 	s.ownerID = txID
+	s.lastGateway = gw
+	s.lastGeneration = validatedFinal.Generation
 	s.mu.Unlock()
 	return snapshotFrom(validatedFinal, gw, PhaseCompleted, true), nil
 }
@@ -252,7 +305,18 @@ func (s *Service) Disable(ctx context.Context) (Snapshot, error) {
 
 	s.mu.Lock()
 	ownerID := s.ownerID
+	lastGateway := s.lastGateway
+	lastGeneration := s.lastGeneration
 	s.mu.Unlock()
+	if journal.GatewayInstance == "" {
+		journal.GatewayInstance = lastGateway.InstanceID
+	}
+	if journal.GatewayAddress == "" {
+		journal.GatewayAddress = lastGateway.Address
+	}
+	if journal.CaptureGeneration == 0 {
+		journal.CaptureGeneration = lastGeneration
+	}
 	if ownerID == "" || (journal.OwnerID != "" && journal.OwnerID != ownerID) {
 		return Snapshot{}, safeError(KindRecoveryRequired, "desktop ownership cannot be confirmed in this process", false)
 	}
@@ -289,7 +353,9 @@ func (s *Service) Disable(ctx context.Context) (Snapshot, error) {
 
 	current, err := s.deps.Config.ReadRootURL(ctx)
 	if err != nil || current.ConfigHash != journal.AfterHash {
-		_ = s.deps.Recovery.Checkpoint(ctx, checkpointForDisable(txID, ownerID, PhaseDisableStarted, DurableReconciliationRequired, journal, traffic.Generation, true))
+		cp := checkpointForDisable(txID, ownerID, PhaseDisableStarted, DurableReconciliationRequired, journal, traffic.Generation, true)
+		cp.ReconciliationStatus = ReconciliationStatusConfigConflict
+		_ = s.deps.Recovery.Checkpoint(ctx, cp)
 		return Snapshot{}, safeError(KindRestoreConflict, "codex configuration changed after integration", false)
 	}
 
@@ -369,6 +435,19 @@ func (s *Service) Finish(ctx context.Context, discardUnsaved bool) (Snapshot, er
 	if err != nil || journal.IntegrationActive || journal.DurablePhase != DurableInactive {
 		return Snapshot{}, safeError(KindFinishPrecondition, "traffic integration is not inactive", false)
 	}
+	s.mu.Lock()
+	lastGateway := s.lastGateway
+	lastGeneration := s.lastGeneration
+	s.mu.Unlock()
+	if journal.GatewayInstance == "" {
+		journal.GatewayInstance = lastGateway.InstanceID
+	}
+	if journal.GatewayAddress == "" {
+		journal.GatewayAddress = lastGateway.Address
+	}
+	if journal.CaptureGeneration == 0 {
+		journal.CaptureGeneration = lastGeneration
+	}
 	traffic := s.deps.Traffic.Status()
 	if traffic.Mode != trafficanalysis.ModeCaptureOnly || traffic.CaptureState != "passthrough" || traffic.Generation == 0 ||
 		traffic.GatewayInstanceID != journal.GatewayInstance || traffic.GatewayAddress != journal.GatewayAddress {
@@ -418,6 +497,10 @@ func (s *Service) Finish(ctx context.Context, discardUnsaved bool) (Snapshot, er
 	if err != nil {
 		return s.finishRecovery(ctx, txID, finishJournal, final, FinishFailureFinalValidation)
 	}
+	s.mu.Lock()
+	s.lastGateway = GatewaySnapshot{}
+	s.lastGeneration = 0
+	s.mu.Unlock()
 	return Snapshot{Operation: OperationFinish, Phase: PhaseInactive, CaptureState: final.CaptureState, TrafficMode: final.Mode, CaptureGeneration: final.Generation, GatewayMatches: false, IntegrationActive: false}, nil
 }
 
@@ -467,6 +550,11 @@ func (s *Service) backout(ctx context.Context, txID string, prepared *codexconfi
 			return s.requireRecovery(ctx, txID, prepared, backup, gw, traffic.Generation)
 		}
 		if err := s.deps.Config.CommitPreparedRootURLChange(ctx, restore); err != nil {
+			return s.requireRecovery(ctx, txID, prepared, backup, gw, traffic.Generation)
+		}
+	}
+	if state.ModelMappingClaimed {
+		if err := s.deps.Traffic.ClearDesktopModelMappingExpected(traffic.Generation, gw.InstanceID, gw.Address, txID); err != nil {
 			return s.requireRecovery(ctx, txID, prepared, backup, gw, traffic.Generation)
 		}
 	}

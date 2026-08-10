@@ -7,6 +7,7 @@ import (
 	"log/slog"
 
 	"moonbridge/internal/config"
+	"moonbridge/internal/secretstore"
 	runtimepkg "moonbridge/internal/service/runtime"
 )
 
@@ -27,6 +28,7 @@ type Service struct {
 	runtime        Runtime
 	logger         *slog.Logger
 	extensionSpecs []config.ExtensionConfigSpec
+	codec          secretstore.SecretCodec
 }
 
 func NewService(store Store, rt Runtime, logger *slog.Logger) *Service {
@@ -44,6 +46,13 @@ func NewService(store Store, rt Runtime, logger *slog.Logger) *Service {
 
 func (s *Service) WithExtensionSpecs(specs []config.ExtensionConfigSpec) *Service {
 	s.extensionSpecs = append([]config.ExtensionConfigSpec(nil), specs...)
+	return s
+}
+
+// WithCodec injects the secret codec used to encrypt provider API keys at the
+// config boundary. Without a codec, provider keys pass through unchanged.
+func (s *Service) WithCodec(codec secretstore.SecretCodec) *Service {
+	s.codec = codec
 	return s
 }
 
@@ -175,6 +184,15 @@ func (s *Service) DeleteResource(ctx context.Context, kind ResourceKind, id stri
 }
 
 func (s *Service) acceptCandidate(ctx context.Context, fc config.FileConfig, revision string, ops []PatchOp, commit bool) (PatchResponse, error) {
+	if err := fc.NormalizeProviderSecrets(s.codec); err != nil {
+		return PatchResponse{
+			Result:   ResultValidationRejected,
+			Revision: revision,
+			Errors: []FieldError{
+				runtimeFieldError(ops, "secretEncryptionFailed", err),
+			},
+		}, nil
+	}
 	candidate, errs := s.runtimeConfigFromFileConfig(fc, ops)
 	if len(errs) > 0 {
 		return PatchResponse{Result: ResultValidationRejected, Revision: revision, Errors: errs}, nil
@@ -200,6 +218,13 @@ func (s *Service) acceptCandidate(ctx context.Context, fc config.FileConfig, rev
 	nextRevision, err := s.store.SaveConfig(ctx, &candidate)
 	if err != nil {
 		return PatchResponse{}, fmt.Errorf("save config graph: %w", err)
+	}
+	for _, op := range ops {
+		if op.Kind == ResourceProvider && op.Field == "api_key" {
+			if clearer, ok := s.runtime.(interface{ ClearMigrationIssue(string) }); ok {
+				clearer.ClearMigrationIssue(op.ID)
+			}
+		}
 	}
 	if requiresRestart(ops) {
 		graph := BuildGraph(candidate, nextRevision)

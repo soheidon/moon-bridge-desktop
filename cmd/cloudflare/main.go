@@ -13,6 +13,7 @@ import (
 	"moonbridge/internal/db"
 	"moonbridge/internal/logger"
 	"moonbridge/internal/protocol/anthropic"
+	"moonbridge/internal/secretstore"
 	"moonbridge/internal/service/provider"
 	"moonbridge/internal/service/runtime"
 	"moonbridge/internal/service/server"
@@ -49,10 +50,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Build provider infrastructure.
+	// Build provider infrastructure with the shared fail-closed resolver.
+	credentialResolver := &provider.CredentialResolver{Codec: secretstore.New(), LookupEnv: os.LookupEnv}
 	providerDefs := buildProviderDefs(cfg)
 	modelRoutes := buildModelRoutes(cfg)
-	providerMgr, err := provider.NewProviderManager(providerDefs, modelRoutes)
+	providerMgr, err := provider.NewSecureProviderManager(providerDefs, modelRoutes, credentialResolver)
 	if err != nil {
 		slog.Error("init provider manager", "error", err)
 		os.Exit(1)
@@ -67,7 +69,7 @@ func main() {
 	if len(pricing) > 0 {
 		sessionStats.SetPricing(pricing)
 	}
-	rt := runtime.NewRuntime(cfg, providerMgr, pricing)
+	rt := runtime.NewRuntime(cfg, providerMgr, pricing, credentialResolver)
 	cat := app.BuiltinExtensionCatalog{}
 	if d1Cfg := cfg.ExtensionRawConfig("db_d1", ""); len(d1Cfg) > 0 {
 		if binding, ok := d1Cfg["binding"].(string); ok && binding != "" {

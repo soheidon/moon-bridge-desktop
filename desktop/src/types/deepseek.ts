@@ -14,17 +14,34 @@ export interface DeepSeekMetadata {
   models: DeepSeekModelMetadata[];
 }
 
+export interface DeepSeekModelConfig {
+  modelId: DeepSeekModel;
+  reasoning: string;
+  supported: string[];
+}
+
+export type DeepSeekCredentialSource = "stored" | "environment" | "none";
+export type DeepSeekCredentialState = "available" | "missing" | "unavailable" | "unverified";
+export type DeepSeekCredentialErrorCode = "decrypt_failed" | "migration_failed" | "unsupported_platform";
+
 export interface DeepSeekStatus {
   gatewayRunning: boolean;
   providerExists: boolean;
   apiKeySet: boolean;
+  apiKeyEnv?: string;
+  credentialSource: DeepSeekCredentialSource;
+  credentialState: DeepSeekCredentialState;
+  credentialErrorCode?: DeepSeekCredentialErrorCode;
   configured: boolean;
   active: boolean;
   selectedModel: DeepSeekModel | null;
+  defaultModel: "pro" | "flash" | "";
   reasoningEffort: string;
   reasoningExplicitlyConfigured: boolean;
   allowedReasoningEfforts: string[];
   routeAlias: string;
+  pro: DeepSeekModelConfig;
+  flash: DeepSeekModelConfig;
 }
 
 export interface DeepSeekOperationProgress {

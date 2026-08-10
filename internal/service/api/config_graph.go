@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"moonbridge/internal/secretstore"
 	"moonbridge/internal/service/configgraph"
 )
 
@@ -26,6 +27,7 @@ func (r *Router) configGraphService() *configgraph.Service {
 	if r.registry != nil {
 		svc.WithExtensionSpecs(r.registry.ConfigSpecs())
 	}
+	svc.WithCodec(secretstore.New())
 	return svc
 }
 

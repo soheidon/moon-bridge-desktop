@@ -53,11 +53,13 @@ func (s *Server) handleWithAdapters(
 	w http.ResponseWriter,
 	r *http.Request,
 	openAIReq openai.ResponsesRequest,
+	routingAlias string,
 	route *provider.ResolvedRoute,
 ) {
 	ctx := r.Context()
 	log := slog.Default().With("model", openAIReq.Model, "path", "adapter")
 	pm := s.activeProviderManager()
+	routingModel := modelAliasForRequest(openAIReq.Model, routingAlias)
 
 	// Defense-in-depth: ensure model is non-empty.
 	if openAIReq.Model == "" {
@@ -191,12 +193,50 @@ func (s *Server) handleWithAdapters(
 	// the upstream provider receives the correct model identifier.
 	coreReq.Model = preferred.UpstreamModel
 
-	wsMode := resolvedWebSearchMode(pm, openAIReq.Model, preferred)
+	// Apply reasoning policy from routing profile slot.
+	// "thinking": slot reasoning overrides input-derived effort.
+	// "normal": explicitly clear all reasoning/thinking (model default is no thinking).
+	// "": no routing profile slot — pass through input-derived values unchanged.
+	switch preferred.ReasoningMode {
+	case "thinking":
+		if preferred.ReasoningOverride != nil {
+			effort := *preferred.ReasoningOverride
+			if coreReq.Output == nil {
+				coreReq.Output = &format.CoreOutputConfig{}
+			}
+			coreReq.Output.Effort = effort
+		}
+	case "normal":
+		// Explicitly clear input-derived reasoning/thinking.
+		// This ensures "no thinking" regardless of model defaults.
+		coreReq.Output = nil
+		coreReq.Thinking = nil
+		if coreReq.Extensions != nil {
+			if openai, ok := coreReq.Extensions["openai"].(map[string]any); ok {
+				delete(openai, "reasoning")
+			}
+		}
+	case "":
+		// No routing profile slot — pass through unchanged.
+	default:
+		log.Error("adapter path: unknown reasoning mode", "mode", preferred.ReasoningMode)
+		payload := openai.ErrorResponse{
+			Error: openai.ErrorObject{
+				Message: fmt.Sprintf("unsupported reasoning mode: %q", preferred.ReasoningMode),
+				Type:    "server_error",
+				Code:    "unsupported_reasoning_mode",
+			},
+		}
+		writeOpenAIError(w, http.StatusInternalServerError, payload)
+		return
+	}
+
+	wsMode := resolvedWebSearchMode(pm, routingModel, preferred)
 
 	// Inject web search tools at Core level if mode is "injected".
 	// This replaces web_search/web_search_preview with tavily_search/firecrawl_fetch tools.
-	wsInjected := s.injectCoreWebSearch(ctx, coreReq, preferred, openAIReq, wsMode)
-	searchCfg := s.resolvedSearchConfig(preferred.ProviderKey, openAIReq.Model)
+	wsInjected := s.injectCoreWebSearch(ctx, coreReq, preferred, routingModel, wsMode)
+	searchCfg := s.resolvedSearchConfig(preferred.ProviderKey, routingModel)
 
 	upstreamAny, err := providerAdapter.FromCoreRequest(ctx, coreReq)
 	if err != nil {
@@ -262,7 +302,7 @@ func (s *Server) handleWithAdapters(
 		// If streaming, use streaming path.
 		if openAIReq.Stream {
 			adapterCompleted = true
-			s.handleAdapterStream(w, r, ctx, openAIReq, coreReq, upstreamReq, preferred, wsMode, wsInjected)
+			s.handleAdapterStream(w, r, ctx, openAIReq, routingAlias, coreReq, upstreamReq, preferred, wsMode, wsInjected)
 			record.OpenAIRequest = nil
 			return
 		}
@@ -298,7 +338,7 @@ func (s *Server) handleWithAdapters(
 
 		// Wrap with visual orchestrator at Core level if enabled for this model.
 		// This uses CoreProvider, which is protocol-agnostic.
-		if visProv := s.wrapWithVisual(ctx, openAIReq.Model, preferred, providerAdapter, finalizeAnthropicUpstream); visProv != nil {
+		if visProv := s.wrapWithVisual(ctx, routingModel, preferred, providerAdapter, finalizeAnthropicUpstream); visProv != nil {
 			var coreRespApi *format.CoreResponse
 			coreRespApi, err = visProv.CreateCore(ctx, coreReq)
 			if err == nil {
@@ -361,7 +401,7 @@ func (s *Server) handleWithAdapters(
 
 		if openAIReq.Stream {
 			adapterCompleted = true
-			s.handleAdapterStream(w, r, ctx, openAIReq, coreReq, chatReq, preferred, wsMode, wsInjected)
+			s.handleAdapterStream(w, r, ctx, openAIReq, routingAlias, coreReq, chatReq, preferred, wsMode, wsInjected)
 			record.OpenAIRequest = nil
 			return
 		}
@@ -422,7 +462,7 @@ func (s *Server) handleWithAdapters(
 		// the chat-protocol endpoint instead.
 		visualCandidate := preferred
 		visualCandidate.Client = &chatProviderClient{c: chatClient}
-		if visProv := s.wrapWithVisual(ctx, openAIReq.Model, visualCandidate, providerAdapter, finalizeChatUpstream); visProv != nil {
+		if visProv := s.wrapWithVisual(ctx, routingModel, visualCandidate, providerAdapter, finalizeChatUpstream); visProv != nil {
 			coreResp, err = visProv.CreateCore(ctx, coreReq)
 			if err != nil {
 				log.Error("adapter path: chat visual CreateCore failed", "error", err)
@@ -516,7 +556,7 @@ func (s *Server) handleWithAdapters(
 
 		if openAIReq.Stream {
 			adapterCompleted = true
-			s.handleAdapterStream(w, r, ctx, openAIReq, coreReq, googleReq, preferred, wsMode, wsInjected)
+			s.handleAdapterStream(w, r, ctx, openAIReq, routingAlias, coreReq, googleReq, preferred, wsMode, wsInjected)
 			record.OpenAIRequest = nil
 			return
 		}
@@ -558,7 +598,7 @@ func (s *Server) handleWithAdapters(
 		// Wrap with visual orchestrator if enabled for this model.
 		googlePreferred := preferred
 		googlePreferred.Client = &googleProviderClient{c: googleClient, model: googlePreferred.UpstreamModel}
-		if visProv := s.wrapWithVisual(ctx, openAIReq.Model, googlePreferred, providerAdapter, nil); visProv != nil {
+		if visProv := s.wrapWithVisual(ctx, routingModel, googlePreferred, providerAdapter, nil); visProv != nil {
 			var visErr error
 			coreResp, visErr = visProv.CreateCore(ctx, coreReq)
 			if visErr != nil {
@@ -905,6 +945,7 @@ func (s *Server) handleAdapterStream(
 	r *http.Request,
 	ctx context.Context,
 	openAIReq openai.ResponsesRequest,
+	routingAlias string,
 	coreReq *format.CoreRequest,
 	upstreamReq any,
 	candidate provider.ProviderCandidate,
@@ -913,6 +954,7 @@ func (s *Server) handleAdapterStream(
 ) {
 	log := slog.Default().With("model", openAIReq.Model, "path", "adapter_stream")
 	pm := s.activeProviderManager()
+	routingModel := modelAliasForRequest(openAIReq.Model, routingAlias)
 
 	// Track when the request started for latency measurement.
 	requestStart := time.Now()
@@ -947,7 +989,7 @@ func (s *Server) handleAdapterStream(
 				}
 				return &msgReq, nil
 			}
-			if visProv := s.wrapWithVisual(ctx, openAIReq.Model, candidate, providerAdapter, finalizeAnthropicUpstream); visProv != nil {
+			if visProv := s.wrapWithVisual(ctx, routingModel, candidate, providerAdapter, finalizeAnthropicUpstream); visProv != nil {
 				coreResp, err := visProv.CreateCore(ctx, coreReq)
 				if err != nil {
 					log.Error("adapter stream visual fallback: CreateCore failed", "error", err)
@@ -1029,7 +1071,7 @@ func (s *Server) handleAdapterStream(
 					}
 					return &msgReq, nil
 				}
-				if visProv := s.wrapWithVisual(ctx, openAIReq.Model, candidate, provAdapter, finalizeAnthropicUpstream); visProv != nil {
+				if visProv := s.wrapWithVisual(ctx, routingModel, candidate, provAdapter, finalizeAnthropicUpstream); visProv != nil {
 					visCoreProvider = visProv
 				}
 			}
@@ -1055,9 +1097,9 @@ func (s *Server) handleAdapterStream(
 		// Strip image blocks from anthropic request if visual extension is enabled
 		// and images are present. This prevents base64 image data from being sent to
 		// text-only models while keeping pure-text requests on the real streaming path.
-		if hasImage && s.pluginRegistry != nil && s.runtime != nil && openAIReq.Model != "" {
+		if hasImage && s.pluginRegistry != nil && s.runtime != nil && routingModel != "" {
 			cfgV := s.runtime.Current().Config
-			visCfg, visOk := visualpkg.ConfigForModelFromResolvedConfig(cfgV, openAIReq.Model)
+			visCfg, visOk := visualpkg.ConfigForModelFromResolvedConfig(cfgV, routingModel)
 			if visOk && visCfg.Provider != "" && visCfg.Model != "" {
 				strippedReq, _ := visualpkg.StripImagesFromAnthropic(*anthReq)
 				anthReq = &strippedReq
@@ -1156,9 +1198,9 @@ func (s *Server) handleAdapterStream(
 		// streaming path; without stripping, raw base64 image data would be
 		// forwarded to a text-only upstream that cannot consume it and would
 		// burn input tokens. Mirrors the anthropic streaming behavior above.
-		if s.pluginRegistry != nil && s.runtime != nil && openAIReq.Model != "" {
+		if s.pluginRegistry != nil && s.runtime != nil && routingModel != "" {
 			cfgV := s.runtime.Current().Config
-			visCfg, visOk := visualpkg.ConfigForModelFromResolvedConfig(cfgV, openAIReq.Model)
+			visCfg, visOk := visualpkg.ConfigForModelFromResolvedConfig(cfgV, routingModel)
 			if visOk && visCfg.Provider != "" && visCfg.Model != "" {
 				strippedReq, _ := visualpkg.StripImagesFromChat(*chatReq)
 				chatReq = &strippedReq
@@ -1212,9 +1254,9 @@ func (s *Server) handleAdapterStream(
 
 		// Visual orchestrator for streaming path: non-streaming orchestration
 		// → synthetic stream events, matching the anthropic streaming pattern.
-		if s.pluginRegistry != nil && s.runtime != nil && openAIReq.Model != "" && ok && providerAdapter != nil {
+		if s.pluginRegistry != nil && s.runtime != nil && routingModel != "" && ok && providerAdapter != nil {
 			cfgV := s.runtime.Current().Config
-			visCfg, visOk := visualpkg.ConfigForModelFromResolvedConfig(cfgV, openAIReq.Model)
+			visCfg, visOk := visualpkg.ConfigForModelFromResolvedConfig(cfgV, routingModel)
 			if visOk && visCfg.Provider != "" && visCfg.Model != "" {
 				finalizeUpstream := func(_ context.Context, upstream any) (any, error) {
 					req, ok := upstream.(*chat.ChatRequest)
@@ -1228,7 +1270,7 @@ func (s *Server) handleAdapterStream(
 				}
 				visCandidate := candidate
 				visCandidate.Client = &chatProviderClient{c: chatClient}
-				if visProv := s.wrapWithVisual(ctx, openAIReq.Model, visCandidate, providerAdapter, finalizeUpstream); visProv != nil {
+				if visProv := s.wrapWithVisual(ctx, routingModel, visCandidate, providerAdapter, finalizeUpstream); visProv != nil {
 					coreResp, visErr := visProv.CreateCore(ctx, coreReq)
 					if visErr != nil {
 						log.Error("adapter stream: chat visual CreateCore failed", "error", visErr)
@@ -1251,7 +1293,7 @@ func (s *Server) handleAdapterStream(
 		}
 
 		if wsInjected {
-			searchCfg := s.resolvedSearchConfig(candidate.ProviderKey, openAIReq.Model)
+			searchCfg := s.resolvedSearchConfig(candidate.ProviderKey, routingModel)
 			chatStream, err = s.chatSearchBufferedStream(ctx, chatClient, chatReq, searchCfg.tavilyKey, searchCfg.firecrawlKey, searchCfg.maxRounds)
 		} else {
 			chatStream, err = chatClient.StreamChat(ctx, chatReq)
@@ -1359,13 +1401,13 @@ func (s *Server) handleAdapterStream(
 		// Visual orchestrator for streaming path: non-streaming orchestration
 		// → synthetic stream events, matching the anthropic/chat streaming pattern.
 		providerAdapter, ok := s.adapterRegistry.GetProvider(config.ProtocolGoogleGenAI)
-		if ok && providerAdapter != nil && s.runtime != nil && openAIReq.Model != "" {
+		if ok && providerAdapter != nil && s.runtime != nil && routingModel != "" {
 			cfgV := s.runtime.Current().Config
-			visCfg, visOk := visualpkg.ConfigForModelFromResolvedConfig(cfgV, openAIReq.Model)
+			visCfg, visOk := visualpkg.ConfigForModelFromResolvedConfig(cfgV, routingModel)
 			if visOk && visCfg.Provider != "" && visCfg.Model != "" {
 				visCandidate := candidate
 				visCandidate.Client = &googleProviderClient{c: googleClient, model: candidate.UpstreamModel}
-				if visProv := s.wrapWithVisual(ctx, openAIReq.Model, visCandidate, providerAdapter, nil); visProv != nil {
+				if visProv := s.wrapWithVisual(ctx, routingModel, visCandidate, providerAdapter, nil); visProv != nil {
 					coreResp, visErr := visProv.CreateCore(ctx, coreReq)
 					if visErr != nil {
 						log.Error("adapter stream: google visual CreateCore failed", "error", visErr)
@@ -1388,7 +1430,7 @@ func (s *Server) handleAdapterStream(
 		}
 
 		if wsInjected {
-			searchCfg := s.resolvedSearchConfig(candidate.ProviderKey, openAIReq.Model)
+			searchCfg := s.resolvedSearchConfig(candidate.ProviderKey, routingModel)
 			googleResp, err := s.executeGoogleSearchLoop(ctx, googleClient, candidate.UpstreamModel, googleReq, searchCfg.tavilyKey, searchCfg.firecrawlKey, searchCfg.maxRounds)
 			if err != nil {
 				log.Error("adapter stream: injected google search loop failed", "error", err)
@@ -2441,7 +2483,7 @@ func normalizeAnthropicRequest(upstream any) (anthropic.MessageRequest, error) {
 // injectCoreWebSearch replaces web_search tools in coreReq.Tools with injected
 // tavily_search/firecrawl_fetch tools when the resolved web search mode is "injected".
 // Returns true if injection was applied.
-func (s *Server) injectCoreWebSearch(ctx context.Context, coreReq *format.CoreRequest, preferred provider.ProviderCandidate, openAIReq openai.ResponsesRequest, wsMode string) bool {
+func (s *Server) injectCoreWebSearch(ctx context.Context, coreReq *format.CoreRequest, preferred provider.ProviderCandidate, modelAlias, wsMode string) bool {
 	_ = ctx
 	if wsMode != "injected" {
 		return false
@@ -2449,7 +2491,7 @@ func (s *Server) injectCoreWebSearch(ctx context.Context, coreReq *format.CoreRe
 	if s.runtime == nil {
 		return false
 	}
-	searchCfg := s.resolvedSearchConfig(preferred.ProviderKey, openAIReq.Model)
+	searchCfg := s.resolvedSearchConfig(preferred.ProviderKey, modelAlias)
 	if searchCfg.tavilyKey == "" && searchCfg.firecrawlKey == "" {
 		return false
 	}
@@ -2469,6 +2511,13 @@ func (s *Server) injectCoreWebSearch(ctx context.Context, coreReq *format.CoreRe
 		coreReq.ToolChoice = &format.CoreToolChoice{Mode: "auto"}
 	}
 	return true
+}
+
+func modelAliasForRequest(requestedModel, routingAlias string) string {
+	if routingAlias != "" {
+		return routingAlias
+	}
+	return requestedModel
 }
 
 func resolvedWebSearchMode(pm *provider.ProviderManager, modelAlias string, preferred provider.ProviderCandidate) string {

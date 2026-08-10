@@ -50,10 +50,17 @@ const (
 	DurableReconciliationRequired DurablePhase = "reconciliation_required"
 )
 
+// ReconciliationStatusConfigConflict marks a Disable restore-conflict
+// checkpoint so the GUI can surface the live dead-end without a process
+// restart. The value must equal recovery.StatusConfigConflict.
+const ReconciliationStatusConfigConflict = "config_conflict"
+
 type GatewaySnapshot struct {
-	Running    bool
-	InstanceID string
-	Address    string
+	Running           bool
+	InstanceID        string
+	Address           string
+	DefaultModelAlias string
+	RoutingAvailable  bool
 }
 
 type GatewayProvider interface {
@@ -70,6 +77,8 @@ type TrafficProvider interface {
 	ValidateIdleExpected(uint64) (trafficanalysis.State, error)
 	StartCapture(trafficanalysis.StartOptions) (trafficanalysis.State, error)
 	ClaimDesktopExpected(uint64, string, string, string) (trafficanalysis.State, error)
+	SetDesktopModelMappingExpected(uint64, string, string, string, string, string) error
+	ClearDesktopModelMappingExpected(uint64, string, string, string) error
 	PauseDesktopExpected(context.Context, uint64, string, string, string) (trafficanalysis.State, error)
 	ReleaseDesktopExpected(uint64, string) (trafficanalysis.State, error)
 	CloseCapture(context.Context) (trafficanalysis.State, error)
@@ -77,6 +86,7 @@ type TrafficProvider interface {
 
 type ConfigEditor interface {
 	ReadRootURL(context.Context) (codexconfig.RootURLSnapshot, error)
+	ReadRoutingIdentity(context.Context) (codexconfig.RoutingIdentitySnapshot, error)
 	PrepareRootURLChange(context.Context, *string, string) (*codexconfig.PreparedRootURLChange, error)
 	CommitPreparedRootURLChange(context.Context, *codexconfig.PreparedRootURLChange) error
 }
@@ -110,6 +120,10 @@ type Checkpoint struct {
 	UnsavedObservationsMayRemain bool
 	UnsavedDiscardConfirmed      bool
 	AutoLogFinalized             bool
+	// ReconciliationStatus records the Recovery reconciliation classification
+	// (e.g. ReconciliationStatusConfigConflict) when Disable hits a restore
+	// conflict, so the GUI can surface the live dead-end without a restart.
+	ReconciliationStatus string
 }
 
 type RecoveryWriter interface {
@@ -165,6 +179,7 @@ type FailureState struct {
 	StartedCapture      bool
 	AdoptedCapture      bool
 	OwnershipClaimed    bool
+	ModelMappingClaimed bool
 	ConfigCommitted     bool
 	CheckpointUncertain bool
 }

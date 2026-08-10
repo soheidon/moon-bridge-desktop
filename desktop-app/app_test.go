@@ -154,6 +154,10 @@ func (c *scriptedController) Status() gateway.State {
 	return c.state
 }
 
+func (c *scriptedController) RefreshRoutingProfile(cfg config.Config) {
+	// no-op in tests
+}
+
 type gatewayIdentity struct {
 	instanceID string
 	token      string
@@ -181,6 +185,15 @@ func noopEmit(string, any) {}
 func scriptedDeriver(cfg config.Config, err error) codexConfigDeriver {
 	return func(context.Context, *gatewaySession, config.LoadOptions) (config.Config, error) {
 		return cfg, err
+	}
+}
+
+// dynamicDeriver returns a codexConfigDeriver that calls fn each time. This
+// allows tests to simulate a post-mutation effective config that differs from
+// the pre-mutation session config.
+func dynamicDeriver(fn func() (config.Config, error)) codexConfigDeriver {
+	return func(context.Context, *gatewaySession, config.LoadOptions) (config.Config, error) {
+		return fn()
 	}
 }
 
@@ -661,6 +674,10 @@ func (b *blockingController) Status() gateway.State {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.state
+}
+
+func (b *blockingController) RefreshRoutingProfile(cfg config.Config) {
+	// no-op in tests
 }
 
 func TestShutdownInterruptsInflightStart(t *testing.T) {

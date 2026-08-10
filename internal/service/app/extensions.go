@@ -12,6 +12,7 @@ import (
 	kimiworkaround "moonbridge/internal/extension/kimi_workaround"
 	mbtrics "moonbridge/internal/extension/metrics"
 	"moonbridge/internal/extension/plugin"
+	routingprofiles "moonbridge/internal/extension/routingprofiles"
 	"moonbridge/internal/extension/visual"
 )
 
@@ -38,6 +39,7 @@ func (cat BuiltinExtensionCatalog) ConfigSpecs() []config.ExtensionConfigSpec {
 	specs = append(specs, dbd1.ConfigSpecs()...)
 	specs = append(specs, mbtrics.ConfigSpecs()...)
 	specs = append(specs, codextoolproxy.ConfigSpecs()...)
+	specs = append(specs, routingprofiles.ConfigSpecs()...)
 	return specs
 }
 

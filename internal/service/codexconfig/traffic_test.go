@@ -31,6 +31,27 @@ func TestReadRootURLIgnoresCommentsStringsAndTables(t *testing.T) {
 	}
 }
 
+func TestReadRoutingIdentityReadsOnlyTopLevelKeys(t *testing.T) {
+	svc, home, _ := newTestService(t)
+	config := "# model = \"comment-model\"\n" +
+		"note = 'model_provider = \"string-provider\"'\n" +
+		"model = \"gpt-future\"\n" +
+		"model_provider = \"openai\"\n" +
+		"\n[profile]\nmodel = \"table-model\"\nmodel_provider = \"table-provider\"\n"
+	writeFile(t, filepath.Join(home, "config.toml"), config)
+
+	identity, err := svc.ReadRoutingIdentity(context.Background())
+	if err != nil {
+		t.Fatalf("ReadRoutingIdentity failed: %v", err)
+	}
+	if identity.Model != "gpt-future" || identity.ModelProvider != "openai" {
+		t.Fatalf("unexpected routing identity: %+v", identity)
+	}
+	if identity.ConfigHash != hashBytes([]byte(config)) {
+		t.Fatalf("unexpected config hash: %q", identity.ConfigHash)
+	}
+}
+
 func TestPrepareAndCommitRootURLPreservesLosslessConfig(t *testing.T) {
 	svc, home, _ := newTestService(t)
 	path := filepath.Join(home, "config.toml")

@@ -14,6 +14,7 @@ import (
 
 	"moonbridge/internal/config"
 	"moonbridge/internal/service/configgraph"
+	"moonbridge/internal/service/provider"
 )
 
 // ManagementAPI is the subset of the gateway config management API the
@@ -27,6 +28,15 @@ type ManagementAPI interface {
 	// masked by the server). It is the source of truth for codex config
 	// derivation; the desktop re-injects the live server token.
 	Effective(ctx context.Context) (config.FileConfig, error)
+	// CredentialStatus returns the non-secret credential states the shared
+	// resolver recorded at client generation. It lets Load report what the
+	// runtime actually observed (decrypt/migration failure, env-only use)
+	// instead of assuming a stored key is usable.
+	CredentialStatus(ctx context.Context) ([]provider.CredentialInfo, error)
+	// TestProvider probes the provider's upstream connection. The server resolves
+	// the credential via the shared resolver; key is the provider id, never a
+	// secret.
+	TestProvider(ctx context.Context, key string) (ConnectionTestResult, error)
 }
 
 // HTTPClient talks to the in-process gateway's management API over loopback.
@@ -76,6 +86,51 @@ func (c *HTTPClient) Effective(ctx context.Context) (config.FileConfig, error) {
 		return config.FileConfig{}, fmt.Errorf("deepseek: decode effective config: %w", err)
 	}
 	return fc, nil
+}
+
+// ConnectionTestResult is the structured, secret-free result of a provider
+// connection probe. Code is allowlisted by the server; Message is server-authored.
+type ConnectionTestResult struct {
+	Success  bool   `json:"success"`
+	Code     string `json:"code"`
+	Message  string `json:"message"`
+	Model    string `json:"model"`
+	Duration string `json:"duration"`
+}
+
+// TestProvider probes the provider's upstream connection through the management
+// API. The server resolves the credential via the shared resolver, so no key is
+// passed from the caller.
+func (c *HTTPClient) TestProvider(ctx context.Context, key string) (ConnectionTestResult, error) {
+	data, status, err := c.do(ctx, http.MethodPost, "/api/v1/providers/"+url.PathEscape(key)+"/test", nil)
+	if err != nil {
+		return ConnectionTestResult{}, err
+	}
+	if status != http.StatusOK {
+		return ConnectionTestResult{}, fmt.Errorf("deepseek: test provider failed with status %d", status)
+	}
+	var result ConnectionTestResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		return ConnectionTestResult{}, fmt.Errorf("deepseek: decode test provider result: %w", err)
+	}
+	return result, nil
+}
+
+func (c *HTTPClient) CredentialStatus(ctx context.Context) ([]provider.CredentialInfo, error) {
+	data, status, err := c.do(ctx, http.MethodGet, "/api/v1/credentials/status", nil)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("deepseek: get credential status failed with status %d", status)
+	}
+	var resp struct {
+		Credentials []provider.CredentialInfo `json:"credentials"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("deepseek: decode credential status: %w", err)
+	}
+	return resp.Credentials, nil
 }
 
 func (c *HTTPClient) Patch(ctx context.Context, req configgraph.PatchRequest) (configgraph.PatchResponse, error) {

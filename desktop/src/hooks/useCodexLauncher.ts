@@ -1,8 +1,5 @@
-import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { open } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { closeWindow, command, onEvent, openDialog } from "../platform/desktop";
 import type { GatewaySnapshot } from "../types/gateway";
 import type { DeepSeekStatus } from "../types/deepseek";
 import type {
@@ -11,6 +8,21 @@ import type {
   CodexOperationProgress,
   CodexStatus,
 } from "../types/codex";
+
+type WailsCodexState = { status: string; pid: number; codexHome: string };
+type WailsCodexValue = { codex?: WailsCodexState };
+
+function toCodexStatus(value: WailsCodexValue): CodexStatus {
+  return {
+    installed: value.codex !== undefined,
+    executablePath: null,
+    version: null,
+    codexHome: value.codex?.codexHome ?? "",
+    configPath: "",
+    configExists: value.codex !== undefined,
+    routeAlias: "moonbridge",
+  };
+}
 
 const PROJECT_STORAGE_KEY = "moon-bridge-desktop.codex.project-directory";
 
@@ -27,7 +39,8 @@ export function useCodexLauncher(snapshot: GatewaySnapshot, deepseekStatus: Deep
 
   const refreshStatus = useCallback(async () => {
     try {
-      setStatus(await invoke<CodexStatus>("codex_status"));
+      const value = await command<WailsCodexValue>("CodexStatus");
+      setStatus(value.codex ? toCodexStatus(value) : null);
     } catch (reason) {
       setStatus(null);
       setError(asCodexError(reason, "codex_status"));
@@ -40,38 +53,30 @@ export function useCodexLauncher(snapshot: GatewaySnapshot, deepseekStatus: Deep
 
   useEffect(() => {
     let disposed = false;
-    let unlisten: UnlistenFn | undefined;
-    void listen<CodexOperationProgress>("codex-operation-progress", (event) => {
-      if (!disposed && event.payload.operationId === operationIdRef.current) {
-        setProgress(event.payload);
+    const unlisten = onEvent<CodexOperationProgress>("codex-operation-progress", (payload) => {
+      if (!disposed && payload.operationId === operationIdRef.current) {
+        setProgress(payload);
       }
-    }).then((fn) => {
-      if (disposed) fn();
-      else unlisten = fn;
     });
     return () => {
       disposed = true;
-      unlisten?.();
+      unlisten();
     };
   }, []);
 
   useEffect(() => {
     let disposed = false;
-    let unlisten: UnlistenFn | undefined;
-    void listen("desktop-exit-confirmation-requested", () => {
+    const unlisten = onEvent("desktop-exit-confirmation-requested", () => {
       if (!disposed) setExitPromptOpen(true);
-    }).then((fn) => {
-      if (disposed) fn();
-      else unlisten = fn;
     });
     return () => {
       disposed = true;
-      unlisten?.();
+      unlisten();
     };
   }, []);
 
   const chooseProject = useCallback(async () => {
-    const selected = await open({ directory: true, multiple: false, title: "Codexプロジェクトフォルダを選択" });
+    const selected = await openDialog({ directory: true, multiple: false, title: "Codexプロジェクトフォルダを選択" });
     if (typeof selected === "string") {
       setProjectDirectory(selected);
       localStorage.setItem(PROJECT_STORAGE_KEY, selected);
@@ -87,11 +92,20 @@ export function useCodexLauncher(snapshot: GatewaySnapshot, deepseekStatus: Deep
     setLaunching(true);
     setError(null);
     try {
-      const result = await invoke<CodexLaunchResult>("codex_launch", {
-        input: { operationId: nextOperationId, projectDirectory: projectDirectory.trim() },
-      });
+      const value = await command<WailsCodexValue>("LaunchCodex", { projectDirectory: projectDirectory.trim() });
+      const result: CodexLaunchResult = {
+        operationId: nextOperationId,
+        terminalPid: value.codex?.pid ?? 0,
+        projectDirectory: projectDirectory.trim(),
+        codexHome: value.codex?.codexHome ?? "",
+        configPath: "",
+        codexVersion: "",
+        gatewayStartedByOperation: false,
+        gatewaySnapshot: snapshot,
+        warning: null,
+      };
       setLastLaunch(result);
-      setProgress({ operationId: nextOperationId, operation: "launch", stage: "complete", message: result.warning ?? "Codexを起動しました" });
+      setProgress({ operationId: nextOperationId, operation: "launch", stage: "complete", message: "Codexを起動しました" });
       return true;
     } catch (reason) {
       setError(asCodexError(reason, "codex_launch"));
@@ -102,14 +116,14 @@ export function useCodexLauncher(snapshot: GatewaySnapshot, deepseekStatus: Deep
   }, [launching, projectDirectory]);
 
   const cancelExit = useCallback(async () => {
-    await invoke("desktop_cancel_exit");
+    await command("CancelExit");
     setExitPromptOpen(false);
   }, []);
 
   const confirmExit = useCallback(async () => {
-    await invoke("desktop_confirm_exit");
+    await command("ConfirmExit", { confirm: true });
     setExitPromptOpen(false);
-    await getCurrentWindow().close();
+    await closeWindow();
   }, []);
 
   const effectiveModel = deepseekStatus?.selectedModel ?? null;

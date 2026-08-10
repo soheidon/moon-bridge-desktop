@@ -53,6 +53,9 @@ func validatePatchTarget(fc config.FileConfig, schema map[ResourceKind]map[strin
 	if !resourceExists(fc, op.Kind, op.ID) {
 		return patchError(op, "unknownResource", fmt.Sprintf("unknown resource %s/%s", op.Kind, op.ID))
 	}
+	if op.Clear && op.Value != nil {
+		return patchError(op, "invalidPatch", "clear cannot be combined with a value")
+	}
 	return nil
 }
 
@@ -270,7 +273,15 @@ func applyProviderPatch(fc *config.FileConfig, op PatchOp) *FieldError {
 			return err
 		}
 	case "api_key":
+		if op.Clear {
+			provider.APIKey = ""
+			break
+		}
 		if err := setSecretString(op, &provider.APIKey); err != nil {
+			return err
+		}
+	case "api_key_env":
+		if err := setString(op, &provider.APIKeyEnv); err != nil {
 			return err
 		}
 	case "version":

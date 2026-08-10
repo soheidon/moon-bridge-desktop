@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"moonbridge/internal/config"
 )
 
 const APIVersion = 2
@@ -25,6 +27,8 @@ type Control struct {
 	StartedAt       time.Time
 	trafficAnalysis http.Handler
 	trafficStatus   func() any
+
+	routingProfileRefresh func(cfg config.Config)
 
 	shutdownOnce sync.Once
 	shutdown     func()
@@ -48,6 +52,22 @@ func (c *Control) WithTrafficAnalysis(handler http.Handler) *Control {
 func (c *Control) WithTrafficAnalysisStatus(status func() any) *Control {
 	c.trafficStatus = status
 	return c
+}
+
+// WithRoutingProfileRefresh registers a callback that rebuilds the Gateway's
+// runtime SlotResolver from a fresh config snapshot. Called after a routing
+// profile mutation succeeds so the next request uses the updated profile.
+func (c *Control) WithRoutingProfileRefresh(refresh func(cfg config.Config)) *Control {
+	c.routingProfileRefresh = refresh
+	return c
+}
+
+// RefreshRoutingProfile triggers the registered routing profile resolver
+// rebuild callback. No-op when no callback is registered.
+func (c *Control) RefreshRoutingProfile(cfg config.Config) {
+	if c.routingProfileRefresh != nil {
+		c.routingProfileRefresh(cfg)
+	}
 }
 
 func New(instanceID, token string, shutdown func()) *Control {

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"moonbridge/internal/config"
@@ -18,6 +19,7 @@ import (
 	"moonbridge/internal/protocol/openai"
 	"moonbridge/internal/service/api"
 	"moonbridge/internal/service/provider"
+	"moonbridge/internal/service/routingprofile"
 	"moonbridge/internal/service/runtime"
 	"moonbridge/internal/service/stats"
 	"moonbridge/internal/service/store"
@@ -35,47 +37,86 @@ import (
 type Config struct {
 	// ServerCfg is the scoped domain config for the server layer.
 	// Used alongside AppConfig for the full config.
-	ServerCfg        config.ServerConfig
-	AdapterRegistry  *format.Registry        // adapter dispatch path (format registry)
-	Provider         provider.ProviderClient // fallback provider for non-adapter path
-	ProviderMgr      *provider.ProviderManager
-	OpenAIHTTPClient *http.Client
-	ProxyHTTPClient  *http.Client
-	ChatClients      map[string]any
-	GoogleClients    map[string]any
-	Tracer           *mbtrace.Tracer
-	TraceErrors      io.Writer
-	Stats            *stats.SessionStats
-	PluginRegistry   *plugin.Registry
-	AppConfig        config.ServerConfig
-	Runtime          *runtime.Runtime
-	Store            store.ConfigStore
-	SessionManager   session.Manager
-	UsageTracker     usage.Tracker
-	TraceWriter      trace.Writer
+	ServerCfg              config.ServerConfig
+	AdapterRegistry        *format.Registry        // adapter dispatch path (format registry)
+	Provider               provider.ProviderClient // fallback provider for non-adapter path
+	ProviderMgr            *provider.ProviderManager
+	TrafficRouting         TrafficRouting
+	RoutingProfileResolver RoutingProfileResolver
+	OpenAIHTTPClient       *http.Client
+	ProxyHTTPClient        *http.Client
+	ChatClients            map[string]any
+	GoogleClients          map[string]any
+	Tracer                 *mbtrace.Tracer
+	TraceErrors            io.Writer
+	Stats                  *stats.SessionStats
+	PluginRegistry         *plugin.Registry
+	AppConfig              config.ServerConfig
+	Runtime                *runtime.Runtime
+	Store                  store.ConfigStore
+	SessionManager         session.Manager
+	UsageTracker           usage.Tracker
+	TraceWriter            trace.Writer
+}
+
+// RelayMarkerHeader names the origin-proof header the Capture relay stamps on
+// forwarded requests. dispatch consumes and removes it before any tracing, and
+// the Gateway validates it before a source model may be lazily bound.
+const RelayMarkerHeader = "X-Moonbridge-Relay"
+
+// TrafficRouting is the narrow, read-only bridge from the active Traffic
+// relay to model resolution. Implementations lazily bind and exact-match a
+// process-local source mapping for requests that provably traversed the relay.
+type TrafficRouting interface {
+	ObservedModelFor(sourceModel, relayMarker string) (targetRoute string, ok bool)
+}
+
+// RoutingProfileSlotResult is the output of a routing profile slot resolution.
+type RoutingProfileSlotResult struct {
+	ProviderKey   string
+	UpstreamModel string
+	Mode          string
+	Reasoning     *string
+}
+
+// RoutingProfileResolver is the read-only bridge from the active routing
+// profile to slot resolution at request time. It maps a Codex request model
+// identifier to the profile's slot configuration without mutating the graph.
+type RoutingProfileResolver interface {
+	// ResolveSlot returns the slot configuration for a Codex request model.
+	// Returns ok=false when no active profile or no exact match.
+	ResolveSlot(requestModel string) (RoutingProfileSlotResult, bool)
+}
+
+// routingProfileResolverHolder wraps a RoutingProfileResolver so atomic.Pointer
+// can swap it without the concrete-type restriction of atomic.Value.
+type routingProfileResolverHolder struct {
+	resolver RoutingProfileResolver
 }
 
 type Server struct {
-	adapterRegistry *format.Registry
-	provider        provider.ProviderClient
-	providerMgr     *provider.ProviderManager
-	openAIHTTP      *http.Client
-	proxyHTTP       *http.Client
-	chatClients     map[string]any
-	googleClients   map[string]any
-	tracer          *mbtrace.Tracer
-	traceErrors     io.Writer
-	stats           *stats.SessionStats
-	pluginRegistry  *plugin.Registry
-	mux             *http.ServeMux
-	onceClose       sync.Once
-	appConfig       config.ServerConfig
-	serverCfg       config.ServerConfig
-	runtime         *runtime.Runtime
-	store           store.ConfigStore
-	sessionManager  session.Manager
-	usageTracker    usage.Tracker
-	traceWriter     trace.Writer
+	adapterRegistry        *format.Registry
+	provider               provider.ProviderClient
+	providerMgr            *provider.ProviderManager
+	trafficRouting         TrafficRouting
+	routingProfileResolver atomic.Pointer[routingProfileResolverHolder]
+	openAIHTTP             *http.Client
+	proxyHTTP              *http.Client
+	chatClients            map[string]any
+	googleClients          map[string]any
+	tracer                 *mbtrace.Tracer
+	traceErrors            io.Writer
+	stats                  *stats.SessionStats
+	pluginRegistry         *plugin.Registry
+	mux                    *http.ServeMux
+	onceClose              sync.Once
+	appConfig              config.ServerConfig
+	serverCfg              config.ServerConfig
+	runtime                *runtime.Runtime
+	store                  store.ConfigStore
+	sessionManager         session.Manager
+	usageTracker           usage.Tracker
+	traceWriter            trace.Writer
 
 	// clientCaches holds lazily-created HTTP clients for runtime-reloaded providers.
 	// Keyed by provider key, invalidated when Runtime reloads.
@@ -83,6 +124,17 @@ type Server struct {
 	googleCache   map[string]*google.Client
 	clientCacheMu sync.RWMutex
 	googleCacheMu sync.RWMutex
+}
+
+// SwapRoutingProfileResolver atomically replaces the routing profile slot
+// resolver. Call this after a profile mutation so the next request uses the
+// updated profile configuration. Pass nil to clear.
+func (s *Server) SwapRoutingProfileResolver(r RoutingProfileResolver) {
+	if r == nil {
+		s.routingProfileResolver.Store(nil)
+		return
+	}
+	s.routingProfileResolver.Store(&routingProfileResolverHolder{resolver: r})
 }
 
 func (s *Server) runtimeSnapshot() *runtime.ConfigSnapshot {
@@ -167,6 +219,7 @@ func New(cfg Config) *Server {
 		adapterRegistry: cfg.AdapterRegistry,
 		provider:        cfg.Provider,
 		providerMgr:     cfg.ProviderMgr,
+		trafficRouting:  cfg.TrafficRouting,
 		openAIHTTP:      cfg.OpenAIHTTPClient,
 		proxyHTTP:       cfg.ProxyHTTPClient,
 		tracer:          cfg.Tracer,
@@ -185,6 +238,9 @@ func New(cfg Config) *Server {
 		traceWriter:     cfg.TraceWriter,
 		clientCache:     make(map[string]*chat.Client),
 		googleCache:     make(map[string]*google.Client),
+	}
+	if cfg.RoutingProfileResolver != nil {
+		s.routingProfileResolver.Store(&routingProfileResolverHolder{resolver: cfg.RoutingProfileResolver})
 	}
 	s.mux.HandleFunc("/v1/responses", s.handleResponses)
 	s.mux.HandleFunc("/responses", s.handleResponses)
@@ -370,9 +426,66 @@ func checkAuth(r *http.Request, expectedToken string) bool {
 	return strings.TrimSpace(auth[7:]) == expectedToken
 }
 
-func (s *Server) resolveModelOrFallback(modelName string) (*provider.ResolvedRoute, error) {
+func (s *Server) resolveModelOrFallback(modelName, relayMarker string) (*provider.ResolvedRoute, string, error) {
 	if pm := s.activeProviderManager(); pm != nil {
-		return pm.ResolveModel(modelName)
+		resolved, err := pm.ResolveModel(modelName)
+		if err == nil {
+			return resolved, "", nil
+		}
+		if !isModelNotFound(err) {
+			return nil, "", err
+		}
+		// Traffic relay fallback (existing)
+		if s.trafficRouting != nil {
+			resolveDiag := func(hit, attempted, success bool) {
+				logger.Info("traffic model routing resolve",
+					"primary_not_found", true,
+					"mapping_lookup_hit", hit,
+					"target_resolve_attempted", attempted,
+					"target_resolve_success", success)
+			}
+			targetAlias, ok := s.trafficRouting.ObservedModelFor(modelName, relayMarker)
+			if !ok || targetAlias == "" {
+				resolveDiag(false, false, false)
+			} else {
+				mapped, mappedErr := pm.ResolveModel(targetAlias)
+				if mappedErr == nil {
+					resolveDiag(true, true, true)
+					return mapped, targetAlias, nil
+				}
+				resolveDiag(true, true, false)
+			}
+		}
+		// Routing profile slot resolver: maps Codex request model identifiers
+		// (gpt-5.6-sol/terra/luna) to the active profile's slot configuration.
+		// Read-only; never patches the graph. Uses provider/model direct ref
+		// to honor slot.ProviderKey so mixed-provider profiles resolve correctly.
+		if h := s.routingProfileResolver.Load(); h != nil && h.resolver != nil {
+			slot, ok := h.resolver.ResolveSlot(modelName)
+			if ok {
+				// Build a provider/model direct ref so the ProviderManager
+				// resolves to the slot's specific provider, not an ambiguous
+				// model name that could match multiple providers.
+				targetRef := slot.ProviderKey + "/" + slot.UpstreamModel
+				mapped, mappedErr := pm.ResolveModel(targetRef)
+				if mappedErr == nil {
+					mode, modeErr := routingprofile.NormalizeSlotMode(slot.Mode, slot.Reasoning)
+					if modeErr != nil {
+						return nil, "", err
+					}
+					for i := range mapped.Candidates {
+						mapped.Candidates[i].ReasoningMode = mode
+					}
+					if mode == routingprofile.ModeThinking && slot.Reasoning != nil {
+						for i := range mapped.Candidates {
+							mapped.Candidates[i].ReasoningOverride = slot.Reasoning
+						}
+					}
+					return mapped, slot.UpstreamModel, nil
+				}
+			}
+		}
+		return nil, "", err
 	}
 	if s.provider != nil {
 		return &provider.ResolvedRoute{
@@ -382,9 +495,16 @@ func (s *Server) resolveModelOrFallback(modelName string) (*provider.ResolvedRou
 				Protocol:      "anthropic",
 				Client:        s.provider,
 			}},
-		}, nil
+		}, "", nil
 	}
-	return nil, fmt.Errorf("no provider manager configured for model %q", modelName)
+	return nil, "", fmt.Errorf("no provider manager configured for model %q", modelName)
+}
+
+func isModelNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.HasPrefix(err.Error(), "no route or provider found for model ")
 }
 
 func requestHasImage(input json.RawMessage) bool {

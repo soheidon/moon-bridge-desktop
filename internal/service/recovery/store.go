@@ -49,6 +49,8 @@ func Resolve(root, rel string) (string, error) {
 // ToRelative returns the root-relative form of an absolute path if it lies
 // under root; otherwise it returns an error (the path must not be stored).
 func ToRelative(root, abs string) (string, error) {
+	abs = stripVerbatimPrefix(abs)
+	root = stripVerbatimPrefix(root)
 	if !filepath.IsAbs(abs) {
 		return "", errors.New("path is not absolute")
 	}
@@ -233,6 +235,30 @@ func (s *Store) Update(ctx context.Context, fn func(current *State) error) error
 	return s.writeLocked(ctx, cur)
 }
 
+// UpdateOrCreate is the atomic counterpart for callers that may be writing
+// the first Recovery record. Unlike Update, the callback is given a fresh
+// schema-v2 state when the file does not exist. The load, callback, and write
+// remain under one Store lock so two first checkpoints cannot overwrite one
+// another or observe a partially initialized record.
+func (s *Store) UpdateOrCreate(ctx context.Context, fn func(current *State) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, err := s.loadUnlocked(ctx)
+	if err != nil {
+		return err
+	}
+	if cur == nil {
+		cur = New()
+	}
+	if err := fn(cur); err != nil {
+		if errors.Is(err, errChangesSkipped) {
+			return nil
+		}
+		return err
+	}
+	return s.writeLocked(ctx, cur)
+}
+
 // Write persists a full State atomically, running normalizeForWrite first.
 func (s *Store) Write(ctx context.Context, st *State) error {
 	s.mu.Lock()
@@ -249,6 +275,32 @@ func (s *Store) Delete(ctx context.Context) error {
 		return &Error{Kind: KindStateParseFailed, Message: "remove recovery state failed"}
 	}
 	return nil
+}
+
+// DeleteIf atomically validates the current state and deletes it while the
+// Store mutex is held. It is used by discard transactions so a stale read
+// cannot delete a newer Recovery record. A false predicate is a safe no-op.
+func (s *Store) DeleteIf(ctx context.Context, predicate func(*State) (bool, error)) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, err := s.loadUnlocked(ctx)
+	if err != nil {
+		return false, err
+	}
+	if cur == nil {
+		return false, nil
+	}
+	ok, err := predicate(cur)
+	if err != nil || !ok {
+		return false, err
+	}
+	if err := os.Remove(s.path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, &Error{Kind: KindStateParseFailed, Message: "remove recovery state failed"}
+	}
+	return true, nil
 }
 
 // errChangesSkipped is returned by Update callbacks that decide nothing should

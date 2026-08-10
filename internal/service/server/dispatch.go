@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -50,6 +51,11 @@ func (server *Server) handleResponses(writer http.ResponseWriter, request *http.
 	log := slog.Default().With("path", request.URL.Path, "method", request.Method, "remote", request.RemoteAddr)
 	log.Debug("收到请求")
 	requestStart := time.Now()
+	// Consume the relay marker before any tracing or upstream forwarding so it
+	// never appears in traces or reaches upstream. Only the value extracted here
+	// may qualify a source model for lazy binding.
+	relayMarker := request.Header.Get(RelayMarkerHeader)
+	request.Header.Del(RelayMarkerHeader)
 	if request.Method != http.MethodPost {
 		log.Warn("方法不允许", "method", request.Method)
 		writeOpenAIError(writer, http.StatusMethodNotAllowed, openai.ErrorResponse{Error: openai.ErrorObject{
@@ -62,24 +68,88 @@ func (server *Server) handleResponses(writer http.ResponseWriter, request *http.
 
 	server.sessionForRequest(request)
 
-	body, err := io.ReadAll(request.Body)
-	record := mbtrace.Record{HTTPRequest: mbtrace.NewHTTPRequest(request), OpenAIRequest: mbtrace.RawJSONOrString(body)}
-	if err != nil {
-		log.Error("读取请求体失败", "error", err)
+	encoding, encodingErr := normalizeContentEncoding(request.Header.Values("Content-Encoding"))
+	if encodingErr != nil {
+		log.Warn("不支持的 Content-Encoding", "error", encodingErr)
 		payload := openai.ErrorResponse{Error: openai.ErrorObject{
-			Message: "读取请求体失败",
+			Message: "unsupported content encoding",
 			Type:    "invalid_request_error",
-			Code:    "invalid_request_body",
+			Code:    "unsupported_content_encoding",
 		}}
-		record.Error = traceError("read_openai_request", err)
+		record := mbtrace.Record{HTTPRequest: mbtrace.NewHTTPRequest(request), OpenAIRequest: mbtrace.RawJSONOrString(nil)}
+		record.Error = traceError("unsupported_content_encoding", encodingErr)
 		record.OpenAIResponse = payload
 		server.writeTrace(record)
 		writeOpenAIError(writer, http.StatusBadRequest, payload)
 		return
 	}
 
+	// Bound the encoded side for zstd only; identity/plain keeps the existing
+	// unbounded read so we never add a limit to today's behavior.
+	bodyReader := io.Reader(request.Body)
+	if encoding == "zstd" {
+		bodyReader = io.LimitReader(request.Body, maxEncodedZstdRequestBody+1)
+	}
+	encoded, err := io.ReadAll(bodyReader)
+	record := mbtrace.Record{HTTPRequest: mbtrace.NewHTTPRequest(request)}
+	// A bounded read that hit the encoded cap means the zstd body exceeded it.
+	if err == nil && encoding == "zstd" && len(encoded) > maxEncodedZstdRequestBody {
+		err = errRequestBodyTooLarge
+	}
+	if err != nil {
+		log.Error("读取请求体失败", "error", err)
+		code := "invalid_request_body"
+		message := "读取请求体失败"
+		stage := "read_openai_request"
+		if errors.Is(err, errRequestBodyTooLarge) {
+			code = "request_too_large"
+			message = "request body too large"
+			stage = "decode_request_too_large"
+		}
+		payload := openai.ErrorResponse{Error: openai.ErrorObject{
+			Message: message,
+			Type:    "invalid_request_error",
+			Code:    code,
+		}}
+		record.Error = traceError(stage, err)
+		record.OpenAIResponse = payload
+		server.writeTrace(record)
+		writeOpenAIError(writer, http.StatusBadRequest, payload)
+		return
+	}
+
+	decoded, decodeErr := decodeRequestBody(encoded, encoding)
+	if decodeErr != nil {
+		log.Warn("请求体解码失败", "error", decodeErr)
+		code := "invalid_request_body"
+		message := "读取请求体失败"
+		stage := "decode_request_body"
+		switch {
+		case errors.Is(decodeErr, errRequestBodyTooLarge):
+			code = "request_too_large"
+			message = "request body too large"
+			stage = "decode_request_too_large"
+		case errors.Is(decodeErr, errUnsupportedContentEncoding):
+			code = "unsupported_content_encoding"
+			message = "unsupported content encoding"
+			stage = "unsupported_content_encoding"
+		}
+		payload := openai.ErrorResponse{Error: openai.ErrorObject{
+			Message: message,
+			Type:    "invalid_request_error",
+			Code:    code,
+		}}
+		record.Error = traceError(stage, decodeErr)
+		record.OpenAIResponse = payload
+		server.writeTrace(record)
+		writeOpenAIError(writer, http.StatusBadRequest, payload)
+		return
+	}
+
+	record.OpenAIRequest = mbtrace.RawJSONOrString(decoded)
+
 	var responsesRequest openai.ResponsesRequest
-	if err := json.Unmarshal(body, &responsesRequest); err != nil {
+	if err := json.Unmarshal(decoded, &responsesRequest); err != nil {
 		log.Warn("无效的 JSON 请求体", "error", err)
 		payload := openai.ErrorResponse{Error: openai.ErrorObject{
 			Message: "无效的 JSON 请求体",
@@ -94,7 +164,7 @@ func (server *Server) handleResponses(writer http.ResponseWriter, request *http.
 	}
 
 	record.Model = responsesRequest.Model
-	resolvedRoute, resolveErr := server.resolveModelOrFallback(responsesRequest.Model)
+	resolvedRoute, routingAlias, resolveErr := server.resolveModelOrFallback(responsesRequest.Model, relayMarker)
 	if resolveErr == nil {
 		var candidateInfo string
 		for i, c := range resolvedRoute.Candidates {
@@ -159,14 +229,14 @@ func (server *Server) handleResponses(writer http.ResponseWriter, request *http.
 	}
 
 	if preferred.Protocol == config.ProtocolOpenAIResponse {
-		server.handleOpenAIResponse(writer, request, responsesRequest, resolvedRoute.Candidates, record)
+		server.handleOpenAIResponse(writer, request, responsesRequest, routingAlias, resolvedRoute.Candidates, record)
 		return
 	}
 
 	// Adapter dispatch path for all non-OpenAI-Response protocols.
 	if server.adapterRegistry != nil {
 		if _, ok := server.adapterRegistry.GetProvider(preferred.Protocol); ok {
-			server.handleWithAdapters(writer, request, responsesRequest, resolvedRoute)
+			server.handleWithAdapters(writer, request, responsesRequest, routingAlias, resolvedRoute)
 			return
 		}
 	}
@@ -273,7 +343,7 @@ func writeSSE(writer http.ResponseWriter, event openai.StreamEvent) error {
 	return nil
 }
 
-func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *http.Request, responsesRequest openai.ResponsesRequest, candidates []provider.ProviderCandidate, record mbtrace.Record) {
+func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *http.Request, responsesRequest openai.ResponsesRequest, routingAlias string, candidates []provider.ProviderCandidate, record mbtrace.Record) {
 	proxyStart := time.Now()
 	var hookErr string
 	var lastErr error
@@ -373,7 +443,11 @@ func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *
 		actualModel = candidate.UpstreamModel
 
 		// Inject web_search tool if enabled for this model.
-		if pm.ResolvedWebSearchForModel(responsesRequest.Model) == "enabled" {
+		webSearchModel := responsesRequest.Model
+		if routingAlias != "" {
+			webSearchModel = routingAlias
+		}
+		if pm.ResolvedWebSearchForModel(webSearchModel) == "enabled" {
 			upstreamRequest.Tools = InjectWebSearchTool(upstreamRequest.Tools)
 		}
 

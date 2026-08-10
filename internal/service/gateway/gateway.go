@@ -44,6 +44,10 @@ type StartOptions struct {
 	// callbacks are called without the gateway lock held. Token is never
 	// forwarded through these callbacks. May be nil (no lifecycle hooks).
 	TrafficLifecycle *app.TrafficLifecycle
+	// RoutingProfileRefresh rebuilds the Gateway's runtime SlotResolver from a
+	// fresh config snapshot. Called after a routing profile mutation so the next
+	// request uses the updated profile configuration. May be nil.
+	RoutingProfileRefresh func(cfg config.Config)
 }
 
 // Status is the lifecycle state of a gateway run.
@@ -85,11 +89,12 @@ type startResult struct {
 // its cancellation is used to distinguish a cancel-before-bind from a real
 // startup failure even when app.RunServerWithOptions returns nil.
 type runState struct {
-	id     uint64
-	ctx    context.Context
-	cancel context.CancelFunc
-	done   chan struct{}
-	err    error
+	id      uint64
+	ctx     context.Context
+	cancel  context.CancelFunc
+	control *desktopcontrol.Control
+	done    chan struct{}
+	err     error
 
 	startupOnce sync.Once        // the startup outcome is reported exactly once
 	started     chan startResult // buffered(1)
@@ -275,6 +280,10 @@ func (s *Service) run(run *runState, opts StartOptions) error {
 	var control *desktopcontrol.Control
 	if opts.DesktopMode {
 		control = desktopcontrol.New(opts.InstanceID, opts.Token, run.cancel).WithServerToken(opts.ServerToken)
+		if opts.RoutingProfileRefresh != nil {
+			control.WithRoutingProfileRefresh(opts.RoutingProfileRefresh)
+		}
+		run.control = control
 	}
 	return s.runServer(run.ctx, opts.Config, s.opts.Errors, app.RunOptions{
 		DesktopControl: control,
@@ -387,6 +396,21 @@ func (s *Service) Wait() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return run.err
+}
+
+// RefreshRoutingProfile rebuilds the live Gateway's runtime SlotResolver from
+// a fresh config snapshot. No-op when no gateway is running or the run has no
+// DesktopControl (non-desktop mode).
+func (s *Service) RefreshRoutingProfile(cfg config.Config) {
+	s.mu.Lock()
+	run := s.current
+	s.mu.Unlock()
+	if run == nil {
+		return
+	}
+	if run.control != nil {
+		run.control.RefreshRoutingProfile(cfg)
+	}
 }
 
 // Status returns a snapshot of the current service state.

@@ -59,7 +59,11 @@ func (f *fakeGateway) Snapshot(context.Context) (GatewaySnapshot, error) {
 	if f.failOnCall == f.calls {
 		f.snapshot.Running = false
 	}
-	return f.snapshot, f.err
+	snapshot := f.snapshot
+	if snapshot.DefaultModelAlias == "" {
+		snapshot.DefaultModelAlias = "moonbridge"
+	}
+	return snapshot, f.err
 }
 
 type fakeConfig struct {
@@ -76,6 +80,22 @@ type fakeConfig struct {
 	restoreVerifyMismatch bool
 	commitCalls           int
 	reads                 int
+	routing               codexconfig.RoutingIdentitySnapshot
+	routingErr            error
+	routingEmpty          bool
+}
+
+func (f *fakeConfig) ReadRoutingIdentity(context.Context) (codexconfig.RoutingIdentitySnapshot, error) {
+	if f.routingErr != nil {
+		return codexconfig.RoutingIdentitySnapshot{}, f.routingErr
+	}
+	if f.routingEmpty {
+		return codexconfig.RoutingIdentitySnapshot{Model: "", ModelProvider: "openai", ConfigHash: f.currentHash}, nil
+	}
+	if f.routing.Model == "" {
+		return codexconfig.RoutingIdentitySnapshot{Model: "gpt-test", ModelProvider: "openai", ConfigHash: f.currentHash}, nil
+	}
+	return f.routing, nil
 }
 
 func (f *fakeConfig) ReadRootURL(context.Context) (codexconfig.RootURLSnapshot, error) {
@@ -221,6 +241,8 @@ type fakeTraffic struct {
 	closeCalls        int
 	pauseCalls        int
 	claimErr          error
+	mappingSetErr     error
+	mappingClearErr   error
 	pauseErr          error
 	startErr          error
 	releaseErr        error
@@ -234,6 +256,12 @@ type fakeTraffic struct {
 	lastStart         trafficanalysis.StartOptions
 	lastOwner         string
 	lastReleaseOwner  string
+	mappingSetCalls   int
+	mappingClearCalls int
+	mappingPresent    bool
+	mappingSource     string
+	mappingTarget     string
+	mappingOwner      string
 }
 
 func (f *fakeTraffic) Status() trafficanalysis.State {
@@ -332,6 +360,43 @@ func (f *fakeTraffic) ClaimDesktopExpected(gen uint64, id, addr, owner string) (
 	return f.state, nil
 }
 
+func (f *fakeTraffic) SetDesktopModelMappingExpected(gen uint64, id, addr, owner, source, target string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.mappingSetCalls++
+	if f.mappingSetErr != nil {
+		return f.mappingSetErr
+	}
+	if f.state.Mode != trafficanalysis.ModeDesktop || f.state.Generation != gen || f.state.GatewayInstanceID != id || f.state.GatewayAddress != addr || f.lastOwner != owner {
+		return errors.New("mapping identity mismatch")
+	}
+	f.mappingPresent = true
+	f.mappingSource = source
+	f.mappingTarget = target
+	f.mappingOwner = owner
+	return nil
+}
+
+func (f *fakeTraffic) ClearDesktopModelMappingExpected(gen uint64, id, addr, owner string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.mappingClearCalls++
+	if f.mappingClearErr != nil {
+		return f.mappingClearErr
+	}
+	if !f.mappingPresent {
+		return nil
+	}
+	if f.state.Generation != gen || f.state.GatewayInstanceID != id || f.state.GatewayAddress != addr || f.mappingOwner != owner {
+		return errors.New("mapping clear identity mismatch")
+	}
+	f.mappingPresent = false
+	f.mappingSource = ""
+	f.mappingTarget = ""
+	f.mappingOwner = ""
+	return nil
+}
+
 func (f *fakeTraffic) PauseDesktopExpected(_ context.Context, _ uint64, _, _, _ string) (trafficanalysis.State, error) {
 	f.mu.Lock()
 	f.pauseCalls++
@@ -382,6 +447,10 @@ func (f *fakeTraffic) CloseCapture(context.Context) (trafficanalysis.State, erro
 		return f.state, f.closeErr
 	}
 	f.state = trafficanalysis.State{Mode: trafficanalysis.ModeIdle, CaptureState: "stopped", Generation: f.state.Generation + 1}
+	f.mappingPresent = false
+	f.mappingSource = ""
+	f.mappingTarget = ""
+	f.mappingOwner = ""
 	return f.state, nil
 }
 
@@ -391,7 +460,7 @@ func newFixture() (*Service, *fakeTraffic, *fakeConfig, *fakeBackup, *fakeRecove
 }
 
 func newFixtureWithGateway() (*Service, *fakeTraffic, *fakeConfig, *fakeBackup, *fakeRecovery, *fakeGateway) {
-	gw := &fakeGateway{snapshot: GatewaySnapshot{Running: true, InstanceID: "gw-1", Address: "127.0.0.1:38440"}}
+	gw := &fakeGateway{snapshot: GatewaySnapshot{Running: true, InstanceID: "gw-1", Address: "127.0.0.1:38440", DefaultModelAlias: "moonbridge", RoutingAvailable: true}}
 	traffic := &fakeTraffic{state: trafficanalysis.State{Mode: trafficanalysis.ModeIdle, CaptureState: "stopped"}}
 	cfg := &fakeConfig{beforeHash: "before", afterHash: "after", currentHash: "before", present: true, value: "https://api.openai.com"}
 	backup := &fakeBackup{}
@@ -454,6 +523,62 @@ func TestEnableStartsClaimsCommitsAndCheckpoints(t *testing.T) {
 	}
 }
 
+func TestEnableRegistersExactModelMappingBeforeConfigCommit(t *testing.T) {
+	service, traffic, cfg, _, _ := newFixture()
+	if _, err := service.Enable(context.Background()); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	if traffic.mappingSetCalls != 1 || !traffic.mappingPresent || traffic.mappingSource != "gpt-test" || traffic.mappingTarget != "moonbridge" {
+		t.Fatalf("mapping registration = calls %d present %v source %q target %q", traffic.mappingSetCalls, traffic.mappingPresent, traffic.mappingSource, traffic.mappingTarget)
+	}
+	if cfg.commitCalls != 1 {
+		t.Fatalf("config commit calls = %d, want 1", cfg.commitCalls)
+	}
+}
+
+func TestEnableMappingRegistrationFailureLeavesConfigUnchanged(t *testing.T) {
+	service, traffic, cfg, _, _ := newFixture()
+	traffic.mappingSetErr = errors.New("mapping registration failed")
+	_, err := service.Enable(context.Background())
+	requireKind(t, err, KindOwnershipClaimFailed)
+	if cfg.commitCalls != 0 {
+		t.Fatalf("config commit calls = %d, want 0", cfg.commitCalls)
+	}
+	if traffic.mappingPresent || traffic.closeCalls != 1 || traffic.releaseCalls != 1 {
+		t.Fatalf("failed mapping cleanup = present %v close %d release %d", traffic.mappingPresent, traffic.closeCalls, traffic.releaseCalls)
+	}
+}
+
+func TestEnableAllowsEmptyRoutingModel(t *testing.T) {
+	service, traffic, cfg, _, _ := newFixture()
+	cfg.routingEmpty = true
+	if _, err := service.Enable(context.Background()); err != nil {
+		t.Fatalf("Enable() with empty routing model error = %v", err)
+	}
+	// The mapping is still registered (source pending); the empty model no longer
+	// fails the transaction because the source is lazily bound later.
+	if traffic.mappingSetCalls != 1 || !traffic.mappingPresent || traffic.mappingSource != "" || traffic.mappingTarget != "moonbridge" {
+		t.Fatalf("mapping registration = calls %d present %v source %q target %q", traffic.mappingSetCalls, traffic.mappingPresent, traffic.mappingSource, traffic.mappingTarget)
+	}
+	if cfg.commitCalls != 1 {
+		t.Fatalf("config commit calls = %d, want 1", cfg.commitCalls)
+	}
+}
+
+func TestEnableRejectsNonOpenAIRoutingIdentityBeforeMutation(t *testing.T) {
+	service, traffic, cfg, _, _ := newFixture()
+	cfg.routing = codexconfig.RoutingIdentitySnapshot{
+		Model:         "gpt-test",
+		ModelProvider: "anthropic",
+		ConfigHash:    cfg.currentHash,
+	}
+	_, err := service.Enable(context.Background())
+	requireKind(t, err, KindConfigReadFailed)
+	if traffic.startCalls != 0 || cfg.commitCalls != 0 {
+		t.Fatalf("invalid routing identity mutated traffic/config: start=%d commit=%d", traffic.startCalls, cfg.commitCalls)
+	}
+}
+
 func TestEnableAdoptsExistingCaptureWithoutStarting(t *testing.T) {
 	service, traffic, _, _, _ := newFixture()
 	traffic.state = trafficanalysis.State{Mode: trafficanalysis.ModeCaptureOnly, CaptureState: "capturing", Generation: 7, GatewayInstanceID: "gw-1", GatewayAddress: "127.0.0.1:38440", ListeningAddress: CaptureListenAddress, ObservationCount: 3}
@@ -486,8 +611,8 @@ func TestEnableConfigFailureReleasesAndClosesOnlyNewCapture(t *testing.T) {
 	cfg.commitErrAfterWrite = true
 	_, err := service.Enable(context.Background())
 	requireKind(t, err, KindConfigSaveFailed)
-	if traffic.releaseCalls != 1 || traffic.closeCalls != 1 || traffic.state.Mode != trafficanalysis.ModeIdle {
-		t.Fatalf("new capture backout = release %d close %d state %#v", traffic.releaseCalls, traffic.closeCalls, traffic.state)
+	if traffic.releaseCalls != 1 || traffic.closeCalls != 1 || traffic.mappingClearCalls != 1 || traffic.mappingPresent || traffic.state.Mode != trafficanalysis.ModeIdle {
+		t.Fatalf("new capture backout = release %d close %d mapping clear %d present %v state %#v", traffic.releaseCalls, traffic.closeCalls, traffic.mappingClearCalls, traffic.mappingPresent, traffic.state)
 	}
 
 	service, traffic, cfg, _, _ = newFixture()
@@ -808,7 +933,7 @@ func TestDisableSuccessPausesRestoresAndReleasesWithoutClosing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Disable() error = %v", err)
 	}
-	if traffic.pauseCalls != 1 || traffic.releaseCalls != 1 || traffic.closeCalls != 0 || traffic.lastReleaseOwner != "enable-1" || traffic.lastOwner != "" || traffic.state.Mode != trafficanalysis.ModeCaptureOnly || traffic.state.CaptureState != "passthrough" || traffic.state.Generation != beforeGeneration {
+	if traffic.pauseCalls != 1 || traffic.releaseCalls != 1 || traffic.closeCalls != 0 || !traffic.mappingPresent || traffic.lastReleaseOwner != "enable-1" || traffic.lastOwner != "" || traffic.state.Mode != trafficanalysis.ModeCaptureOnly || traffic.state.CaptureState != "passthrough" || traffic.state.Generation != beforeGeneration {
 		t.Fatalf("disable traffic state/calls = %#v pause=%d release=%d close=%d", traffic.state, traffic.pauseCalls, traffic.releaseCalls, traffic.closeCalls)
 	}
 	if cfg.commitCalls != 2 || !cfg.present || cfg.value != "https://api.openai.com" || len(recovery.checkpoints) == 0 || recovery.checkpoints[len(recovery.checkpoints)-1].DurablePhase != DurableInactive || recovery.checkpoints[len(recovery.checkpoints)-1].OperationID != "disable-1" {
@@ -842,7 +967,7 @@ func TestDisablePauseFailureDoesNotWriteOrRelease(t *testing.T) {
 }
 
 func TestDisableConfigConflictDoesNotWriteOrRelease(t *testing.T) {
-	service, traffic, cfg, _ := newEnabledFixture(t)
+	service, traffic, cfg, recovery := newEnabledFixture(t)
 	cfg.mu.Lock()
 	cfg.currentHash = "external"
 	cfg.mu.Unlock()
@@ -850,6 +975,17 @@ func TestDisableConfigConflictDoesNotWriteOrRelease(t *testing.T) {
 	requireKind(t, err, KindRestoreConflict)
 	if traffic.releaseCalls != 0 || traffic.closeCalls != 0 || cfg.commitCalls != 1 || traffic.state.Mode != trafficanalysis.ModeDesktop {
 		t.Fatalf("config conflict side effects = release %d close %d commits %d mode %q", traffic.releaseCalls, traffic.closeCalls, cfg.commitCalls, traffic.state.Mode)
+	}
+	// The conflict checkpoint must surface the live dead-end to the GUI without
+	// a process restart.
+	recovery.mu.Lock()
+	last := recovery.checkpoints[len(recovery.checkpoints)-1]
+	recovery.mu.Unlock()
+	if last.ReconciliationStatus != ReconciliationStatusConfigConflict {
+		t.Fatalf("conflict checkpoint ReconciliationStatus = %q, want %q", last.ReconciliationStatus, ReconciliationStatusConfigConflict)
+	}
+	if last.DurablePhase != DurableReconciliationRequired || !last.IntegrationActive {
+		t.Fatalf("conflict checkpoint = durable %q active %t, want reconciliation_required/true", last.DurablePhase, last.IntegrationActive)
 	}
 }
 
@@ -1031,7 +1167,7 @@ func TestFinishSuccessClosesRelayWithoutConfigWrite(t *testing.T) {
 	if got.Operation != OperationFinish || got.Phase != PhaseInactive || got.TrafficMode != trafficanalysis.ModeIdle || got.CaptureState != "stopped" || got.IntegrationActive {
 		t.Fatalf("Finish result = %#v", got)
 	}
-	if cfg.commitCalls != commits || traffic.closeCalls != 1 || traffic.state.Mode != trafficanalysis.ModeIdle || traffic.state.CaptureState != "stopped" {
+	if cfg.commitCalls != commits || traffic.closeCalls != 1 || traffic.mappingPresent || traffic.state.Mode != trafficanalysis.ModeIdle || traffic.state.CaptureState != "stopped" {
 		t.Fatalf("Finish changed config/traffic unexpectedly: commits %d/%d close %d state %#v", commits, cfg.commitCalls, traffic.closeCalls, traffic.state)
 	}
 	last := recovery.checkpoints[len(recovery.checkpoints)-1]

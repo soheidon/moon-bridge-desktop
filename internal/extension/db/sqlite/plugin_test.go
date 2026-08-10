@@ -106,6 +106,61 @@ func TestOpenCreatesParentDirectories(t *testing.T) {
 	}
 }
 
+func TestResolvePath(t *testing.T) {
+	t.Run("absolute path is unchanged", func(t *testing.T) {
+		abs := filepath.Join(t.TempDir(), "moonbridge.db")
+		got, err := dbsqlite.ResolvePath(abs)
+		if err != nil {
+			t.Fatalf("ResolvePath() error = %v", err)
+		}
+		if got != abs {
+			t.Fatalf("ResolvePath(abs) = %q, want %q", got, abs)
+		}
+	})
+
+	t.Run("relative path resolves against CWD", func(t *testing.T) {
+		dir := t.TempDir()
+		orig, err := os.Getwd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		// os.Chdir mutates the process CWD, so this test must not be parallel.
+		if err := os.Chdir(dir); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chdir(orig) })
+
+		got, err := dbsqlite.ResolvePath("data/moonbridge.db")
+		if err != nil {
+			t.Fatalf("ResolvePath() error = %v", err)
+		}
+		want := filepath.Join(dir, "data", "moonbridge.db")
+		if got != want {
+			t.Fatalf("ResolvePath(relative) = %q, want %q", got, want)
+		}
+		// ResolvePath is side-effect free: neither the parent directory nor the
+		// DB file may exist after the call.
+		if _, err := os.Stat(filepath.Join(dir, "data")); !os.IsNotExist(err) {
+			t.Fatalf("ResolvePath created the parent dir: %v", err)
+		}
+		if _, err := os.Stat(want); !os.IsNotExist(err) {
+			t.Fatalf("ResolvePath created the DB file: %v", err)
+		}
+	})
+
+	t.Run("memory paths pass through", func(t *testing.T) {
+		for _, mem := range []string{":memory:", "file::memory:", "file:memdb?mode=memory"} {
+			got, err := dbsqlite.ResolvePath(mem)
+			if err != nil {
+				t.Fatalf("ResolvePath(%q) error = %v", mem, err)
+			}
+			if got != mem {
+				t.Fatalf("ResolvePath(%q) = %q, want passthrough", mem, got)
+			}
+		}
+	})
+}
+
 func TestConfigSpecs(t *testing.T) {
 	specs := dbsqlite.ConfigSpecs()
 	if len(specs) != 1 {

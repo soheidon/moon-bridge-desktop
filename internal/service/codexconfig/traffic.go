@@ -25,6 +25,37 @@ type RootURLSnapshot struct {
 	ConfigHash string
 }
 
+// RoutingIdentitySnapshot is the non-secret top-level Codex routing identity
+// used by Traffic Analysis. It deliberately contains no provider credentials,
+// model catalog, or config body. ConfigHash binds the identity to the same
+// compare-and-swap generation used for openai_base_url edits.
+type RoutingIdentitySnapshot struct {
+	Model         string
+	ModelProvider string
+	ConfigHash    string
+}
+
+// ReadRoutingIdentity reads only the top-level model and model_provider keys.
+// The values are used to create a session-scoped routing mapping; the Codex
+// config is never rewritten by this method.
+func (s *Service) ReadRoutingIdentity(ctx context.Context) (RoutingIdentitySnapshot, error) {
+	if err := contextErr(ctx); err != nil {
+		return RoutingIdentitySnapshot{}, err
+	}
+	path, err := s.ResolvePath()
+	if err != nil {
+		return RoutingIdentitySnapshot{}, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return RoutingIdentitySnapshot{}, &Error{Kind: KindNotFound, Message: "codex config not found"}
+		}
+		return RoutingIdentitySnapshot{}, err
+	}
+	return readRoutingIdentity(data)
+}
+
 // PreparedRootURLChange contains a candidate top-level URL change. The
 // candidate bytes are deliberately private so callers cannot accidentally
 // persist or expose raw config content outside the commit operation.
@@ -246,6 +277,28 @@ func readRootURL(data []byte) (RootURLSnapshot, error) {
 		result.Hash = hashString(found.value)
 	}
 	return result, nil
+}
+
+func readRoutingIdentity(data []byte) (RoutingIdentitySnapshot, error) {
+	if !isValidUTF8(data) {
+		return RoutingIdentitySnapshot{}, editUnsupported("invalid UTF-8")
+	}
+	decoded, err := decodeTOML(data)
+	if err != nil {
+		return RoutingIdentitySnapshot{}, err
+	}
+	var model, modelProvider string
+	if value, ok := lookup(decoded, nil, "model"); ok {
+		model, _ = value.(string)
+	}
+	if value, ok := lookup(decoded, nil, "model_provider"); ok {
+		modelProvider, _ = value.(string)
+	}
+	return RoutingIdentitySnapshot{
+		Model:         model,
+		ModelProvider: modelProvider,
+		ConfigHash:    hashBytes(data),
+	}, nil
 }
 
 type rootURLLine struct {

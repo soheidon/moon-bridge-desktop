@@ -403,13 +403,20 @@ func (p *DSPlugin) TransformError(_ *plugin.RequestContext, msg string) string {
 // --- MutateCoreRequest (Core format equivalent of MutateRequest) ---
 
 // MutateCoreRequest injects DeepSeek thinking configuration into the CoreRequest.
+// Sets coreReq.Thinking (read by the Anthropic adapter) based on the request's
+// effort level. Plugin config can override the budget_tokens value.
 func (p *DSPlugin) MutateCoreRequest(ctx context.Context, req *format.CoreRequest) {
 	if req.Extensions == nil {
 		req.Extensions = make(map[string]any)
 	}
 
-	// Read thinking budget from extension config, default to 4096.
+	// Determine budget_tokens from effort when thinking is not already set.
 	budgetTokens := 4096
+	if req.Thinking == nil && req.Output != nil && req.Output.Effort != "" {
+		budgetTokens = deepseekBudgetForEffort(req.Output.Effort)
+	}
+
+	// Plugin config override takes precedence.
 	if setting, ok := p.pluginCfg.Extensions[PluginName]; ok && setting.RawConfig != nil {
 		if v, ok := setting.RawConfig["thinking_budget_tokens"]; ok {
 			if n, ok := v.(float64); ok {
@@ -418,8 +425,27 @@ func (p *DSPlugin) MutateCoreRequest(ctx context.Context, req *format.CoreReques
 		}
 	}
 
+	req.Thinking = &format.CoreThinkingConfig{
+		Type:         "enabled",
+		BudgetTokens: budgetTokens,
+	}
 	req.Extensions["thinking"] = map[string]any{
 		"budget_tokens": budgetTokens,
+	}
+}
+
+// deepseekBudgetForEffort maps a reasoning effort string to DeepSeek's
+// thinking budget_tokens. Values are based on DeepSeek V4 API documentation.
+func deepseekBudgetForEffort(effort string) int {
+	switch effort {
+	case "max":
+		return 32000
+	case "high":
+		return 16000
+	case "low":
+		return 4096
+	default:
+		return 4096
 	}
 }
 

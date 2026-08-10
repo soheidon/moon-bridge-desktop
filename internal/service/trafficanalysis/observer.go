@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/klauspost/compress/zstd"
 )
 
 const (
@@ -100,6 +101,7 @@ type PayloadInput struct {
 	StatusCode            int
 	Partial               bool
 	Payload               []byte
+	RequestModelEligible  bool
 	rawPayloadSize        int
 	rawPayloadHMAC        string
 	hasRawPayloadOverride bool
@@ -137,6 +139,7 @@ type Observation struct {
 	Partial                bool                 `json:"partial,omitempty"`
 	Disposition            Disposition          `json:"disposition"`
 	ErrorClass             string               `json:"errorClass,omitempty"`
+	Usage                  *UsageSummary        `json:"usage,omitempty"`
 }
 
 type HeaderSummary struct {
@@ -152,21 +155,27 @@ type HeaderSummary struct {
 }
 
 type PayloadShape struct {
-	TopLevelFields            []string          `json:"topLevelFields,omitempty"`
-	UnknownTopLevelFieldHMACs []string          `json:"unknownTopLevelFieldHmacs,omitempty"`
-	TopLevelTypes             map[string]string `json:"topLevelTypes,omitempty"`
-	ArrayLengths              map[string]int    `json:"arrayLengths,omitempty"`
-	ObjectFieldCounts         map[string]int    `json:"objectFieldCounts,omitempty"`
-	ModelValue                string            `json:"modelValue,omitempty"`
-	StreamValue               *bool             `json:"streamValue,omitempty"`
-	ReasoningEffort           string            `json:"reasoningEffort,omitempty"`
-	ReasoningSummary          string            `json:"reasoningSummary,omitempty"`
-	ToolCount                 int               `json:"toolCount,omitempty"`
-	ToolTypes                 []string          `json:"toolTypes,omitempty"`
-	EventType                 string            `json:"eventType,omitempty"`
-	ObjectType                string            `json:"objectType,omitempty"`
-	Status                    string            `json:"status,omitempty"`
-	ShapeTruncated            bool              `json:"shapeTruncated,omitempty"`
+	TopLevelFields            []string               `json:"topLevelFields,omitempty"`
+	UnknownTopLevelFieldHMACs []string               `json:"unknownTopLevelFieldHmacs,omitempty"`
+	TopLevelTypes             map[string]string      `json:"topLevelTypes,omitempty"`
+	ArrayLengths              map[string]int         `json:"arrayLengths,omitempty"`
+	ObjectFieldCounts         map[string]int         `json:"objectFieldCounts,omitempty"`
+	ModelValue                string                 `json:"modelValue,omitempty"`
+	StreamValue               *bool                  `json:"streamValue,omitempty"`
+	ReasoningEffort           string                 `json:"reasoningEffort,omitempty"`
+	ReasoningSummary          string                 `json:"reasoningSummary,omitempty"`
+	RequestModel              string                 `json:"requestModel,omitempty"`
+	ToolCount                 int                    `json:"toolCount,omitempty"`
+	ToolTypes                 []string               `json:"toolTypes,omitempty"`
+	EventType                 string                 `json:"eventType,omitempty"`
+	ObjectType                string                 `json:"objectType,omitempty"`
+	Status                    string                 `json:"status,omitempty"`
+	ShapeTruncated            bool                   `json:"shapeTruncated,omitempty"`
+	InputItemCount            int                    `json:"inputItemCount,omitempty"`
+	InputItemTypeCounts       map[string]int         `json:"inputItemTypeCounts,omitempty"`
+	InputRoleCounts           map[string]int         `json:"inputRoleCounts,omitempty"`
+	InputItemFingerprints     []InputItemFingerprint `json:"inputItemFingerprints,omitempty"`
+	HasPreviousResponseID     bool                   `json:"hasPreviousResponseId,omitempty"`
 
 	identifiers IdentifierSummary
 	opaque      []OpaqueFieldSummary
@@ -178,11 +187,18 @@ func (s *PayloadShape) OpaqueFields() []OpaqueFieldSummary {
 }
 
 type IdentifierSummary struct {
-	ResponseIDHMACs     []string `json:"responseIdHmacs,omitempty"`
-	ItemIDHMACs         []string `json:"itemIdHmacs,omitempty"`
-	CallIDHMACs         []string `json:"callIdHmacs,omitempty"`
-	ConversationIDHMACs []string `json:"conversationIdHmacs,omitempty"`
-	OtherIDHMACs        []string `json:"otherIdHmacs,omitempty"`
+	ResponseIDHMACs           []string `json:"-"`
+	ResponseIDAliases         []string `json:"responseIdAliases,omitempty"`
+	PreviousResponseIDHMACs   []string `json:"-"`
+	PreviousResponseIDAliases []string `json:"previousResponseIdAliases,omitempty"`
+	ItemIDHMACs               []string `json:"-"`
+	ItemIDAliases             []string `json:"itemIdAliases,omitempty"`
+	CallIDHMACs               []string `json:"-"`
+	CallIDAliases             []string `json:"callIdAliases,omitempty"`
+	ConversationIDHMACs       []string `json:"-"`
+	ConversationIDAliases     []string `json:"conversationIdAliases,omitempty"`
+	OtherIDHMACs              []string `json:"-"`
+	OtherIDAliases            []string `json:"otherIdAliases,omitempty"`
 }
 
 type OpaqueFieldSummary struct {
@@ -192,10 +208,38 @@ type OpaqueFieldSummary struct {
 	OpaqueContentHMAC string `json:"opaqueContentHmac"`
 }
 
+type InputItemFingerprint struct {
+	Index        int               `json:"index"`
+	Fields       []string          `json:"fields,omitempty"`
+	Type         string            `json:"type,omitempty"`
+	Role         string            `json:"role,omitempty"`
+	ContentCount int               `json:"contentCount,omitempty"`
+	ObjectCount  int               `json:"objectCount,omitempty"`
+	ArrayCount   int               `json:"arrayCount,omitempty"`
+	Identifiers  IdentifierSummary `json:"identifiers,omitempty"`
+}
+
+// UsageSummary holds the safe numeric usage extracted from a single SSE event.
+// Pointer fields distinguish "present with value 0" from "absent".
+type UsageSummary struct {
+	InputTokens       *int `json:"inputTokens,omitempty"`
+	OutputTokens      *int `json:"outputTokens,omitempty"`
+	TotalTokens       *int `json:"totalTokens,omitempty"`
+	CachedInputTokens *int `json:"cachedInputTokens,omitempty"`
+	ReasoningTokens   *int `json:"reasoningTokens,omitempty"`
+}
+
+// maxUsageTokens is the safety bound for any single usage field value.
+// Exceeding this causes the field to be ignored.
+const maxUsageTokens = 1_000_000_000
+
 type Analyzer struct {
-	key     []byte
-	session string
-	buffer  *RingBuffer
+	key       []byte
+	session   string
+	buffer    *RingBuffer
+	aliasMu   sync.Mutex
+	aliases   map[string]string
+	nextAlias uint64
 }
 
 // NewAnalyzer creates a session-scoped analyzer. The HMAC key is held only in
@@ -208,7 +252,7 @@ func NewAnalyzer(capacity int) (*Analyzer, error) {
 	if _, err := io.ReadFull(rand.Reader, key); err != nil {
 		return nil, fmt.Errorf("generate analysis key: %w", err)
 	}
-	return &Analyzer{key: key, session: uuid.NewString(), buffer: NewRingBuffer(capacity)}, nil
+	return &Analyzer{key: key, session: uuid.NewString(), buffer: NewRingBuffer(capacity), aliases: make(map[string]string)}, nil
 }
 
 // String and GoString prevent accidental formatting of the private HMAC key.
@@ -219,6 +263,10 @@ func (a *Analyzer) SessionID() string { return a.session }
 
 func (a *Analyzer) Record(input PayloadInput) Observation {
 	obs := analyzePayload(a.key, input)
+	obs.Identifiers = a.aliasIdentifiers(obs.Identifiers)
+	if obs.PayloadShape != nil {
+		a.aliasInputFingerprints(obs.PayloadShape.InputItemFingerprints)
+	}
 	obs.SessionID = a.session
 	obs.Timestamp = time.Now().UTC()
 	obs.ConnectionID = a.hmacString(uuid.NewString())
@@ -231,10 +279,58 @@ func (a *Analyzer) Snapshot(after uint64) ([]Observation, uint64) {
 }
 
 func (a *Analyzer) DroppedCapacity() uint64 { return a.buffer.Dropped() }
+func (a *Analyzer) Capacity() int           { return a.buffer.Capacity() }
 func (a *Analyzer) Clear()                  { a.buffer.Clear() }
 
 func (a *Analyzer) hmacString(value string) string {
 	return hmacHex(a.key, []byte(value))
+}
+
+func (a *Analyzer) aliasIdentifiers(ids IdentifierSummary) IdentifierSummary {
+	a.aliasMu.Lock()
+	defer a.aliasMu.Unlock()
+	return a.aliasIdentifiersLocked(ids)
+}
+
+func (a *Analyzer) aliasInputFingerprints(fingerprints []InputItemFingerprint) {
+	a.aliasMu.Lock()
+	defer a.aliasMu.Unlock()
+	for i := range fingerprints {
+		fingerprints[i].Identifiers = a.aliasIdentifiersLocked(fingerprints[i].Identifiers)
+	}
+}
+
+func (a *Analyzer) aliasIdentifiersLocked(ids IdentifierSummary) IdentifierSummary {
+	ids.ResponseIDAliases = a.aliasList(ids.ResponseIDHMACs)
+	ids.PreviousResponseIDAliases = a.aliasList(ids.PreviousResponseIDHMACs)
+	ids.ItemIDAliases = a.aliasList(ids.ItemIDHMACs)
+	ids.CallIDAliases = a.aliasList(ids.CallIDHMACs)
+	ids.ConversationIDAliases = a.aliasList(ids.ConversationIDHMACs)
+	ids.OtherIDAliases = a.aliasList(ids.OtherIDHMACs)
+	ids.ResponseIDHMACs = nil
+	ids.PreviousResponseIDHMACs = nil
+	ids.ItemIDHMACs = nil
+	ids.CallIDHMACs = nil
+	ids.ConversationIDHMACs = nil
+	ids.OtherIDHMACs = nil
+	return ids
+}
+
+func (a *Analyzer) aliasList(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		alias, ok := a.aliases[value]
+		if !ok {
+			a.nextAlias++
+			alias = fmt.Sprintf("id#%d", a.nextAlias)
+			a.aliases[value] = alias
+		}
+		out = append(out, alias)
+	}
+	return out
 }
 
 type RingBuffer struct {
@@ -284,6 +380,12 @@ func (r *RingBuffer) Dropped() uint64 {
 	return r.dropped
 }
 
+func (r *RingBuffer) Capacity() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.capacity
+}
+
 func (r *RingBuffer) Clear() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -298,12 +400,16 @@ func cloneObservation(in Observation) Observation {
 	out.Identifiers = cloneIdentifiers(in.Identifiers)
 	if in.PayloadShape != nil {
 		shape := *in.PayloadShape
+		shape.RequestModel = in.PayloadShape.RequestModel
 		shape.TopLevelFields = append([]string(nil), in.PayloadShape.TopLevelFields...)
 		shape.UnknownTopLevelFieldHMACs = append([]string(nil), in.PayloadShape.UnknownTopLevelFieldHMACs...)
 		shape.ToolTypes = append([]string(nil), in.PayloadShape.ToolTypes...)
 		shape.TopLevelTypes = cloneStringMap(in.PayloadShape.TopLevelTypes)
 		shape.ArrayLengths = cloneIntMap(in.PayloadShape.ArrayLengths)
 		shape.ObjectFieldCounts = cloneIntMap(in.PayloadShape.ObjectFieldCounts)
+		shape.InputItemTypeCounts = cloneIntMap(in.PayloadShape.InputItemTypeCounts)
+		shape.InputRoleCounts = cloneIntMap(in.PayloadShape.InputRoleCounts)
+		shape.InputItemFingerprints = cloneInputFingerprints(in.PayloadShape.InputItemFingerprints)
 		shape.identifiers = cloneIdentifiers(in.PayloadShape.identifiers)
 		shape.opaque = append([]OpaqueFieldSummary(nil), in.PayloadShape.opaque...)
 		if in.PayloadShape.StreamValue != nil {
@@ -312,16 +418,27 @@ func cloneObservation(in Observation) Observation {
 		}
 		out.PayloadShape = &shape
 	}
+	if in.Usage != nil {
+		usage := *in.Usage
+		out.Usage = &usage
+	}
 	return out
 }
 
 func cloneIdentifiers(in IdentifierSummary) IdentifierSummary {
 	return IdentifierSummary{
-		ResponseIDHMACs:     append([]string(nil), in.ResponseIDHMACs...),
-		ItemIDHMACs:         append([]string(nil), in.ItemIDHMACs...),
-		CallIDHMACs:         append([]string(nil), in.CallIDHMACs...),
-		ConversationIDHMACs: append([]string(nil), in.ConversationIDHMACs...),
-		OtherIDHMACs:        append([]string(nil), in.OtherIDHMACs...),
+		ResponseIDHMACs:           append([]string(nil), in.ResponseIDHMACs...),
+		ResponseIDAliases:         append([]string(nil), in.ResponseIDAliases...),
+		PreviousResponseIDHMACs:   append([]string(nil), in.PreviousResponseIDHMACs...),
+		PreviousResponseIDAliases: append([]string(nil), in.PreviousResponseIDAliases...),
+		ItemIDHMACs:               append([]string(nil), in.ItemIDHMACs...),
+		ItemIDAliases:             append([]string(nil), in.ItemIDAliases...),
+		CallIDHMACs:               append([]string(nil), in.CallIDHMACs...),
+		CallIDAliases:             append([]string(nil), in.CallIDAliases...),
+		ConversationIDHMACs:       append([]string(nil), in.ConversationIDHMACs...),
+		ConversationIDAliases:     append([]string(nil), in.ConversationIDAliases...),
+		OtherIDHMACs:              append([]string(nil), in.OtherIDHMACs...),
+		OtherIDAliases:            append([]string(nil), in.OtherIDAliases...),
 	}
 }
 
@@ -368,7 +485,7 @@ func analyzePayload(key []byte, input PayloadInput) Observation {
 		ContentType:          contentType,
 		ContentEncoding:      safeContentEncoding(contentEncoding),
 		WebSocketMessageType: safeMessageType(input.WebSocketMessageType),
-		SSEEventType:         safeEventType(input.SSEEventType, key),
+		SSEEventType:         safeEventType(input.SSEEventType),
 		StatusCode:           input.StatusCode,
 		Partial:              input.Partial,
 		HeaderSummary:        summarizeHeaders(input.Headers),
@@ -401,12 +518,27 @@ func analyzePayload(key []byte, input PayloadInput) Observation {
 				obs.Disposition = DispositionShapeTruncated
 			}
 		}
+	} else if contentEncoding == "zstd" {
+		decoded, status := decodeZstdBounded(input.Payload)
+		obs.DecodingStatus = status
+		if status == DecodingDecoded {
+			analysisBytes = decoded
+		} else {
+			analysisBytes = nil
+			if status == DecodingDecodedLimitExceeded {
+				obs.Truncated = true
+				obs.Disposition = DispositionShapeTruncated
+			}
+		}
 	} else if contentEncoding != "" && contentEncoding != "identity" {
 		obs.DecodingStatus = DecodingUnsupported
 		analysisBytes = nil
 	}
+	if obs.DecodingStatus == DecodingDecoded || obs.DecodingStatus == DecodingIdentity {
+		obs.PayloadKind = inferPayloadKind(contentType, analysisBytes)
+	}
 	obs.DecodedObservationSize = len(analysisBytes)
-	if shape, ok := buildShape(key, analysisBytes); ok {
+	if shape, ok := buildShape(key, analysisBytes, input.RequestModelEligible); ok {
 		obs.PayloadShape = shape
 		obs.Identifiers = cloneIdentifiers(shape.identifiers)
 		obs.OpaqueFields = append([]OpaqueFieldSummary(nil), shape.opaque...)
@@ -415,7 +547,115 @@ func analyzePayload(key []byte, input PayloadInput) Observation {
 			obs.Disposition = DispositionShapeTruncated
 		}
 	}
+	if obs.SSEEventType == "response.completed" {
+		obs.Usage = extractUsageSummary(analysisBytes)
+	}
 	return obs
+}
+
+// extractUsageSummary extracts safe numeric usage from a single event JSON
+// payload. It mirrors the existing server semantics: response.usage is preferred;
+// top-level usage is the fallback. Both are checked for validity (at least one of
+// input_tokens, output_tokens, or cached_tokens must be non-zero).
+//
+// SSE framing is not handled here — Capture already splits events and passes
+// the decoded data JSON directly.
+func extractUsageSummary(payload []byte) *UsageSummary {
+	if len(payload) == 0 {
+		return nil
+	}
+	var envelope struct {
+		Usage    json.RawMessage `json:"usage"`
+		Response struct {
+			Usage json.RawMessage `json:"usage"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		return nil
+	}
+	if len(envelope.Response.Usage) > 0 {
+		if u := parseUsageJSON(envelope.Response.Usage); u != nil {
+			return u
+		}
+	}
+	if len(envelope.Usage) > 0 {
+		if u := parseUsageJSON(envelope.Usage); u != nil {
+			return u
+		}
+	}
+	return nil
+}
+
+// parseUsageJSON parses a usage JSON object and returns a UsageSummary.
+// Returns nil when the usage is empty (all relevant fields zero/absent) or malformed.
+//
+// Allowed JSON paths (fixed allowlist):
+//
+//	input_tokens
+//	output_tokens
+//	total_tokens
+//	input_tokens_details.cached_tokens
+//	output_tokens_details.reasoning_tokens
+func parseUsageJSON(data json.RawMessage) *UsageSummary {
+	var raw struct {
+		InputTokens  int `json:"input_tokens"`
+		OutputTokens int `json:"output_tokens"`
+		TotalTokens  int `json:"total_tokens"`
+		InputDetails struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"input_tokens_details"`
+		OutputDetails struct {
+			ReasoningTokens int `json:"reasoning_tokens"`
+		} `json:"output_tokens_details"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil
+	}
+	// Mirror server validity check: at least one of these must be non-zero.
+	if raw.InputTokens == 0 && raw.OutputTokens == 0 && raw.InputDetails.CachedTokens == 0 {
+		return nil
+	}
+	u := &UsageSummary{}
+	if raw.InputTokens > 0 && raw.InputTokens <= maxUsageTokens {
+		v := raw.InputTokens
+		u.InputTokens = &v
+	}
+	if raw.OutputTokens > 0 && raw.OutputTokens <= maxUsageTokens {
+		v := raw.OutputTokens
+		u.OutputTokens = &v
+	}
+	if raw.TotalTokens > 0 && raw.TotalTokens <= maxUsageTokens {
+		v := raw.TotalTokens
+		u.TotalTokens = &v
+	}
+	if raw.InputDetails.CachedTokens > 0 && raw.InputDetails.CachedTokens <= maxUsageTokens {
+		v := raw.InputDetails.CachedTokens
+		u.CachedInputTokens = &v
+	}
+	if raw.OutputDetails.ReasoningTokens > 0 && raw.OutputDetails.ReasoningTokens <= maxUsageTokens {
+		v := raw.OutputDetails.ReasoningTokens
+		u.ReasoningTokens = &v
+	}
+	return u
+}
+
+func decodeZstdBounded(payload []byte) ([]byte, DecodingStatus) {
+	reader, err := zstd.NewReader(bytes.NewReader(payload),
+		zstd.WithDecoderLowmem(true),
+		zstd.WithDecoderMaxMemory(MaxDecodedBytes),
+	)
+	if err != nil {
+		return nil, DecodingInvalid
+	}
+	defer reader.Close()
+	decoded, err := io.ReadAll(io.LimitReader(reader, MaxDecodedBytes+1))
+	if err != nil {
+		return nil, DecodingInvalid
+	}
+	if len(decoded) > MaxDecodedBytes {
+		return nil, DecodingDecodedLimitExceeded
+	}
+	return decoded, DecodingDecoded
 }
 
 func decodeGzipBounded(payload []byte) ([]byte, DecodingStatus) {
@@ -434,7 +674,7 @@ func decodeGzipBounded(payload []byte) ([]byte, DecodingStatus) {
 	return decoded, DecodingDecoded
 }
 
-func buildShape(key, payload []byte) (*PayloadShape, bool) {
+func buildShape(key, payload []byte, requestModelEligible bool) (*PayloadShape, bool) {
 	if len(payload) == 0 {
 		return nil, false
 	}
@@ -450,6 +690,11 @@ func buildShape(key, payload []byte) (*PayloadShape, bool) {
 	}
 	shape := &PayloadShape{TopLevelTypes: map[string]string{}, ArrayLengths: map[string]int{}, ObjectFieldCounts: map[string]int{}}
 	if object, ok := value.(map[string]any); ok {
+		if requestModelEligible {
+			if model, ok := safeString(object["model"], modelPattern); ok {
+				shape.RequestModel = model
+			}
+		}
 		keys := make([]string, 0, len(object))
 		for field := range object {
 			keys = append(keys, field)
@@ -490,6 +735,8 @@ func buildShape(key, payload []byte) (*PayloadShape, bool) {
 		shape.EventType = safeStringValue(object["event"], protocolEvents)
 		shape.ObjectType = safeStringValue(object["object"], protocolObjects)
 		shape.Status = safeStringValue(object["status"], protocolStatuses)
+		collectInputSummary(key, shape, object)
+		shape.HasPreviousResponseID = hasPreviousResponseID(object)
 	} else {
 		shape.ShapeTruncated = true
 	}
@@ -552,9 +799,9 @@ func collectIdentifiersAndOpaque(key []byte, shape *PayloadShape, value any, pat
 				}
 				continue
 			}
-			if isIdentifierField(lower) {
-				if identifier, ok := nested.(string); ok {
-					shape.addIdentifier(lower, hmacHex(key, []byte("id:"+identifier)))
+			if identifier, ok := nested.(string); ok {
+				if bucket, matched := identifierBucket(lower, path); matched {
+					shape.addIdentifier(bucket, hmacHex(key, []byte("id:"+identifier)))
 				}
 			}
 			collectIdentifiersAndOpaque(key, shape, nested, append(path, field), depth+1)
@@ -570,19 +817,176 @@ func collectIdentifiersAndOpaque(key []byte, shape *PayloadShape, value any, pat
 	}
 }
 
-func (s *PayloadShape) addIdentifier(field, value string) {
-	switch {
-	case strings.Contains(field, "response"):
+func (s *PayloadShape) addIdentifier(bucket, value string) {
+	switch bucket {
+	case "response":
 		s.identifiers.ResponseIDHMACs = appendBounded(s.identifiers.ResponseIDHMACs, value)
-	case strings.Contains(field, "conversation"):
+	case "previous_response":
+		s.identifiers.PreviousResponseIDHMACs = appendBounded(s.identifiers.PreviousResponseIDHMACs, value)
+	case "conversation":
 		s.identifiers.ConversationIDHMACs = appendBounded(s.identifiers.ConversationIDHMACs, value)
-	case strings.Contains(field, "item"):
+	case "item":
 		s.identifiers.ItemIDHMACs = appendBounded(s.identifiers.ItemIDHMACs, value)
-	case strings.Contains(field, "call") || strings.Contains(field, "tool"):
+	case "call":
 		s.identifiers.CallIDHMACs = appendBounded(s.identifiers.CallIDHMACs, value)
 	default:
 		s.identifiers.OtherIDHMACs = appendBounded(s.identifiers.OtherIDHMACs, value)
 	}
+}
+
+func identifierBucket(field string, path []string) (string, bool) {
+	if field == "previous_response_id" {
+		return "previous_response", true
+	}
+	if field == "call_id" {
+		return "call", true
+	}
+	if field == "id" && len(path) > 0 {
+		switch path[len(path)-1] {
+		case "response":
+			return "response", true
+		case "item":
+			return "item", true
+		default:
+			return "other", true
+		}
+	}
+	if isIdentifierField(field) {
+		switch {
+		case strings.Contains(field, "response"):
+			return "response", true
+		case strings.Contains(field, "conversation"):
+			return "conversation", true
+		case strings.Contains(field, "item"):
+			return "item", true
+		case strings.Contains(field, "call"):
+			return "call", true
+		default:
+			return "other", true
+		}
+	}
+	return "", false
+}
+
+func collectInputSummary(key []byte, shape *PayloadShape, value any) {
+	input, ok := value.(map[string]any)["input"].([]any)
+	if !ok {
+		return
+	}
+	shape.InputItemCount = len(input)
+	shape.InputItemTypeCounts = map[string]int{}
+	shape.InputRoleCounts = map[string]int{}
+	shape.InputItemFingerprints = make([]InputItemFingerprint, 0, minInt(len(input), MaxObjectFields))
+	for index, item := range input {
+		if index >= MaxObjectFields {
+			shape.ShapeTruncated = true
+			break
+		}
+		object, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		fingerprint := InputItemFingerprint{Index: index, Fields: safeObjectFields(object)}
+		if kind, ok := object["type"].(string); ok && safeInputClass(kind) != "" {
+			fingerprint.Type = kind
+			shape.InputItemTypeCounts[kind]++
+		}
+		if role, ok := object["role"].(string); ok && safeInputClass(role) != "" {
+			fingerprint.Role = role
+			shape.InputRoleCounts[role]++
+		}
+		if content, ok := object["content"].([]any); ok {
+			fingerprint.ContentCount = boundedArrayCount(len(content), shape)
+		}
+		fingerprint.ObjectCount, fingerprint.ArrayCount = safeNestedCounts(object)
+		itemShape := &PayloadShape{}
+		collectIdentifiersAndOpaque(key, itemShape, object, []string{"input", fmt.Sprintf("[%d]", index)}, 0)
+		fingerprint.Identifiers = cloneIdentifiers(itemShape.identifiers)
+		shape.InputItemFingerprints = append(shape.InputItemFingerprints, fingerprint)
+	}
+	if len(shape.InputItemTypeCounts) == 0 {
+		shape.InputItemTypeCounts = nil
+	}
+	if len(shape.InputRoleCounts) == 0 {
+		shape.InputRoleCounts = nil
+	}
+}
+
+func safeObjectFields(object map[string]any) []string {
+	fields := make([]string, 0, len(object))
+	for field := range object {
+		if tokenPattern.MatchString(field) && !containsSensitiveMarker(field) {
+			fields = append(fields, field)
+		}
+	}
+	sort.Strings(fields)
+	if len(fields) > MaxObjectFields {
+		fields = fields[:MaxObjectFields]
+	}
+	return fields
+}
+
+func safeNestedCounts(value any) (int, int) {
+	objects, arrays := 0, 0
+	var walk func(any, int)
+	walk = func(current any, depth int) {
+		if depth > MaxJSONDepth {
+			return
+		}
+		switch typed := current.(type) {
+		case map[string]any:
+			objects++
+			for _, nested := range typed {
+				walk(nested, depth+1)
+			}
+		case []any:
+			arrays++
+			for index, nested := range typed {
+				if index >= MaxObjectFields {
+					break
+				}
+				walk(nested, depth+1)
+			}
+		}
+	}
+	walk(value, 0)
+	return objects, arrays
+}
+
+func cloneInputFingerprints(values []InputItemFingerprint) []InputItemFingerprint {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]InputItemFingerprint, len(values))
+	for index, value := range values {
+		out[index] = value
+		out[index].Fields = append([]string(nil), value.Fields...)
+		out[index].Identifiers = cloneIdentifiers(value.Identifiers)
+	}
+	return out
+}
+
+func minInt(left, right int) int {
+	if left < right {
+		return left
+	}
+	return right
+}
+
+func safeInputClass(value string) string {
+	if containsSensitiveMarker(value) || len(value) > 64 || !tokenPattern.MatchString(value) {
+		return ""
+	}
+	return value
+}
+
+func hasPreviousResponseID(value any) bool {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	_, ok = object["previous_response_id"].(string)
+	return ok
 }
 
 func appendBounded(values []string, value string) []string {
@@ -825,7 +1229,7 @@ func safeToken(value string) string {
 func safeContentEncoding(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
 	switch value {
-	case "identity", "gzip", "br", "deflate":
+	case "identity", "gzip", "br", "deflate", "zstd":
 		return value
 	default:
 		return ""
@@ -877,7 +1281,7 @@ func safeMessageType(value string) string {
 	}
 }
 
-func safeEventType(value string, key []byte) string {
+func safeEventType(value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return ""
@@ -885,7 +1289,7 @@ func safeEventType(value string, key []byte) string {
 	if _, ok := protocolEvents[value]; ok {
 		return value
 	}
-	return hmacHex(key, []byte("event:"+value))
+	return "unknown"
 }
 
 func safeShapePath(key []byte, path []string) string {

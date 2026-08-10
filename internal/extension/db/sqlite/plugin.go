@@ -82,13 +82,31 @@ func (p *sqliteProvider) Open(ctx context.Context) error {
 	return nil
 }
 
-func sqliteDSN(path string) (string, error) {
+// ResolvePath returns the absolute filesystem path a configured sqlite path
+// resolves to. It is side-effect free (no directory/DB creation), so a
+// stopped-state read can confirm the DB path without touching disk. Open and
+// desktop-app's stopped read share this so both target the same DB.
+func ResolvePath(path string) (string, error) {
 	if isSQLiteMemoryPath(path) {
 		return path, nil
 	}
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		return "", fmt.Errorf("resolve path: %w", err)
+	}
+	return absPath, nil
+}
+
+// sqliteDSN resolves the path and creates the parent directory. Open uses this
+// so gateway startup keeps the MkdirAll behavior; ResolvePath itself never
+// creates anything.
+func sqliteDSN(path string) (string, error) {
+	absPath, err := ResolvePath(path)
+	if err != nil {
+		return "", err
+	}
+	if isSQLiteMemoryPath(path) {
+		return absPath, nil
 	}
 	parent := filepath.Dir(absPath)
 	if err := os.MkdirAll(parent, 0o700); err != nil {
@@ -105,6 +123,12 @@ func isSQLiteMemoryPath(path string) bool {
 		return true
 	}
 	return path == "file::memory:"
+}
+
+// ProviderFor returns a SQLite provider for dbPath without opening it. The
+// caller (db.Registry.Init) owns the connection lifecycle.
+func ProviderFor(dbPath string) db.Provider {
+	return &sqliteProvider{cfg: Config{Path: dbPath}}
 }
 
 func (p *sqliteProvider) DB() *sql.DB { return p.db }

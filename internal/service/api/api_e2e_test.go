@@ -247,8 +247,8 @@ func TestE2EProviderUpdateThenDelete(t *testing.T) {
 	if prov.BaseURL != "https://updated-anthropic.test" {
 		t.Fatalf("step 3: expected base_url 'https://updated-anthropic.test', got '%s'", prov.BaseURL)
 	}
-	if prov.APIKey != "sk-ant-test-key-12345678" {
-		t.Fatalf("step 3: API key should be preserved, got '%s'", prov.APIKey)
+	if prov.APIKey == "" || prov.APIKey == "sk-ant-test-key-12345678" {
+		t.Fatalf("step 3: API key should remain stored without plaintext, got '%s'", prov.APIKey)
 	}
 
 	resp4 := f.request("DELETE", "/providers/backup", nil)
@@ -351,8 +351,8 @@ func TestE2ESecretMaskingAndPatchPreserve(t *testing.T) {
 
 	cfg := f.rt.Current()
 	prov := cfg.Config.ProviderDefs["anthropic"]
-	if prov.APIKey != "sk-ant-test-key-12345678" {
-		t.Fatalf("expected preserved API key, got %q", prov.APIKey)
+	if prov.APIKey == "" || prov.APIKey == "sk-ant-test-key-12345678" {
+		t.Fatalf("expected stored non-plaintext API key, got %q", prov.APIKey)
 	}
 	if prov.BaseURL != "https://patched.test" {
 		t.Fatalf("expected base_url 'https://patched.test', got %q", prov.BaseURL)

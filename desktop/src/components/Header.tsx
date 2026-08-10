@@ -1,13 +1,29 @@
 import type { GatewaySnapshot } from "../types/gateway";
 
-type Props = { snapshot: GatewaySnapshot; busy: boolean; onStart: () => void; onStop: () => void; gatewayWarning?: string | null };
+export type AppPage = "dashboard" | "settings" | "traffic";
 
-export function Header({ snapshot, busy, onStart, onStop, gatewayWarning }: Props) {
+// Clicking the active sub-page tab returns to the dashboard. Pure so the toggle
+// behavior is unit-testable.
+export function getNavigationTarget(currentPage: AppPage, clickedPage: AppPage): AppPage {
+  if (clickedPage === "dashboard") return "dashboard";
+  return currentPage === clickedPage ? "dashboard" : clickedPage;
+}
+
+type Props = {
+  snapshot: GatewaySnapshot;
+  busy: boolean;
+  onStart: () => void;
+  onStop: () => void;
+  gatewayWarning?: string | null;
+  page: AppPage;
+  onNavigate: (page: AppPage) => void;
+};
+
+export function Header({ snapshot, busy, onStart, onStop, gatewayWarning, page, onNavigate }: Props) {
   const running = snapshot.state === "running";
   return (
     <header className="app-header">
       <div className="header-proxy-section">
-        <strong>Moon Bridge Desktop</strong>
         {running ? (
           <button className="btn btn-large" disabled={busy} onClick={onStop}>ゲートウェイ停止</button>
         ) : (
@@ -17,7 +33,21 @@ export function Header({ snapshot, busy, onStart, onStop, gatewayWarning }: Prop
       </div>
       <div className="header-meta">
         {gatewayWarning && <span className="header-warning">Gateway実行中: {gatewayWarning}</span>}
-        <span className="version-info">v0.1.0</span>
+        <nav className="header-nav" aria-label="ページ切替">
+          <span className="version-info">v0.1.0</span>
+          <button
+            type="button"
+            className={`header-nav-tab${page === "traffic" ? " active" : ""}`}
+            aria-current={page === "traffic" ? "page" : undefined}
+            onClick={() => onNavigate(getNavigationTarget(page, "traffic"))}
+          >Codex Traffic Analysis</button>
+          <button
+            type="button"
+            className={`btn btn-settings${page === "settings" ? " active" : ""}`}
+            aria-current={page === "settings" ? "page" : undefined}
+            onClick={() => onNavigate(getNavigationTarget(page, "settings"))}
+          >設定</button>
+        </nav>
       </div>
     </header>
   );

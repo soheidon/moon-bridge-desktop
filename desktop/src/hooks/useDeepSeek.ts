@@ -1,6 +1,5 @@
-import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useState } from "react";
+import { command, onEvent } from "../platform/desktop";
 import type { GatewaySnapshot } from "../types/gateway";
 import {
   DEEPSEEK_FLASH,
@@ -14,11 +13,14 @@ import {
   type DeepSeekStatus,
 } from "../types/deepseek";
 
+type WailsDeepSeekSnapshot = { deepseek?: DeepSeekStatus };
+
 export function useDeepSeek(snapshot: GatewaySnapshot) {
   const [status, setStatus] = useState<DeepSeekStatus | null>(null);
   const [metadata, setMetadata] = useState<DeepSeekMetadata | null>(null);
   const [model, setModel] = useState<DeepSeekModel>(DEEPSEEK_PRO);
   const [reasoningEffort, setReasoningEffort] = useState("high");
+  const [apiKeyEnv, setApiKeyEnv] = useState("DEEPSEEK_API_KEY");
   const [modelDirty, setModelDirty] = useState(false);
   const [reasoningDirty, setReasoningDirty] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -31,13 +33,10 @@ export function useDeepSeek(snapshot: GatewaySnapshot) {
 
   useEffect(() => {
     let disposed = false;
-    void invoke<DeepSeekMetadata>("deepseek_metadata")
-      .then((next) => {
-        if (!disposed) setMetadata(next);
-      })
-      .catch((reason) => {
-        if (!disposed) setError(String(reason));
-      });
+    setMetadata({ models: [
+      { id: DEEPSEEK_PRO, displayName: "DeepSeek V4 Pro", allowedReasoningEfforts: ["high", "max"], defaultReasoningEffort: "high" },
+      { id: DEEPSEEK_FLASH, displayName: "DeepSeek V4 Flash", allowedReasoningEfforts: ["low", "high", "max"], defaultReasoningEffort: "high" },
+    ] });
     return () => {
       disposed = true;
     };
@@ -45,29 +44,24 @@ export function useDeepSeek(snapshot: GatewaySnapshot) {
 
   useEffect(() => {
     let disposed = false;
-    let unlisten: UnlistenFn | undefined;
-    void listen<DeepSeekOperationProgress>("deepseek-operation-progress", (event) => {
-      if (!disposed && event.payload.operationId === operationId) {
-        setProgress(event.payload);
+    const unlisten = onEvent<DeepSeekOperationProgress>("deepseek-operation-progress", (payload) => {
+      if (!disposed && payload.operationId === operationId) {
+        setProgress(payload);
       }
-    }).then((fn) => {
-      if (disposed) fn();
-      else unlisten = fn;
     });
     return () => {
       disposed = true;
-      unlisten?.();
+      unlisten();
     };
   }, [operationId]);
 
   const refresh = useCallback(async () => {
-    if (snapshot.state !== "running") {
-      setError(null);
-      return;
-    }
     try {
-      const next = await invoke<DeepSeekStatus>("deepseek_status");
+      const snapshot = await command<WailsDeepSeekSnapshot>("LoadDeepSeekSettings");
+      const next = snapshot.deepseek;
+      if (!next) throw new Error("deepseek status unavailable");
       setStatus(next);
+      setApiKeyEnv(next.apiKeyEnv || "DEEPSEEK_API_KEY");
       if (!modelDirty && (next.selectedModel === DEEPSEEK_PRO || next.selectedModel === DEEPSEEK_FLASH)) {
         setModel(next.selectedModel);
       }
@@ -77,13 +71,13 @@ export function useDeepSeek(snapshot: GatewaySnapshot) {
     } catch (reason) {
       setError(String(reason));
     }
-  }, [modelDirty, reasoningDirty, snapshot.state]);
+  }, [modelDirty, reasoningDirty]);
 
   useEffect(() => {
     void refresh();
   }, [refresh, snapshot.address]);
 
-  const configure = useCallback(async (apiKey: string) => {
+  const configure = useCallback(async (apiKey: string, nextApiKeyEnv?: string) => {
     const nextOperationId = crypto.randomUUID();
     setOperationId(nextOperationId);
     setProgress({ operationId: nextOperationId, operation: "save", stage: "validating_input", message: "設定値を検証しています" });
@@ -91,13 +85,20 @@ export function useDeepSeek(snapshot: GatewaySnapshot) {
     setError(null);
     setCommandError(null);
     try {
-      const result = await invoke<DeepSeekSaveResult>("deepseek_save", {
-        input: { operationId: nextOperationId, apiKey: apiKey.trim() || null, model, reasoningEffort },
-      });
-      setStatus(result.status);
+      const input: Record<string, string> = {
+        apiKey: apiKey.trim(),
+        defaultModel: model === DEEPSEEK_FLASH ? "flash" : "pro",
+        proReasoning: model === DEEPSEEK_PRO ? reasoningEffort : "high",
+        flashReasoning: model === DEEPSEEK_FLASH ? reasoningEffort : "high",
+      };
+      if (nextApiKeyEnv !== undefined) input.apiKeyEnv = nextApiKeyEnv.trim();
+      const snapshot = await command<WailsDeepSeekSnapshot>("SaveDeepSeekSettings", input);
+      const next = snapshot.deepseek;
+      if (!next) throw new Error("deepseek save result unavailable");
+      setStatus(next);
       setModelDirty(false);
       setReasoningDirty(false);
-      setProgress({ operationId: nextOperationId, operation: "save", stage: "complete", message: result.warning ?? "DeepSeek設定を保存しました" });
+      setProgress({ operationId: nextOperationId, operation: "save", stage: "complete", message: "DeepSeek設定を保存しました" });
       return true;
     } catch (reason) {
       setCommandError(asCommandError(reason));
@@ -106,7 +107,40 @@ export function useDeepSeek(snapshot: GatewaySnapshot) {
     } finally {
       setSaving(false);
     }
-  }, [model, reasoningEffort]);
+  }, [apiKeyEnv, model, reasoningEffort]);
+
+  const activateModel = useCallback(async (nextModel: DeepSeekModel) => {
+    if (snapshot.state !== "running" || saving || nextModel === model) return false;
+    const nextOperationId = crypto.randomUUID();
+    setOperationId(nextOperationId);
+    setProgress({ operationId: nextOperationId, operation: "save", stage: "activating", message: "プロバイダを切り替えています" });
+    setSaving(true);
+    setError(null);
+    setCommandError(null);
+    try {
+      const nextSnapshot = await command<WailsDeepSeekSnapshot>("SaveDeepSeekSettings", {
+        apiKey: "",
+        apiKeyEnv,
+        defaultModel: nextModel === DEEPSEEK_FLASH ? "flash" : "pro",
+        proReasoning: nextModel === DEEPSEEK_PRO ? reasoningEffort : "high",
+        flashReasoning: nextModel === DEEPSEEK_FLASH ? reasoningEffort : "high",
+      });
+      const next = nextSnapshot.deepseek;
+      if (!next) throw new Error("deepseek activation result unavailable");
+      setStatus(next);
+      setModel(nextModel);
+      setModelDirty(false);
+      setReasoningDirty(false);
+      setProgress({ operationId: nextOperationId, operation: "save", stage: "complete", message: "プロバイダを切り替えました" });
+      return true;
+    } catch (reason) {
+      setCommandError(asCommandError(reason));
+      setError(commandErrorMessage(reason));
+      return false;
+    } finally {
+      setSaving(false);
+    }
+  }, [apiKeyEnv, model, reasoningEffort, saving, snapshot.state]);
 
   const testConnection = useCallback(async () => {
     const nextOperationId = crypto.randomUUID();
@@ -116,9 +150,7 @@ export function useDeepSeek(snapshot: GatewaySnapshot) {
     setError(null);
     setCommandError(null);
     try {
-      const result = await invoke<DeepSeekConnectionTestResult>("deepseek_test_connection", {
-        input: { operationId: nextOperationId },
-      });
+      const result = await command<DeepSeekConnectionTestResult>("TestDeepSeekConnection", { operationId: nextOperationId });
       setConnectionTest(result);
       setProgress({ operationId: nextOperationId, operation: "connection_test", stage: "complete", message: result.warning ?? result.result.message });
       return result;
@@ -128,6 +160,30 @@ export function useDeepSeek(snapshot: GatewaySnapshot) {
       return null;
     } finally {
       setTestingConnection(false);
+    }
+  }, []);
+
+  const clearKey = useCallback(async () => {
+    const nextOperationId = crypto.randomUUID();
+    setOperationId(nextOperationId);
+    setSaving(true);
+    setError(null);
+    setCommandError(null);
+    try {
+      const snapshot = await command<WailsDeepSeekSnapshot>("ClearDeepSeekKey", { operationId: nextOperationId });
+      const next = snapshot.deepseek;
+      if (!next) throw new Error("deepseek clear result unavailable");
+      setStatus(next);
+      setApiKeyEnv(next.apiKeyEnv || "DEEPSEEK_API_KEY");
+      setModelDirty(false);
+      setReasoningDirty(false);
+      return true;
+    } catch (reason) {
+      setCommandError(asCommandError(reason));
+      setError(commandErrorMessage(reason));
+      return false;
+    } finally {
+      setSaving(false);
     }
   }, []);
 
@@ -167,7 +223,11 @@ export function useDeepSeek(snapshot: GatewaySnapshot) {
     hasUnsavedChanges: modelDirty || reasoningDirty,
     refresh,
     configure,
+    activateModel,
     testConnection,
+    clearKey,
+    apiKeyEnv,
+    setApiKeyEnv,
   };
 }
 

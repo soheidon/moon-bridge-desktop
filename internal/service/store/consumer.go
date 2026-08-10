@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"log/slog"
 	"moonbridge/internal/config"
 
@@ -39,6 +40,7 @@ func (c *ConfigStoreConsumer) Tables() []db.TableSpec {
     key          TEXT PRIMARY KEY,
     base_url     TEXT NOT NULL,
     api_key      TEXT NOT NULL,
+    api_key_env  TEXT DEFAULT '',
     version      TEXT DEFAULT '',
     protocol     TEXT DEFAULT 'anthropic',
     enabled      INTEGER DEFAULT 1,
@@ -127,7 +129,11 @@ func (c *ConfigStoreConsumer) Tables() []db.TableSpec {
 // BindStore is called by the db.Registry after tables are created.
 func (c *ConfigStoreConsumer) BindStore(s db.Store) error {
 	c.store = s
-	c.configStore = NewSQLiteStore(s, c.logger, c.extensionSpecs...)
+	store, err := NewSQLiteStore(s, c.logger, c.extensionSpecs...)
+	if err != nil {
+		return fmt.Errorf("init config store: %w", err)
+	}
+	c.configStore = store
 	if c.logger != nil {
 		c.logger.Info("config_store 持久化已启用")
 	}

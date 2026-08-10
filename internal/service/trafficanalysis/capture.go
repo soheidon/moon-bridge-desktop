@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -27,6 +28,12 @@ const (
 	DefaultUpstreamBase   = "https://chatgpt.com/backend-api/codex"
 	managementPathPrefix  = "/api/v1/system/traffic-analysis/"
 )
+
+// RelayMarkerHeader names the origin-proof header the Capture relay stamps on
+// forwarded requests. Its value is the owning gateway instance ID; the Gateway
+// validates it before lazily binding a source model. A client-supplied value is
+// always discarded, and the header never reaches traces or the upstream.
+const RelayMarkerHeader = "X-Moonbridge-Relay"
 
 type CaptureConfig struct {
 	ListenAddr      string
@@ -49,6 +56,7 @@ type CaptureStatus struct {
 	SSEStreams                 uint64     `json:"sseStreams"`
 	WebSocketConnections       uint64     `json:"websocketConnections"`
 	ObservationCount           uint64     `json:"observationCount"`
+	ObservationCapacity        uint64     `json:"observationCapacity"`
 	DroppedObservations        uint64     `json:"droppedObservations"`
 	DroppedBackpressure        uint64     `json:"droppedBackpressure"`
 	ActiveHTTPRequests         uint64     `json:"activeHttpRequests"`
@@ -322,6 +330,7 @@ func (p *CaptureProxy) Status() CaptureStatus {
 		HTTPRequests:               atomic.LoadUint64(&p.httpCount),
 		SSEStreams:                 atomic.LoadUint64(&p.sseCount),
 		WebSocketConnections:       atomic.LoadUint64(&p.wsCount),
+		ObservationCapacity:        uint64(p.config.RingCapacity),
 		DroppedBackpressure:        atomic.LoadUint64(&p.droppedBackpressure),
 	}
 	if !p.startedAt.IsZero() {
@@ -433,9 +442,11 @@ func (p *CaptureProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	upstream, err := composeUpstreamURL(p.config.UpstreamBase, r)
 	if err != nil {
+		logCaptureRequestTarget(r, p.config.UpstreamBase, err)
 		http.Error(w, "invalid capture request target", http.StatusBadRequest)
 		return
 	}
+	logCaptureRequestTarget(r, p.config.UpstreamBase, nil)
 	if websocket.IsWebSocketUpgrade(r) {
 		p.serveWebSocket(w, r, upstream)
 		return
@@ -456,8 +467,10 @@ func (p *CaptureProxy) serveHTTPForward(w http.ResponseWriter, r *http.Request, 
 		http.Error(w, "capture is not ready", http.StatusServiceUnavailable)
 		return
 	}
+	requestPath := r.URL.EscapedPath()
 	requestInput := PayloadInput{Direction: DirectionClientToUpstream, Transport: TransportHTTP, Method: r.Method,
-		ReceivedHost: r.Host, ReceivedPath: r.URL.EscapedPath(), UpstreamHost: upstream.Host, UpstreamPath: upstream.EscapedPath(),
+		RequestModelEligible: r.Method == http.MethodPost && (requestPath == "/responses" || requestPath == "/v1/responses"),
+		ReceivedHost:         r.Host, ReceivedPath: requestPath, UpstreamHost: upstream.Host, UpstreamPath: upstream.EscapedPath(),
 		QueryParameterNames: queryNames(r.URL), Headers: r.Header, ContentType: r.Header.Get("Content-Type"), ContentEncoding: r.Header.Get("Content-Encoding")}
 	body := r.Body
 	if body == nil {
@@ -476,6 +489,13 @@ func (p *CaptureProxy) serveHTTPForward(w http.ResponseWriter, r *http.Request, 
 	outgoing.Host = upstream.Host
 	outgoing.RequestURI = ""
 	outgoing.Header = cloneForwardHeaders(r.Header)
+	// Stamp the relay origin proof. The cloned header may carry a spoofed
+	// client value, so it is stripped first and exactly one Capture-generated
+	// value is set when the relay owns a gateway identity.
+	outgoing.Header.Del(RelayMarkerHeader)
+	if p.config.InstanceID != "" {
+		outgoing.Header.Set(RelayMarkerHeader, p.config.InstanceID)
+	}
 	if requestTap != nil {
 		outgoing.Body = requestTap
 	} else {
@@ -490,6 +510,7 @@ func (p *CaptureProxy) serveHTTPForward(w http.ResponseWriter, r *http.Request, 
 	if requestTap != nil {
 		requestTap.finish(err != nil)
 	}
+	logCaptureRequestBody(r, requestTap)
 	if err != nil {
 		http.Error(w, "capture upstream request failed", http.StatusBadGateway)
 		return
@@ -532,7 +553,11 @@ func (p *CaptureProxy) serveWebSocket(w http.ResponseWriter, r *http.Request, up
 		http.Error(w, "capture is not ready", http.StatusServiceUnavailable)
 		return
 	}
-	upstream.Scheme = "wss"
+	if upstream.Scheme == "https" {
+		upstream.Scheme = "wss"
+	} else {
+		upstream.Scheme = "ws"
+	}
 	upstreamHeader := cloneForwardHeaders(r.Header)
 	upstreamHeader.Del("Sec-WebSocket-Key")
 	upstreamHeader.Del("Sec-WebSocket-Version")
@@ -840,29 +865,51 @@ func boundedSample(value []byte) []byte {
 	return value
 }
 
+var (
+	errAbsoluteRequestTarget       = errors.New("absolute request target")
+	errUnsafeRequestPath           = errors.New("unsafe request path")
+	errInvalidEscapedPath          = errors.New("invalid escaped path")
+	errTraversalPath               = errors.New("traversal path")
+	errInvalidUpstreamBase         = errors.New("invalid upstream base")
+	errHTTPUpstreamOutsideLoopback = errors.New("http upstream outside loopback")
+	errUnsupportedUpstreamScheme   = errors.New("unsupported upstream scheme")
+)
+
 func composeUpstreamURL(base string, request *http.Request) (*url.URL, error) {
 	if request == nil || request.URL == nil || request.URL.IsAbs() || request.URL.Host != "" {
-		return nil, errors.New("absolute request target")
+		return nil, errAbsoluteRequestTarget
 	}
 	escaped := request.URL.EscapedPath()
 	if escaped == "" {
 		escaped = "/"
 	}
 	if !strings.HasPrefix(escaped, "/") || strings.HasPrefix(escaped, "//") || strings.ContainsAny(escaped, "\\\x00") {
-		return nil, errors.New("unsafe request path")
+		return nil, errUnsafeRequestPath
 	}
 	decoded, err := url.PathUnescape(escaped)
 	if err != nil {
-		return nil, errors.New("invalid escaped path")
+		return nil, errInvalidEscapedPath
 	}
 	for _, segment := range strings.Split(decoded, "/") {
 		if segment == "." || segment == ".." {
-			return nil, errors.New("traversal path")
+			return nil, errTraversalPath
 		}
 	}
 	upstream, err := url.Parse(base)
-	if err != nil || upstream.Scheme != "https" || upstream.Host == "" {
-		return nil, errors.New("invalid upstream base")
+	if err != nil || upstream.Host == "" {
+		return nil, errInvalidUpstreamBase
+	}
+	switch upstream.Scheme {
+	case "https":
+		// The fixed default upstream (chatgpt.com) and any TLS upstream.
+	case "http":
+		// The desktop flow forwards to the local loopback Gateway only. Allowing
+		// http to any host would turn the capture proxy into an open relay.
+		if !isLoopbackHost(upstream.Hostname()) {
+			return nil, errHTTPUpstreamOutsideLoopback
+		}
+	default:
+		return nil, errUnsupportedUpstreamScheme
 	}
 	baseEscaped := strings.TrimRight(upstream.EscapedPath(), "/")
 	upstream.Path = strings.TrimRight(upstream.Path, "/") + decoded
@@ -870,6 +917,117 @@ func composeUpstreamURL(base string, request *http.Request) (*url.URL, error) {
 	upstream.RawQuery = request.URL.RawQuery
 	return upstream, nil
 }
+
+func isLoopbackHost(host string) bool {
+	switch host {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func logCaptureRequestTarget(r *http.Request, upstreamBase string, err error) {
+	form := "origin"
+	path := ""
+	hasQuery := false
+	if r.URL != nil {
+		if r.URL.IsAbs() || r.URL.Host != "" {
+			form = "absolute"
+		}
+		path = safeCapturePath(r.URL.EscapedPath())
+		hasQuery = r.URL.RawQuery != ""
+	}
+	reason := ""
+	if err != nil {
+		reason = captureTargetReason(err)
+	}
+	upstream, parseErr := url.Parse(upstreamBase)
+	upstreamScheme := ""
+	if parseErr == nil {
+		upstreamScheme = upstream.Scheme
+	}
+	log.Printf("capture request: method=%q request_uri_form=%q path=%q has_query=%t upstream_scheme=%q accepted=%t reason=%q",
+		r.Method, form, path, hasQuery, upstreamScheme, err == nil, reason)
+}
+
+// safeCapturePath is a log-display sanitizer only, not a forwarding allowlist:
+// known diagnostic paths are echoed verbatim, anything else is folded to
+// <other>. Arbitrary path forwarding is unaffected.
+func safeCapturePath(path string) string {
+	switch path {
+	case "/responses", "/v1/responses", "/models", "/v1/models", "/socket":
+		return path
+	default:
+		return "<other>"
+	}
+}
+
+// captureTargetReason maps sentinel errors to safe enum strings. Anything
+// unexpected is reported as unknown so raw error text is never logged.
+func captureTargetReason(err error) string {
+	switch {
+	case errors.Is(err, errAbsoluteRequestTarget):
+		return "absolute_request_target"
+	case errors.Is(err, errUnsafeRequestPath):
+		return "unsafe_request_path"
+	case errors.Is(err, errInvalidEscapedPath):
+		return "invalid_escaped_path"
+	case errors.Is(err, errTraversalPath):
+		return "traversal_path"
+	case errors.Is(err, errInvalidUpstreamBase):
+		return "invalid_upstream_base"
+	case errors.Is(err, errHTTPUpstreamOutsideLoopback):
+		return "http_upstream_outside_loopback"
+	case errors.Is(err, errUnsupportedUpstreamScheme):
+		return "unsupported_upstream_scheme"
+	default:
+		return "unknown"
+	}
+}
+
+// bodyFirstByteClass classifies only the first significant byte of a body for
+// secret-free diagnostics. It never exposes the body text itself. "other" means
+// the body does not begin with a JSON object or array token.
+func bodyFirstByteClass(sample []byte) string {
+	for _, b := range sample {
+		switch b {
+		case ' ', '\t', '\r', '\n':
+			continue
+		case '{':
+			return "object"
+		case '[':
+			return "array"
+		default:
+			return "other"
+		}
+	}
+	return "empty"
+}
+
+// logCaptureRequestBody is a secret-free forwarding diagnostic. It reports only
+// framing metadata and the first-byte JSON class of the forwarded body — never
+// the body text, its raw digest, or any header value that could carry secrets.
+func logCaptureRequestBody(r *http.Request, tap *payloadTap) {
+	chunked := false
+	for _, te := range r.TransferEncoding {
+		if te == "chunked" {
+			chunked = true
+		}
+	}
+	size := 0
+	firstByteClass := "empty"
+	if tap != nil {
+		tap.mu.Lock()
+		size = tap.size
+		firstByteClass = bodyFirstByteClass(tap.sample)
+		tap.mu.Unlock()
+	}
+	log.Printf("capture request body: path=%q method=%q content_length=%d content_type=%q content_encoding=%q chunked=%t forwarded_bytes=%d first_byte_class=%q",
+		r.URL.EscapedPath(), r.Method, r.ContentLength, r.Header.Get("Content-Type"), r.Header.Get("Content-Encoding"),
+		chunked, size, firstByteClass)
+}
+
 func cloneForwardHeaders(in http.Header) http.Header {
 	out := in.Clone()
 	removeHopHeaders(out)

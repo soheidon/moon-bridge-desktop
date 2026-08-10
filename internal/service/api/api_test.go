@@ -12,6 +12,7 @@ import (
 	"moonbridge/internal/config"
 	"moonbridge/internal/db"
 	"moonbridge/internal/extension/plugin"
+	"moonbridge/internal/service/provider"
 	"moonbridge/internal/service/runtime"
 	"moonbridge/internal/service/stats"
 	"moonbridge/internal/service/store"
@@ -30,6 +31,7 @@ type testFixture struct {
 type fixtureOptions struct {
 	sessionStats *stats.SessionStats
 	registry     *plugin.Registry
+	resolver     *provider.CredentialResolver
 	mutateConfig func(*config.Config)
 }
 
@@ -95,8 +97,14 @@ func newFixtureWithOptions(t *testing.T, opts fixtureOptions) *testFixture {
 	if opts.mutateConfig != nil {
 		opts.mutateConfig(&cfg)
 	}
+	if opts.resolver == nil {
+		opts.resolver = &provider.CredentialResolver{
+			Codec:    fakeCodec{},
+			Registry: provider.NewCredentialStatusRegistry(),
+		}
+	}
 
-	rt := runtime.NewRuntime(cfg, nil, nil)
+	rt := runtime.NewRuntime(cfg, nil, nil, opts.resolver)
 
 	// Build in-memory SQLite store.
 	database, err := sql.Open("sqlite", ":memory:")
@@ -127,6 +135,9 @@ func newFixtureWithOptions(t *testing.T, opts fixtureOptions) *testFixture {
 	s := c.Store()
 	if s == nil {
 		t.Fatal("Store() returned nil")
+	}
+	if sqlStore, ok := s.(*store.SQLiteConfigStore); ok {
+		sqlStore.SetCodec(fakeCodec{})
 	}
 
 	if err := s.SeedFromConfig(&cfg); err != nil {

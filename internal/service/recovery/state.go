@@ -35,6 +35,22 @@ const (
 	PhaseInactive           Phase = "inactive"
 )
 
+// IsKnownPhase reports whether a persisted Recovery phase is part of the
+// schema-v2 contract. Unknown strings are decoded for forward compatibility,
+// but callers must classify them as recovery-required before taking action.
+func IsKnownPhase(phase Phase) bool {
+	switch phase {
+	case PhasePrepared, PhaseCaptureStarted, PhaseIntegrationApplied,
+		PhaseAborted, PhaseRestartPrepared, PhaseRestartFailed,
+		PhaseCaptureRestarted, PhaseReconciliationReq,
+		PhaseReconciledRestored, PhaseReconciliationConf,
+		PhaseRecovered, PhaseInactive:
+		return true
+	default:
+		return false
+	}
+}
+
 // DefaultPhase matches the Rust default of "integration_applied".
 const DefaultPhase = PhaseIntegrationApplied
 

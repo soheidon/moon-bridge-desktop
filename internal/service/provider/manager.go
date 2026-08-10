@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -29,6 +30,7 @@ type ModelMeta = config.ModelMeta
 type ProviderConfig struct {
 	BaseURL          string               `yaml:"base_url"`
 	APIKey           string               `yaml:"api_key"`
+	APIKeyEnv        string               `yaml:"api_key_env"`
 	Version          string               `yaml:"version"`
 	UserAgent        string               `yaml:"user_agent"`
 	Protocol         string               // "anthropic" (default) or "openai-response"
@@ -54,10 +56,12 @@ type ModelRoute struct {
 
 // ProviderCandidate represents a candidate provider for a resolved model.
 type ProviderCandidate struct {
-	ProviderKey   string
-	UpstreamModel string
-	Protocol      string // "anthropic" | "openai-response"
-	Client        ProviderClient
+	ProviderKey       string
+	UpstreamModel     string
+	Protocol          string // "anthropic" | "openai-response"
+	Client            ProviderClient
+	ReasoningOverride *string // nil = use model default; non-nil = override (from routing profile slot)
+	ReasoningMode     string // "thinking" | "normal" | "" (no routing profile slot)
 }
 
 // ResolvedRoute contains the result of model resolution.
@@ -130,30 +134,71 @@ func (a *anthropicClientAdapter) AnthropicClient() *anthropic.Client {
 	return a.client
 }
 
-// NewAnthropicClientAdapter wraps an *anthropic.Client to satisfy ProviderClient.
 func NewAnthropicClientAdapter(client *anthropic.Client) ProviderClient {
 	return &anthropicClientAdapter{client: client}
 }
 
 type ProviderManager struct {
-	mu             sync.RWMutex // guards field replacement during Reload
-	clients        map[string]ProviderClient
-	providers      map[string]ProviderConfig       // provider key -> config (for inspection)
-	routes         map[string]ModelRoute           // model alias -> route
-	defaultK       string                          // default provider key
-	resolvedWS     map[string]string               // provider key -> resolved web search support
-	modelProviders map[string][]modelProviderEntry // upstream model name -> (provider key, priority) (reverse index)
+	mu              sync.RWMutex // guards field replacement during Reload
+	clients         map[string]ProviderClient
+	providers       map[string]ProviderConfig       // provider key -> config (for inspection)
+	routes          map[string]ModelRoute           // model alias -> route
+	defaultK        string                          // default provider key
+	resolvedWS      map[string]string               // provider key -> resolved web search support
+	modelProviders  map[string][]modelProviderEntry // upstream model name -> (provider key, priority) (reverse index)
+	resolver        *CredentialResolver
+	migrationIssues []CredentialInfo
+}
+
+func credentialIssueFor(issues []CredentialInfo, providerID string) (CredentialInfo, bool) {
+	for _, issue := range issues {
+		if issue.ProviderID == providerID && issue.State == StateUnavailable {
+			return issue, true
+		}
+	}
+	return CredentialInfo{}, false
 }
 
 // NewProviderManager creates a ProviderManager from provider configs and model routes.
-// providerCfgs: provider key -> ProviderConfig
-// routes: model alias -> ModelRoute
-func NewProviderManager(providerCfgs map[string]ProviderConfig, routes map[string]ModelRoute) (*ProviderManager, error) {
+// Legacy callers may omit a resolver; production paths use NewSecureProviderManager.
+func NewSecureProviderManager(providerCfgs map[string]ProviderConfig, routes map[string]ModelRoute, resolver *CredentialResolver) (*ProviderManager, error) {
+	return NewSecureProviderManagerWithIssues(providerCfgs, routes, resolver, nil)
+}
+
+func NewSecureProviderManagerWithIssues(providerCfgs map[string]ProviderConfig, routes map[string]ModelRoute, resolver *CredentialResolver, issues []CredentialInfo) (*ProviderManager, error) {
+	if resolver == nil {
+		return nil, fmt.Errorf("credential resolver is required")
+	}
+	return newProviderManager(providerCfgs, routes, resolver, issues)
+}
+
+func NewProviderManager(providerCfgs map[string]ProviderConfig, routes map[string]ModelRoute, resolvers ...*CredentialResolver) (*ProviderManager, error) {
+	var resolver *CredentialResolver
+	if len(resolvers) > 0 {
+		resolver = resolvers[0]
+	}
+	return newProviderManager(providerCfgs, routes, resolver, nil)
+}
+
+func newProviderManager(providerCfgs map[string]ProviderConfig, routes map[string]ModelRoute, resolver *CredentialResolver, issues []CredentialInfo) (*ProviderManager, error) {
 	pm := &ProviderManager{
-		clients:    make(map[string]ProviderClient, len(providerCfgs)),
-		providers:  providerCfgs,
-		routes:     routes,
-		resolvedWS: make(map[string]string, len(providerCfgs)),
+		clients:         make(map[string]ProviderClient, len(providerCfgs)),
+		providers:       providerCfgs,
+		routes:          routes,
+		resolvedWS:      make(map[string]string, len(providerCfgs)),
+		resolver:        resolver,
+		migrationIssues: append([]CredentialInfo(nil), issues...),
+	}
+
+	// A manager build re-records every provider's credential status, so any
+	// status left over from a previously removed provider is dropped.
+	if resolver != nil && resolver.Registry != nil {
+		resolver.Registry.Clear()
+		for _, issue := range issues {
+			if issue.State == StateUnavailable {
+				resolver.RecordIssue(issue)
+			}
+		}
 	}
 
 	// Build clients for each provider config.
@@ -165,9 +210,23 @@ func NewProviderManager(providerCfgs map[string]ProviderConfig, routes map[strin
 		if httpClient == nil {
 			httpClient = newHTTPClient(cfg.HTTP)
 		}
+		if issue, blocked := credentialIssueFor(issues, key); blocked {
+			pm.clients[key] = &UnavailableProviderClient{Code: issue.ErrorCode}
+			continue
+		}
+
+		apiKey := ""
+		if resolver != nil {
+			apiKey = resolver.Resolve(key, cfg.APIKey, cfg.APIKeyEnv)
+		}
+		if apiKey == "" {
+			pm.clients[key] = &UnavailableProviderClient{Code: "credential_unavailable"}
+			continue
+		}
+
 		pm.clients[key] = &anthropicClientAdapter{client: anthropic.NewClient(anthropic.ClientConfig{
 			BaseURL:   cfg.BaseURL,
-			APIKey:    cfg.APIKey,
+			APIKey:    apiKey,
 			Version:   cfg.Version,
 			UserAgent: cfg.UserAgent,
 			Client:    httpClient,
@@ -239,6 +298,7 @@ func (pm *ProviderManager) Reload(cfg config.ProviderConfig) error {
 		providerDefs[key] = ProviderConfig{
 			BaseURL:          def.BaseURL,
 			APIKey:           def.APIKey,
+			APIKeyEnv:        def.APIKeyEnv,
 			Version:          def.Version,
 			UserAgent:        def.UserAgent,
 			Protocol:         def.Protocol,
@@ -258,8 +318,15 @@ func (pm *ProviderManager) Reload(cfg config.ProviderConfig) error {
 		}
 	}
 
-	// Build the new manager (validates + creates clients).
-	newPM, err := NewProviderManager(providerDefs, modelRoutes)
+	// Build the new manager (validates + creates clients). The shared resolver
+	// is re-injected so reload re-records credential statuses.
+	var newPM *ProviderManager
+	var err error
+	if pm.resolver == nil {
+		newPM, err = newProviderManager(providerDefs, modelRoutes, nil, pm.migrationIssues)
+	} else {
+		newPM, err = NewSecureProviderManagerWithIssues(providerDefs, modelRoutes, pm.resolver, pm.migrationIssues)
+	}
 	if err != nil {
 		return err
 	}
@@ -273,6 +340,7 @@ func (pm *ProviderManager) Reload(cfg config.ProviderConfig) error {
 	pm.defaultK = newPM.defaultK
 	pm.resolvedWS = newPM.resolvedWS
 	pm.modelProviders = newPM.modelProviders
+	pm.migrationIssues = newPM.migrationIssues
 	return nil
 }
 
@@ -441,6 +509,41 @@ func (pm *ProviderManager) DefaultKey() string {
 	return pm.defaultK
 }
 
+// CredentialStatus returns the credential states the shared resolver recorded
+// at client generation, or nil when no resolver is configured. The result is a
+// copy, safe for concurrent use.
+func (pm *ProviderManager) MigrationIssue(providerID string) (CredentialInfo, bool) {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	return credentialIssueFor(pm.migrationIssues, providerID)
+}
+
+func (pm *ProviderManager) ClearMigrationIssue(providerID string) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	filtered := pm.migrationIssues[:0]
+	for _, issue := range pm.migrationIssues {
+		if issue.ProviderID != providerID {
+			filtered = append(filtered, issue)
+		}
+	}
+	pm.migrationIssues = filtered
+	if pm.resolver != nil {
+		pm.resolver.ClearStatus(providerID)
+	}
+}
+
+// CredentialStatus returns the credential states the shared resolver recorded
+// at client generation, or nil when no resolver is configured.
+func (pm *ProviderManager) CredentialStatus() []CredentialInfo {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	if pm.resolver == nil || pm.resolver.Registry == nil {
+		return nil
+	}
+	return pm.resolver.Registry.All()
+}
+
 // newHTTPClient creates an *http.Client with connection pooling configured.
 func newHTTPClient(cfg HTTPConfig) *http.Client {
 	maxIdle := cfg.MaxIdleConnsPerHost
@@ -464,6 +567,20 @@ func newHTTPClient(cfg HTTPConfig) *http.Client {
 			ResponseHeaderTimeout: 30 * time.Second,
 		},
 	}
+}
+
+func resolveAPIKey(stored, envName string) string {
+	if stored != "" {
+		return stored
+	}
+	if envName == "" {
+		return ""
+	}
+	value, ok := os.LookupEnv(envName)
+	if !ok {
+		return ""
+	}
+	return value
 }
 
 func valueOrDefault(value, fallback string) string {

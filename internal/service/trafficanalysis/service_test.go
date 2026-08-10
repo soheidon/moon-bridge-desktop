@@ -219,6 +219,138 @@ func TestStartCaptureOwnsSingleProxyAndTracksIdentity(t *testing.T) {
 	}
 }
 
+func TestDesktopModelMappingLifecycleIsExactAndProcessLocal(t *testing.T) {
+	svc := NewService()
+	st := svcBindAndStart(t, svc)
+	defer svc.CloseCapture(context.Background())
+	if _, err := svc.ClaimDesktopExpected(st.Generation, "gateway-1", "127.0.0.1:38440", "owner-1"); err != nil {
+		t.Fatalf("ClaimDesktopExpected() error = %v", err)
+	}
+	if err := svc.SetDesktopModelMappingExpected(st.Generation, "gateway-1", "127.0.0.1:38440", "owner-1", "gpt-test", "moonbridge"); err != nil {
+		t.Fatalf("SetDesktopModelMappingExpected() error = %v", err)
+	}
+	if got, ok := svc.ObservedModelFor("gpt-test", "gateway-1"); !ok || got != "moonbridge" {
+		t.Fatalf("lazy bind = %q/%v, want moonbridge/true", got, ok)
+	}
+	if got, ok := svc.ModelMappingFor("gpt-test"); !ok || got != "moonbridge" {
+		t.Fatalf("mapping = %q/%v, want moonbridge/true", got, ok)
+	}
+	if _, ok := svc.ModelMappingFor("other-model"); ok {
+		t.Fatal("unexpected wildcard model mapping")
+	}
+
+	if _, err := svc.PauseDesktopExpected(context.Background(), st.Generation, "gateway-1", "127.0.0.1:38440", "owner-1"); err != nil {
+		t.Fatalf("PauseDesktopExpected() error = %v", err)
+	}
+	if got, ok := svc.ModelMappingFor("gpt-test"); !ok || got != "moonbridge" {
+		t.Fatalf("mapping after pause = %q/%v, want moonbridge/true", got, ok)
+	}
+	if _, err := svc.ReleaseDesktopExpected(st.Generation, "owner-1"); err != nil {
+		t.Fatalf("ReleaseDesktopExpected() error = %v", err)
+	}
+	if got, ok := svc.ModelMappingFor("gpt-test"); !ok || got != "moonbridge" {
+		t.Fatalf("mapping after release = %q/%v, want moonbridge/true", got, ok)
+	}
+	statusBytes, err := json.Marshal(svc.Status())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(statusBytes), "gpt-test") || strings.Contains(string(statusBytes), "moonbridge") {
+		t.Fatalf("mapping leaked through State: %s", statusBytes)
+	}
+	if _, err := svc.CloseCapture(context.Background()); err != nil {
+		t.Fatalf("CloseCapture() error = %v", err)
+	}
+	if _, ok := svc.ModelMappingFor("gpt-test"); ok {
+		t.Fatal("mapping remains after CloseCapture")
+	}
+}
+
+func TestDesktopModelMappingRejectsStaleRegistrationAndGenerationChanges(t *testing.T) {
+	svc := NewService()
+	st := svcBindAndStart(t, svc)
+	defer svc.CloseCapture(context.Background())
+	if _, err := svc.ClaimDesktopExpected(st.Generation, "gateway-1", "127.0.0.1:38440", "owner-1"); err != nil {
+		t.Fatalf("ClaimDesktopExpected() error = %v", err)
+	}
+	mustErrKind(t, svc.SetDesktopModelMappingExpected(st.Generation+1, "gateway-1", "127.0.0.1:38440", "owner-1", "gpt-test", "moonbridge"), KindCaptureGenerationMismatch)
+	mustErrKind(t, svc.SetDesktopModelMappingExpected(st.Generation, "gateway-2", "127.0.0.1:38440", "owner-1", "gpt-test", "moonbridge"), KindGatewayMismatch)
+	mustErrKind(t, svc.SetDesktopModelMappingExpected(st.Generation, "gateway-1", "127.0.0.1:38440", "owner-2", "gpt-test", "moonbridge"), KindCaptureOperationSuperseded)
+	if _, ok := svc.ModelMappingFor("gpt-test"); ok {
+		t.Fatal("stale registration unexpectedly created a mapping")
+	}
+	if err := svc.SetDesktopModelMappingExpected(st.Generation, "gateway-1", "127.0.0.1:38440", "owner-1", "gpt-test", "moonbridge"); err != nil {
+		t.Fatalf("SetDesktopModelMappingExpected() error = %v", err)
+	}
+	if got, ok := svc.ObservedModelFor("gpt-test", "gateway-1"); !ok || got != "moonbridge" {
+		t.Fatalf("lazy bind = %q/%v, want moonbridge/true", got, ok)
+	}
+	if _, err := svc.ReleaseDesktopExpected(st.Generation, "owner-1"); err != nil {
+		t.Fatalf("ReleaseDesktopExpected() error = %v", err)
+	}
+	if _, err := svc.StopCapture(context.Background()); err != nil {
+		t.Fatalf("StopCapture() error = %v", err)
+	}
+	next, err := svc.StartCapture(StartOptions{ListenAddr: "127.0.0.1:0", UpstreamBase: "https://chatgpt.com/backend-api/codex"})
+	if err != nil {
+		t.Fatalf("StartCapture() restart error = %v", err)
+	}
+	if next.Generation <= st.Generation {
+		t.Fatalf("restart generation = %d, want > %d", next.Generation, st.Generation)
+	}
+	if _, ok := svc.ModelMappingFor("gpt-test"); ok {
+		t.Fatal("mapping survived generation change")
+	}
+}
+
+func TestDesktopModelMappingClearsWhenGatewayEnds(t *testing.T) {
+	svc := NewService()
+	st := svcBindAndStart(t, svc)
+	defer svc.CloseCapture(context.Background())
+	if _, err := svc.ClaimDesktopExpected(st.Generation, "gateway-1", "127.0.0.1:38440", "owner-1"); err != nil {
+		t.Fatalf("ClaimDesktopExpected() error = %v", err)
+	}
+	if err := svc.SetDesktopModelMappingExpected(st.Generation, "gateway-1", "127.0.0.1:38440", "owner-1", "gpt-test", "moonbridge"); err != nil {
+		t.Fatalf("SetDesktopModelMappingExpected() error = %v", err)
+	}
+	if got, ok := svc.ObservedModelFor("gpt-test", "gateway-1"); !ok || got != "moonbridge" {
+		t.Fatalf("lazy bind = %q/%v, want moonbridge/true", got, ok)
+	}
+	svc.MarkGatewayLost("gateway-1", true)
+	if _, ok := svc.ModelMappingFor("gpt-test"); ok {
+		t.Fatal("mapping remains after Gateway loss")
+	}
+}
+
+func TestDesktopModelMappingClearsWhenCloseFails(t *testing.T) {
+	var proxy *fakeProxy
+	svc := newService(func(cfg CaptureConfig) captureProxy {
+		proxy = newFakeProxy(cfg)
+		return proxy
+	})
+	st := svcBindAndStart(t, svc)
+	defer svc.MarkGatewayLost("gateway-1", false)
+	if _, err := svc.ClaimDesktopExpected(st.Generation, "gateway-1", "127.0.0.1:38440", "owner-1"); err != nil {
+		t.Fatalf("ClaimDesktopExpected() error = %v", err)
+	}
+	if err := svc.SetDesktopModelMappingExpected(st.Generation, "gateway-1", "127.0.0.1:38440", "owner-1", "gpt-test", "moonbridge"); err != nil {
+		t.Fatalf("SetDesktopModelMappingExpected() error = %v", err)
+	}
+	if got, ok := svc.ObservedModelFor("gpt-test", "gateway-1"); !ok || got != "moonbridge" {
+		t.Fatalf("lazy bind = %q/%v, want moonbridge/true", got, ok)
+	}
+	if _, err := svc.ReleaseDesktopExpected(st.Generation, "owner-1"); err != nil {
+		t.Fatalf("ReleaseDesktopExpected() error = %v", err)
+	}
+	proxy.closeErr = errors.New("close failed")
+	if _, err := svc.CloseCapture(context.Background()); errorKind(err) != KindCaptureStopFailed {
+		t.Fatalf("CloseCapture() error = %v, want close failure", err)
+	}
+	if _, ok := svc.ModelMappingFor("gpt-test"); ok {
+		t.Fatal("mapping remains after failed CloseCapture")
+	}
+}
+
 func TestDoubleStartDoesNotReplaceExistingProxy(t *testing.T) {
 	svc := NewService()
 	first := svcBindAndStart(t, svc)

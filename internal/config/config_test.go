@@ -691,6 +691,61 @@ func TestLoadFromYAMLRequiresTransformProviderSettings(t *testing.T) {
 	}
 }
 
+func TestLoadFromYAMLAllowsEnvOnlyProviderAPIKey(t *testing.T) {
+	// A cleared stored key must be persistable when api_key_env remains set:
+	// the provider resolves its key from the environment at runtime. This is
+	// the persisted shape produced by the saved-key deletion flow.
+	cfg, err := config.LoadFromYAML([]byte(`
+mode: Transform
+models:
+  local-test-model:
+    context_window: 128000
+providers:
+  local:
+    base_url: https://provider.example.test
+    api_key_env: LOCAL_API_KEY
+    offers:
+      - model: local-test-model
+routes:
+  moonbridge:
+    provider: local
+    model: local-test-model
+`))
+	if err != nil {
+		t.Fatalf("LoadFromYAML() error = %v, want env-only provider accepted", err)
+	}
+	if got := cfg.ProviderDefs["local"].APIKey; got != "" {
+		t.Fatalf("providers.local.api_key = %q, want empty (env-only)", got)
+	}
+	if got := cfg.ProviderDefs["local"].APIKeyEnv; got != "LOCAL_API_KEY" {
+		t.Fatalf("providers.local.api_key_env = %q, want LOCAL_API_KEY", got)
+	}
+}
+
+func TestLoadFromYAMLAcceptsProviderWithoutCredentialSource(t *testing.T) {
+	cfg, err := config.LoadFromYAML([]byte(`
+mode: Transform
+models:
+  local-test-model:
+    context_window: 128000
+providers:
+  local:
+    base_url: https://provider.example.test
+    offers:
+      - model: local-test-model
+routes:
+  moonbridge:
+    provider: local
+    model: local-test-model
+`))
+	if err != nil {
+		t.Fatalf("LoadFromYAML() error = %v, want empty credential source accepted for unavailable/migration states", err)
+	}
+	if got := cfg.ProviderDefs["local"].APIKey; got != "" {
+		t.Fatalf("providers.local.api_key = %q, want empty", got)
+	}
+}
+
 func TestLoadFromYAMLRejectsInvalidCacheTTL(t *testing.T) {
 	_, err := config.LoadFromYAML([]byte(`
 mode: Transform

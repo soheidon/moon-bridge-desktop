@@ -17,6 +17,35 @@ func pathWithin(root, p string) bool {
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
+// stripVerbatimPrefix converts the Windows extended-length (verbatim) forms that
+// denote an ordinary file — `\\?\C:\...` and `\\?\UNC\server\share\...` — back to
+// their canonical DOS/UNC form. Both spellings reference the same physical
+// location, so stripping never weakens a containment check. Device and
+// volume-GUID namespaces (`\\?\Volume{...}`, `\\?\pipe\...`, `\\.\...`) are left
+// unchanged: they are not ordinary file paths and must keep failing the legacy
+// absolute-path checks.
+func stripVerbatimPrefix(path string) string {
+	const uncPrefix = `\\?\UNC\`
+	const drivePrefix = `\\?\`
+
+	if strings.HasPrefix(strings.ToUpper(path), strings.ToUpper(uncPrefix)) {
+		return `\\` + path[len(uncPrefix):]
+	}
+
+	if len(path) >= len(drivePrefix)+2 &&
+		strings.HasPrefix(path, drivePrefix) &&
+		isDriveLetter(path[len(drivePrefix)]) &&
+		path[len(drivePrefix)+1] == ':' {
+		return path[len(drivePrefix):]
+	}
+
+	return path
+}
+
+func isDriveLetter(b byte) bool {
+	return ('a' <= b && b <= 'z') || ('A' <= b && b <= 'Z')
+}
+
 // pathWithinPhysical reports whether a path resolves to a location inside root
 // after following symlinks/junctions. It is the authoritative guard against an
 // absolute (legacy) value that redirects outside an allowed root. When the target
@@ -25,6 +54,8 @@ func pathWithin(root, p string) bool {
 // not exist yet, only the existing ancestor chain is resolved and the remainder
 // is re-joined lexically.
 func pathWithinPhysical(root, target string) bool {
+	root = stripVerbatimPrefix(root)
+	target = stripVerbatimPrefix(target)
 	rootPhys, err := evalPhysicalDir(root)
 	if err != nil {
 		return false
@@ -35,13 +66,13 @@ func pathWithinPhysical(root, target string) bool {
 		return false
 	}
 	if targetPhys, err := filepath.EvalSymlinks(target); err == nil {
-		return pathWithin(rootPhys, targetPhys)
+		return pathWithin(stripVerbatimPrefix(rootPhys), stripVerbatimPrefix(targetPhys))
 	}
 	targetPhys, err := evalPhysicalDir(filepath.Dir(target))
 	if err != nil {
 		return false
 	}
-	return pathWithin(rootPhys, targetPhys)
+	return pathWithin(stripVerbatimPrefix(rootPhys), stripVerbatimPrefix(targetPhys))
 }
 
 // evalPhysicalDir resolves a directory path through symlinks/junctions to its

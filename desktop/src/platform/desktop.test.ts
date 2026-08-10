@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { closeWindow, command, onEvent, openDialog, saveDialog, type PlatformAdapter } from "./desktop";
+import {
+  ZERO_ARG_COMMANDS,
+  closeWindow,
+  command,
+  onEvent,
+  openDialog,
+  saveDialog,
+  type PlatformAdapter,
+} from "./desktop";
 
 function installPlatform(adapter: PlatformAdapter) {
   Object.defineProperty(globalThis, "__MOON_BRIDGE_PLATFORM__", { configurable: true, value: adapter });
@@ -29,12 +37,12 @@ function removeWailsRuntime() {
 describe("desktop platform", () => {
   beforeEach(() => {
     delete (globalThis as { __MOON_BRIDGE_PLATFORM__?: unknown }).__MOON_BRIDGE_PLATFORM__;
-    delete (globalThis as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
     removeWailsRuntime();
   });
 
   afterEach(() => {
     removeWailsRuntime();
+    delete (globalThis as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
   });
 
   it("unwraps a successful command result", async () => {
@@ -49,10 +57,28 @@ describe("desktop platform", () => {
     });
   });
 
-  it("resolves undefined when ok is true without a value", async () => {
+  it("unwraps the flat GatewaySnapshot value from GatewayStatus", async () => {
+    const value = {
+      state: "running",
+      address: "127.0.0.1:38440",
+      configPath: "C:/gateway",
+      pid: 25596,
+      instanceId: "inst-1",
+      error: null,
+    };
+    installPlatform(
+      stubAdapter({
+        command: async () => ({ ok: true, value }),
+      }),
+    );
+
+    await expect(command("GatewayStatus")).resolves.toEqual(value);
+  });
+
+  it("rejects ok without a value as a contract violation", async () => {
     installPlatform(stubAdapter());
 
-    await expect(command("VoidOp")).resolves.toBeUndefined();
+    await expect(command("VoidOp")).rejects.toMatchObject({ code: "invalid_command_response" });
   });
 
   it("preserves structured command errors", async () => {
@@ -95,12 +121,96 @@ describe("desktop platform", () => {
     await expect(command("RoundTrip")).rejects.toMatchObject({ code: "unsupported_platform" });
   });
 
-  it("rejects with not_implemented for Wails dialogs and closeWindow", async () => {
+  it("rejects with not_implemented for Wails openDialog and closeWindow", async () => {
     installWailsRuntime({ main: { App: {} } }, { EventsOn: () => () => undefined });
 
     await expect(openDialog()).rejects.toMatchObject({ code: "not_implemented" });
-    await expect(saveDialog()).rejects.toMatchObject({ code: "not_implemented" });
     await expect(closeWindow()).rejects.toMatchObject({ code: "not_implemented" });
+  });
+
+  describe("saveDialog over the Wails SaveFileDialog binding", () => {
+    it("maps a bare defaultPath to DefaultFilename and unwraps the chosen path", async () => {
+      const SaveFileDialog = vi.fn().mockResolvedValue({
+        ok: true,
+        value: { saveDialog: { path: "C:/logs/export.log", canceled: false } },
+      });
+      installWailsRuntime({ main: { App: { SaveFileDialog } } }, { EventsOn: () => () => undefined });
+
+      const path = await saveDialog({
+        title: "ログを保存",
+        defaultPath: "traffic-analysis-export.log",
+        filters: [{ name: "Log", extensions: ["log"] }],
+      });
+
+      expect(path).toBe("C:/logs/export.log");
+      expect(SaveFileDialog).toHaveBeenCalledWith({
+        title: "ログを保存",
+        defaultDirectory: "",
+        defaultFilename: "traffic-analysis-export.log",
+        filters: [{ displayName: "Log", pattern: "*.log" }],
+      });
+    });
+
+    it("splits a full defaultPath into directory and filename", async () => {
+      const SaveFileDialog = vi.fn().mockResolvedValue({
+        ok: true,
+        value: { saveDialog: { path: "C:/logs/export.log", canceled: false } },
+      });
+      installWailsRuntime({ main: { App: { SaveFileDialog } } }, { EventsOn: () => () => undefined });
+
+      await saveDialog({ defaultPath: "C:\\Users\\test\\Desktop\\export.log" });
+
+      expect(SaveFileDialog).toHaveBeenCalledWith({
+        title: "",
+        defaultDirectory: "C:\\Users\\test\\Desktop",
+        defaultFilename: "export.log",
+        filters: [],
+      });
+    });
+
+    it("joins multiple extensions into a single Wails pattern", async () => {
+      const SaveFileDialog = vi.fn().mockResolvedValue({
+        ok: true,
+        value: { saveDialog: { path: "out.log", canceled: false } },
+      });
+      installWailsRuntime({ main: { App: { SaveFileDialog } } }, { EventsOn: () => () => undefined });
+
+      await saveDialog({ filters: [{ name: "Logs", extensions: ["log", "txt"] }] });
+
+      expect(SaveFileDialog).toHaveBeenCalledWith(
+        expect.objectContaining({ filters: [{ displayName: "Logs", pattern: "*.log;*.txt" }] }),
+      );
+    });
+
+    it("returns null when the user cancels", async () => {
+      const SaveFileDialog = vi.fn().mockResolvedValue({
+        ok: true,
+        value: { saveDialog: { path: "", canceled: true } },
+      });
+      installWailsRuntime({ main: { App: { SaveFileDialog } } }, { EventsOn: () => () => undefined });
+
+      await expect(saveDialog({ defaultPath: "export.log" })).resolves.toBeNull();
+    });
+
+    it("returns null when the response lacks a saveDialog value", async () => {
+      const SaveFileDialog = vi.fn().mockResolvedValue({ ok: true, value: {} });
+      installWailsRuntime({ main: { App: { SaveFileDialog } } }, { EventsOn: () => () => undefined });
+
+      await expect(saveDialog()).resolves.toBeNull();
+    });
+
+    it("returns null instead of throwing when the binding is missing", async () => {
+      installWailsRuntime({ main: { App: {} } }, { EventsOn: () => () => undefined });
+
+      await expect(saveDialog()).resolves.toBeNull();
+    });
+
+    it("returns null when the binding reports an error", async () => {
+      const SaveFileDialog = vi.fn().mockResolvedValue({ ok: false, error: { code: "save_dialog_failed" } });
+      installWailsRuntime({ main: { App: { SaveFileDialog } } }, { EventsOn: () => () => undefined });
+
+      await expect(saveDialog()).resolves.toBeNull();
+    });
   });
 
   it("uses the Wails adapter and calls the bound method with args", async () => {
@@ -113,10 +223,72 @@ describe("desktop platform", () => {
     expect(result).toEqual({ payload: "hello" });
   });
 
+  it.each([...ZERO_ARG_COMMANDS])(
+    "invokes zero-argument binding %s with no arguments",
+    async (name) => {
+      const method = vi.fn().mockResolvedValue({ ok: true, value: {} });
+      installWailsRuntime({ main: { App: { [name]: method } } }, { EventsOn: () => () => undefined });
+
+      await command(name);
+
+      expect(method).toHaveBeenCalledOnce();
+      expect(method.mock.calls[0]).toHaveLength(0);
+    },
+  );
+
+  it("invokes a zero-argument method with no arguments even when args are supplied", async () => {
+    const StartTrafficAnalysis = vi.fn().mockResolvedValue({ ok: true, value: {} });
+    installWailsRuntime({ main: { App: { StartTrafficAnalysis } } }, { EventsOn: () => () => undefined });
+
+    await command("StartTrafficAnalysis", { input: { operationId: "op-1" } });
+
+    expect(StartTrafficAnalysis.mock.calls[0]).toHaveLength(0);
+  });
+
+  it("passes a flat argument to a one-argument Wails method without wrapping it", async () => {
+    const FinishTrafficRelay = vi.fn().mockResolvedValue({ ok: true, value: {} });
+    installWailsRuntime({ main: { App: { FinishTrafficRelay } } }, { EventsOn: () => () => undefined });
+
+    await command("FinishTrafficRelay", { discardUnsaved: true });
+
+    expect(FinishTrafficRelay).toHaveBeenCalledWith({ discardUnsaved: true });
+  });
+
   it("rejects with unsupported_platform when a Wails command method is missing", async () => {
     installWailsRuntime({ main: { App: {} } }, { EventsOn: () => () => undefined });
 
     await expect(command("Missing")).rejects.toMatchObject({ code: "unsupported_platform" });
+  });
+
+  it("preserves Wails business errors without retrying through another runtime", async () => {
+    const error = {
+      operation: "RestoreRecovery",
+      stage: "validation",
+      code: "recovery_confirmation_required",
+      message: "Confirmation is required",
+      field: null,
+      retryable: false,
+      mutationStarted: false,
+      gatewayLeftRunning: false,
+      gatewaySnapshot: null,
+    };
+    const RestoreRecovery = vi.fn().mockResolvedValue({ ok: false, error });
+    installWailsRuntime({ main: { App: { RestoreRecovery } } }, { EventsOn: () => () => undefined });
+    Object.defineProperty(globalThis, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+
+    await expect(command("RestoreRecovery", { confirm: false })).rejects.toEqual(error);
+    expect(RestoreRecovery).toHaveBeenCalledOnce();
+  });
+
+  it("normalizes Wails transport rejection without a fallback dispatch", async () => {
+    const RoundTrip = vi.fn().mockRejectedValue(new Error("transport sentinel"));
+    installWailsRuntime({ main: { App: { RoundTrip } } }, { EventsOn: () => () => undefined });
+
+    await expect(command("RoundTrip")).rejects.toMatchObject({
+      code: "native_command_failed",
+      message: "Desktop command failed",
+    });
+    expect(RoundTrip).toHaveBeenCalledOnce();
   });
 
   it("uses runtime.EventsOn unsubscribe for Wails events", async () => {
@@ -130,22 +302,6 @@ describe("desktop platform", () => {
     expect(EventsOn).toHaveBeenCalledWith("desktop:roundtrip", expect.any(Function));
     remove();
     expect(unsubscribe).toHaveBeenCalledOnce();
-  });
-
-  it("falls back to the Tauri adapter when __TAURI_INTERNALS__ is present", async () => {
-    vi.mock("@tauri-apps/api/core", () => ({
-      invoke: vi.fn().mockResolvedValue({ payload: "hello" }),
-    }));
-    vi.mock("@tauri-apps/api/event", () => ({
-      listen: vi.fn().mockResolvedValue(() => undefined),
-    }));
-    Object.defineProperty(globalThis, "__TAURI_INTERNALS__", { configurable: true, value: {} });
-    const { invoke } = await import("@tauri-apps/api/core");
-
-    const result = await command<{ payload: string }>("RoundTrip", { payload: "hello" });
-
-    expect(invoke).toHaveBeenCalledWith("RoundTrip", { payload: "hello" });
-    expect(result).toEqual({ payload: "hello" });
   });
 
   it("passes event registration failures to onError without an unhandled rejection", async () => {

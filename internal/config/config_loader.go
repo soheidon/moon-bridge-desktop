@@ -168,6 +168,7 @@ func (cfg OfferFileConfig) toWire() offerFileConfigWire {
 type ProviderDefFileConfig struct {
 	BaseURL    string                         `yaml:"base_url" json:"base_url"`
 	APIKey     string                         `yaml:"api_key" json:"api_key"`
+	APIKeyEnv  string                         `yaml:"api_key_env,omitempty" json:"api_key_env,omitempty"`
 	Version    string                         `yaml:"version,omitempty" json:"version,omitempty"`
 	UserAgent  string                         `yaml:"user_agent,omitempty" json:"user_agent,omitempty"`
 	Protocol   string                         `yaml:"protocol,omitempty" json:"protocol,omitempty"`
@@ -635,6 +636,7 @@ func fromProviderDefFileConfig(fileConfig map[string]ProviderDefFileConfig, spec
 		pd := ProviderDef{
 			BaseURL:          strings.TrimRight(strings.TrimSpace(def.BaseURL), "/"),
 			APIKey:           strings.TrimSpace(def.APIKey),
+			APIKeyEnv:        strings.TrimSpace(def.APIKeyEnv),
 			Version:          valueOrDefault(strings.TrimSpace(def.Version), "2023-06-01"),
 			UserAgent:        strings.TrimSpace(def.UserAgent),
 			Protocol:         strings.TrimSpace(def.Protocol),

@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"fmt"
 	"moonbridge/internal/protocol/anthropic"
 	"net/http"
 	"net/http/httptest"
@@ -427,6 +428,45 @@ func TestReloadAfterInitialCreation(t *testing.T) {
 	if url := manager.ProviderBaseURL("default"); url != "https://reloaded.test" {
 		t.Fatalf("ProviderBaseURL(default) after reload = %q, want %q", url, "https://reloaded.test")
 	}
+}
+
+func TestProviderManagerUnavailableCredentialsNeverCallTransport(t *testing.T) {
+	calls := 0
+	transport := roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		return nil, fmt.Errorf("unexpected transport call")
+	})
+
+	manager, err := NewProviderManager(map[string]ProviderConfig{
+		"default": {
+			BaseURL:        "https://provider.example.test",
+			APIKey:         "legacy-plaintext",
+			ClientOverride: &http.Client{Transport: transport},
+		},
+	}, map[string]ModelRoute{
+		"model": {Provider: "default", Name: "upstream-model"},
+	})
+	if err != nil {
+		t.Fatalf("NewProviderManager() error = %v", err)
+	}
+
+	route, err := manager.ResolveModel("model")
+	if err != nil {
+		t.Fatalf("ResolveModel() error = %v", err)
+	}
+	_, err = route.Candidates[0].Client.CreateMessage(context.Background(), anthropic.MessageRequest{Model: "upstream-model"})
+	if err == nil {
+		t.Fatal("CreateMessage() error = nil, want local credential_unavailable error")
+	}
+	if calls != 0 {
+		t.Fatalf("transport calls = %d, want 0", calls)
+	}
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
 }
 
 func TestReloadFailurePreservesOldState(t *testing.T) {

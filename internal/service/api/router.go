@@ -117,6 +117,9 @@ func registerRoutes(mux *http.ServeMux, r *Router) {
 	mux.HandleFunc("POST /changes/apply", r.handlePostChangesApply)
 	mux.HandleFunc("POST /changes/discard", r.handlePostChangesDiscard)
 
+	// Credential status (non-secret runtime states recorded by the resolver)
+	mux.HandleFunc("GET /credentials/status", r.handleGetCredentialStatus)
+
 	// Status / Stats / Logs / Version
 	mux.HandleFunc("GET /status", r.handleGetStatus)
 	mux.HandleFunc("GET /status/providers", r.handleGetStatusProviders)

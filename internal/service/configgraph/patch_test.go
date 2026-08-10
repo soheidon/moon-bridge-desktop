@@ -200,6 +200,44 @@ func TestApplyPatchToFileConfigLeavesRouteReferenceValidationToConfigLoader(t *t
 	}
 }
 
+func TestApplyPatchToFileConfigClearsProviderAPIKey(t *testing.T) {
+	fc := testConfig().ToFileConfig()
+
+	patched, errs := ApplyPatchToFileConfig(fc, []PatchOp{
+		{Kind: ResourceProvider, ID: "anthropic", Field: "api_key", Clear: true},
+	})
+
+	if len(errs) != 0 {
+		t.Fatalf("ApplyPatchToFileConfig returned errors: %+v", errs)
+	}
+	if patched.Providers["anthropic"].APIKey != "" {
+		t.Fatalf("Providers[anthropic].APIKey = %q, want cleared", patched.Providers["anthropic"].APIKey)
+	}
+	// Clearing the secret must leave the rest of the provider untouched.
+	if patched.Providers["anthropic"].BaseURL == "" {
+		t.Fatal("Providers[anthropic].BaseURL was cleared along with api_key")
+	}
+}
+
+func TestApplyPatchToFileConfigRejectsClearCombinedWithValue(t *testing.T) {
+	fc := testConfig().ToFileConfig()
+
+	patched, errs := ApplyPatchToFileConfig(fc, []PatchOp{
+		{Kind: ResourceProvider, ID: "anthropic", Field: "api_key", Clear: true, Value: "sk-not-allowed"},
+	})
+
+	if len(errs) != 1 {
+		t.Fatalf("ApplyPatchToFileConfig returned %d errors, want 1: %+v", len(errs), errs)
+	}
+	if errs[0].Code != "invalidPatch" {
+		t.Fatalf("error code = %q, want invalidPatch: %+v", errs[0].Code, errs[0])
+	}
+	// A rejected patch aborts the whole apply, leaving the existing secret intact.
+	if patched.Providers["anthropic"].APIKey != "sk-ant-test-key" {
+		t.Fatalf("Providers[anthropic].APIKey = %q, want untouched after rejection", patched.Providers["anthropic"].APIKey)
+	}
+}
+
 func TestApplyPatchToFileConfigRejectsUnsupportedRoutePriority(t *testing.T) {
 	fc := testConfig().ToFileConfig()
 

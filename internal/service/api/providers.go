@@ -3,11 +3,16 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
+	"moonbridge/internal/config"
 	"moonbridge/internal/protocol/anthropic"
+	"moonbridge/internal/service/configgraph"
+	"moonbridge/internal/service/provider"
+	"moonbridge/internal/service/routingprofile"
 	"moonbridge/internal/service/store"
 )
 
@@ -286,6 +291,20 @@ func (r *Router) handleDeleteProvider(w http.ResponseWriter, req *http.Request) 
 	})
 }
 
+// probeTimeout bounds a provider connection probe. The old 5s was too short for
+// a cold request to a real upstream; the seam lets tests shorten it.
+var probeTimeout = 12 * time.Second
+
+// probeResult is the structured connection-test response. Code is allowlisted
+// and Message is authored by Moon Bridge, never the upstream error body.
+type probeResult struct {
+	Success  bool   `json:"success"`
+	Code     string `json:"code"`
+	Message  string `json:"message"`
+	Model    string `json:"model"`
+	Duration string `json:"duration,omitempty"`
+}
+
 // POST /providers/{key}/test
 func (r *Router) handleTestProvider(w http.ResponseWriter, req *http.Request) {
 	key := req.PathValue("key")
@@ -301,8 +320,44 @@ func (r *Router) handleTestProvider(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	var migrationIssue *provider.CredentialInfo
+	if pm := r.runtime.Current().ProviderMgr; pm != nil {
+		if status, blocked := pm.MigrationIssue(key); blocked {
+			copy := status
+			migrationIssue = &copy
+		}
+	}
+	if migrationIssue == nil {
+		if resolver := r.runtime.Resolver(); resolver != nil && resolver.Registry != nil {
+			if status, blocked := resolver.Registry.Get(key); blocked && status.State == provider.StateUnavailable {
+				copy := status
+				migrationIssue = &copy
+			}
+		}
+	}
+	apiKey := resolveProbeKey(r.runtime.Resolver(), key, def.APIKey, def.APIKeyEnv, migrationIssue)
+	if apiKey == "" {
+		respondProbeResult(w, probeResult{
+			Success: false,
+			Code:    "credential_unavailable",
+			Message: "no usable API key: check the stored key or environment variable",
+		})
+		return
+	}
+
+	activeModel := r.activeProfileModelForProvider(req.Context(), key)
+	probeModel, ok := pickProbeModel(cfg.Config, key, def, activeModel)
+	if !ok {
+		respondProbeResult(w, probeResult{
+			Success: false,
+			Code:    "model_unavailable",
+			Message: "no model available to probe",
+		})
+		return
+	}
+
 	probe := anthropic.MessageRequest{
-		Model:     "claude-3-haiku-20240307",
+		Model:     probeModel,
 		MaxTokens: 1,
 		Messages: []anthropic.Message{
 			{Role: "user", Content: []anthropic.ContentBlock{{Type: "text", Text: "hi"}}},
@@ -310,32 +365,174 @@ func (r *Router) handleTestProvider(w http.ResponseWriter, req *http.Request) {
 	}
 
 	client := anthropic.NewClient(anthropic.ClientConfig{
-		BaseURL: def.BaseURL,
-		APIKey:  def.APIKey,
-		Version: def.Version,
+		BaseURL:   def.BaseURL,
+		APIKey:    apiKey,
+		Version:   def.Version,
+		UserAgent: def.UserAgent,
 	})
 
-	ctx, cancel := context.WithTimeout(req.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(req.Context(), probeTimeout)
 	defer cancel()
 
 	start := time.Now()
 	_, err := client.CreateMessage(ctx, probe)
 	duration := time.Since(start)
 
-	result := map[string]any{
-		"provider":  key,
-		"base_url":  def.BaseURL,
-		"duration":  duration.String(),
-		"timestamp": time.Now().UTC().Format(time.RFC3339),
-	}
+	code, message := classifyProbeError(err)
+	respondProbeResult(w, probeResult{
+		Success:  err == nil,
+		Code:     code,
+		Message:  message,
+		Model:    probeModel,
+		Duration: duration.String(),
+	})
+}
 
-	if err != nil {
-		result["success"] = false
-		result["error"] = err.Error()
-		respondJSON(w, http.StatusOK, result)
-		return
-	}
-
-	result["success"] = true
+// respondProbeResult always responds 200 with the structured probe result; the
+// connection outcome is carried by success/code, not the HTTP status.
+func respondProbeResult(w http.ResponseWriter, result probeResult) {
 	respondJSON(w, http.StatusOK, result)
+}
+
+// resolveProbeKey resolves the effective probe key through the shared resolver
+// when one is injected (recording the outcome in the credential registry),
+// falling back to a stored/env lookup otherwise. The returned key is used only
+// to build the probe client and never leaves the handler.
+func resolveProbeKey(resolver *provider.CredentialResolver, providerID, stored, envName string, issue *provider.CredentialInfo) string {
+	if resolver == nil {
+		return ""
+	}
+	return resolver.ResolveWithIssue(providerID, stored, envName, issue)
+}
+
+// pickProbeModel chooses the model used for the connection probe with a fixed
+// precedence: ① the provider's explicit default route model, ② the model in use
+// by the active routing profile, ③ the first model ID when offers are sorted,
+// ④ no usable model (ok=false). It never falls back to a hardcoded model.
+func pickProbeModel(cfg config.Config, key string, def config.ProviderDef, activeModel string) (string, bool) {
+	if model := defaultRouteModelForProvider(cfg, key); model != "" {
+		return model, true
+	}
+	if activeModel != "" {
+		return activeModel, true
+	}
+	if model := firstSortedOfferModel(def); model != "" {
+		return model, true
+	}
+	return "", false
+}
+
+// defaultRouteModelForProvider returns the model of the provider's explicit
+// default route (defaults.model → routes.<alias>), or the route alias itself
+// when the route model is empty.
+func defaultRouteModelForProvider(cfg config.Config, key string) string {
+	alias := cfg.DefaultModelAlias()
+	if alias == "" {
+		return ""
+	}
+	route, ok := cfg.Routes[alias]
+	if !ok {
+		return ""
+	}
+	if route.Provider != "" && route.Provider != key {
+		return ""
+	}
+	if route.Model != "" {
+		return route.Model
+	}
+	return alias
+}
+
+// firstSortedOfferModel returns the first model ID after sorting the provider's
+// offer models (falling back to its catalog model keys), or "" when there are
+// none. Deterministic so the probe target does not depend on map iteration.
+func firstSortedOfferModel(def config.ProviderDef) string {
+	seen := make(map[string]struct{})
+	var models []string
+	for _, offer := range def.Offers {
+		model := offer.Model
+		if model == "" {
+			model = offer.UpstreamName
+		}
+		if model == "" {
+			continue
+		}
+		if _, dup := seen[model]; dup {
+			continue
+		}
+		seen[model] = struct{}{}
+		models = append(models, model)
+	}
+	if len(models) == 0 {
+		for model := range def.Models {
+			if _, dup := seen[model]; dup {
+				continue
+			}
+			seen[model] = struct{}{}
+			models = append(models, model)
+		}
+	}
+	if len(models) == 0 {
+		return ""
+	}
+	sortStrings(models)
+	return models[0]
+}
+
+// activeProfileSlotModel returns the first non-empty upstream model of the
+// active routing profile for the given provider, or "" when none matches.
+func activeProfileSlotModel(graph configgraph.Graph, key string) string {
+	snap := routingprofile.SnapshotFromGraph(graph, true)
+	for _, profile := range snap.Profiles {
+		if !profile.Active {
+			continue
+		}
+		for _, slot := range profile.Slots {
+			if slot.ProviderID == key && slot.UpstreamModel != "" {
+				return slot.UpstreamModel
+			}
+		}
+	}
+	return ""
+}
+
+// activeProfileModelForProvider reads the active routing profile slot model for
+// the provider through the live config graph. A graph read error yields "" so
+// the probe falls back to the next precedence.
+func (r *Router) activeProfileModelForProvider(ctx context.Context, key string) string {
+	graph, err := r.configGraphService().Graph(ctx)
+	if err != nil {
+		return ""
+	}
+	return activeProfileSlotModel(graph, key)
+}
+
+// classifyProbeError maps an upstream probe error to an allowlisted code and a
+// Moon Bridge-authored message. The upstream error body/string never leaks: only
+// the mapped code and wording leave this function.
+func classifyProbeError(err error) (code, message string) {
+	if err == nil {
+		return "ok", "connection succeeded"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout", "connection timed out"
+	}
+	providerErr, ok := anthropic.IsProviderError(err)
+	if !ok {
+		return "network_error", "network connection failed"
+	}
+	switch {
+	case providerErr.StatusCode == http.StatusUnauthorized || providerErr.StatusCode == http.StatusForbidden:
+		return "auth_failed", "authentication failed: check the API key"
+	case providerErr.StatusCode == http.StatusTooManyRequests:
+		return "rate_limited", "rate limited: try again later"
+	case providerErr.StatusCode == http.StatusNotFound:
+		return "model_unavailable", "probe model unavailable"
+	case providerErr.StatusCode == http.StatusRequestTimeout || providerErr.StatusCode == http.StatusGatewayTimeout:
+		return "timeout", "connection timed out"
+	case providerErr.StatusCode >= 500:
+		return "general", "upstream provider error"
+	default:
+		return "general", "provider request rejected"
+	}
 }

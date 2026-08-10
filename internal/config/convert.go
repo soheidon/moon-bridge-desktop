@@ -144,6 +144,7 @@ func toProviderDefFileConfig(def ProviderDef) ProviderDefFileConfig {
 	p := ProviderDefFileConfig{
 		BaseURL:   def.BaseURL,
 		APIKey:    def.APIKey,
+		APIKeyEnv: def.APIKeyEnv,
 		Version:   def.Version,
 		UserAgent: def.UserAgent,
 		Protocol:  def.Protocol,

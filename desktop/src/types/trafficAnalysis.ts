@@ -1,5 +1,5 @@
 export type CaptureState = "stopped" | "starting" | "capturing" | "passthrough" | "draining" | "failed";
-export type TrafficOperation = "starting" | "restarting" | "stopping" | "exporting" | "clearing" | "restoring" | "revealing" | "openingFolder" | "finalizing" | "retryingAutosave";
+export type TrafficOperation = "starting" | "restarting" | "stopping" | "clearing" | "restoring" | "openingFolder" | "openingFile" | "finalizing";
 
 export interface CaptureStatus {
   state: CaptureState;
@@ -11,6 +11,7 @@ export interface CaptureStatus {
   sseStreams: number;
   websocketConnections: number;
   observationCount: number;
+  observationCapacity: number;
   droppedObservations: number;
   droppedBackpressure: number;
   activeHttpRequests: number;
@@ -25,75 +26,81 @@ export interface TrafficAnalysisStatus {
   configExists: boolean;
   integrationActive: boolean;
   relayActive: boolean;
+  autoSaveStatus: "active" | "finalized" | "failed" | null;
   recoveryAvailable: boolean;
   appliedOpenaiBaseUrl: string | null;
   recoveryPhase?: string | null;
   reconciliationStatus?: string | null;
   reconciledAt?: string | null;
-  autoSave: TrafficAutoSaveStatus;
 }
 
-export interface TrafficAutoSaveStatus {
-  enabled: boolean;
-  active: boolean;
-  destination: string | null;
-  lastPersistedSequence: number;
-  observationsWritten: number;
-  sequenceGaps: number;
-  lastSyncedAt: string | null;
-  finalized: boolean;
-  lastSafeError: {
-    code: string;
-    message: string;
-    retryable: boolean;
-  } | null;
-}
-
+// TrafficObservation is the secret-free Desktop summary of one recorded
+// observation. It mirrors the Wails DTO and never carries prompts, bodies,
+// responses, headers, URL paths/query, API keys, or model/provider names.
 export interface TrafficObservation {
   sequence: number;
-  sessionId: string;
   timestamp: string;
   direction: string;
   transport: string;
   method?: string;
-  receivedPath?: string;
-  upstreamPath?: string;
   statusCode?: number;
-  contentType?: string;
-  contentEncoding?: string;
-  websocketMessageType?: string;
-  sseEventType?: string;
   payloadKind: string;
-  rawPayloadSize: number;
-  decodedObservationSize: number;
-  decodingStatus: string;
+  sseEventType?: string;
+  contentEncoding?: string;
   payloadShape?: {
+    requestModel?: string;
     topLevelFields?: string[];
-    modelValue?: string;
-    reasoningEffort?: string;
+    topLevelTypes?: Record<string, string>;
+    arrayLengths?: Record<string, number>;
+    objectFieldCounts?: Record<string, number>;
+    inputItemCount?: number;
+    inputItemTypeCounts?: Record<string, number>;
+    inputRoleCounts?: Record<string, number>;
+    hasPreviousResponseId?: boolean;
+    inputItemFingerprints?: Array<{
+      index: number;
+      fields?: string[];
+      type?: string;
+      role?: string;
+      contentCount?: number;
+      objectCount?: number;
+      arrayCount?: number;
+      identifiers?: {
+        responseIdAliases?: string[];
+        previousResponseIdAliases?: string[];
+        itemIdAliases?: string[];
+        callIdAliases?: string[];
+        conversationIdAliases?: string[];
+        otherIdAliases?: string[];
+      };
+    }>;
+    toolCount?: number;
+    toolTypes?: string[];
     eventType?: string;
     objectType?: string;
     status?: string;
-    toolCount?: number;
     shapeTruncated?: boolean;
   };
-  identifiers: {
-    responseIdHmacs?: string[];
-    itemIdHmacs?: string[];
-    callIdHmacs?: string[];
-    conversationIdHmacs?: string[];
-    otherIdHmacs?: string[];
+  identifiers?: {
+    responseIdAliases?: string[];
+    previousResponseIdAliases?: string[];
+    itemIdAliases?: string[];
+    callIdAliases?: string[];
+    conversationIdAliases?: string[];
+    otherIdAliases?: string[];
   };
-  opaqueFields?: Array<{ fieldPath: string; valueType: string; size: number }>;
-  headerSummary: {
-    presentNames?: string[];
-    authorizationPresent?: boolean;
-    cookiePresent?: boolean;
-    setCookiePresent?: boolean;
-    userAgentProduct?: string;
+  usage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+    cachedInputTokens?: number;
+    reasoningTokens?: number;
   };
-  truncated?: boolean;
+  rawPayloadSize: number;
+  decodedObservationSize: number;
+  decodingStatus: string;
   partial?: boolean;
+  truncated?: boolean;
   disposition: string;
   errorClass?: string;
 }
@@ -135,3 +142,11 @@ export interface TrafficCommandError {
   captureRunning: boolean;
   restartCodexRequired: boolean;
 }
+
+export type ExitConfirmationPayload = {
+  reason?: string; // "traffic_active" | "gateway_active" | "unsaved_observations" | "recovery_required" | 未知
+  trafficActive?: boolean;
+  gatewayActive?: boolean;
+  unsavedObservations?: boolean;
+  recoveryRequired?: boolean;
+};

@@ -438,3 +438,96 @@ func TestFromCoreStream_NoDuplicateDoneForToolUse(t *testing.T) {
 		t.Fatalf("output_item.done (tool) count=%d, want 1", itemDone)
 	}
 }
+
+// TestToCoreRequest_AccumulatedInputStatelessConversion pins the accumulated-input
+// conversation continuation model observed in HIST-01 (Codex Desktop 5→7→9→11→13).
+//
+// Each turn, Codex Desktop appends assistant+user items to the input array and
+// re-sends the full accumulated input. The adapter must convert this statelessly
+// (no response ID history lookup) while preserving:
+//   - existing item order
+//   - developer/system handling
+//   - user/assistant message ordering
+//   - function_call / function_call_output adjacency
+//   - reasoning semantics
+//
+// The fixture below represents a 3-turn conversation (7 items) that mirrors the
+// real observed pattern: developer instruction, user message, assistant reply,
+// then a tool round-trip, then a new user message — all accumulated in one request.
+func TestToCoreRequest_AccumulatedInputStatelessConversion(t *testing.T) {
+	adapter := openai.NewOpenAIAdapter(format.CorePluginHooks{})
+
+	// 7-item accumulated input after 3 turns (developer + turn1 + turn2 tool + turn3 user).
+	input := json.RawMessage(`[
+		{"type":"message","role":"developer","content":[{"type":"input_text","text":"You are a helpful assistant."}]},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"What is the weather in Tokyo?"}]},
+		{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Let me check the weather for you."}]},
+		{"type":"function_call","id":"fc_1","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"Tokyo\"}"},
+		{"type":"function_call_output","call_id":"call_1","output":"{\"temp\":22,\"condition\":\"sunny\"}"},
+		{"type":"message","role":"assistant","content":[{"type":"output_text","text":"It is 22°C and sunny in Tokyo."}]},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"And tomorrow?"}]}
+	]`)
+
+	req := &openai.ResponsesRequest{Model: "gpt-4o", Input: input}
+	result, err := adapter.ToCoreRequest(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// developer → system blocks, not a message.
+	if len(result.System) == 0 || result.System[0].Text != "You are a helpful assistant." {
+		t.Fatalf("system blocks = %+v", result.System)
+	}
+
+	// Messages: user → assistant(plain) → assistant(tool_use) → tool(result) → assistant(plain) → user(plain)
+	if len(result.Messages) != 6 {
+		t.Fatalf("messages len = %d; want 6", len(result.Messages))
+	}
+
+	// Pin exact role+content shape at each position.
+	assertions := []struct {
+		index        int
+		wantRole     string
+		wantType     string // first content block type
+		wantText     string // first content block text (if applicable)
+		wantToolID   string // ToolUseID / ToolResultContent[0].ToolUseID
+		wantToolName string
+	}{
+		{0, "user", "text", "What is the weather in Tokyo?", "", ""},
+		{1, "assistant", "text", "Let me check the weather for you.", "", ""},
+		{2, "assistant", "tool_use", "", "call_1", "get_weather"},
+		{3, "tool", "tool_result", "", "call_1", ""},
+		{4, "assistant", "text", "It is 22°C and sunny in Tokyo.", "", ""},
+		{5, "user", "text", "And tomorrow?", "", ""},
+	}
+	for _, want := range assertions {
+		msg := result.Messages[want.index]
+		if msg.Role != want.wantRole {
+			t.Fatalf("messages[%d].Role = %q, want %q", want.index, msg.Role, want.wantRole)
+		}
+		if len(msg.Content) == 0 {
+			t.Fatalf("messages[%d].Content is empty", want.index)
+		}
+		block := msg.Content[0]
+		if block.Type != want.wantType {
+			t.Fatalf("messages[%d].Content[0].Type = %q, want %q", want.index, block.Type, want.wantType)
+		}
+		if want.wantText != "" && block.Text != want.wantText {
+			t.Fatalf("messages[%d].Content[0].Text = %q, want %q", want.index, block.Text, want.wantText)
+		}
+		if want.wantToolID != "" {
+			if block.ToolUseID != want.wantToolID {
+				t.Fatalf("messages[%d] tool ID = %q, want %q", want.index, block.ToolUseID, want.wantToolID)
+			}
+		}
+		if want.wantToolName != "" && block.ToolName != want.wantToolName {
+			t.Fatalf("messages[%d].Content[0].ToolName = %q, want %q", want.index, block.ToolName, want.wantToolName)
+		}
+	}
+
+	// Verify the tool result contains the expected output text.
+	toolResult := result.Messages[3].Content[0].ToolResultContent
+	if len(toolResult) == 0 || toolResult[0].Text == "" {
+		t.Fatalf("tool result content = %+v", toolResult)
+	}
+}

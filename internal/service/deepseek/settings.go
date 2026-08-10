@@ -9,9 +9,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"regexp"
 	"strings"
 
 	"moonbridge/internal/service/configgraph"
+	"moonbridge/internal/service/provider"
 )
 
 const (
@@ -71,12 +74,31 @@ func NormalizeReasoningEffort(effort string) string {
 	return effort
 }
 
+// NormalizeModelReasoningEffort applies model-specific legacy migration rules.
+// Anthro Bridge historically accepted low/medium for Pro, then migrated those
+// values to high because DeepSeek Pro exposes only high and max.
+func NormalizeModelReasoningEffort(model, effort string) string {
+	effort = NormalizeReasoningEffort(effort)
+	if model == ModelPro && (effort == ReasoningLow || effort == "medium") {
+		return ReasoningHigh
+	}
+	return effort
+}
+
 // Input is the save payload. APIKey empty keeps the existing key.
 type Input struct {
-	APIKey         string `json:"apiKey,omitempty"`
-	DefaultModel   string `json:"defaultModel"` // pro|flash
-	ProReasoning   string `json:"proReasoning"`
-	FlashReasoning string `json:"flashReasoning"`
+	APIKey         string  `json:"apiKey,omitempty"`
+	APIKeyEnv      *string `json:"apiKeyEnv,omitempty"`
+	DefaultModel   string  `json:"defaultModel"` // pro|flash
+	ProReasoning   string  `json:"proReasoning"`
+	FlashReasoning string  `json:"flashReasoning"`
+}
+
+func (in Input) APIKeyEnvValue() string {
+	if in.APIKeyEnv == nil {
+		return "DEEPSEEK_API_KEY"
+	}
+	return *in.APIKeyEnv
 }
 
 // SelectedModel maps DefaultModel to the route model id.
@@ -90,26 +112,39 @@ func (in Input) SelectedModel() string {
 // Normalized returns a copy with reasoning levels canonicalized and the API
 // key trimmed. Call after Validate.
 func (in Input) Normalized() Input {
-	in.ProReasoning = NormalizeReasoningEffort(in.ProReasoning)
-	in.FlashReasoning = NormalizeReasoningEffort(in.FlashReasoning)
+	in.ProReasoning = NormalizeModelReasoningEffort(ModelPro, in.ProReasoning)
+	in.FlashReasoning = NormalizeModelReasoningEffort(ModelFlash, in.FlashReasoning)
 	in.APIKey = strings.TrimSpace(in.APIKey)
+	if in.APIKeyEnv != nil {
+		value := strings.TrimSpace(*in.APIKeyEnv)
+		in.APIKeyEnv = &value
+	}
 	return in
 }
 
-// Validate checks the input shape. Reasoning levels are normalized before the
-// allowed-membership check so xhigh is accepted as max.
+// Validate checks the input shape. Model-specific legacy values are normalized
+// before the allowed-membership check so Pro low/medium and xhigh are migrated.
 func (in Input) Validate() error {
 	if in.DefaultModel != "pro" && in.DefaultModel != "flash" {
 		return invalidInput("defaultModel", "defaultModel must be \"pro\" or \"flash\"")
 	}
-	if !contains(AllowedReasoningEfforts(ModelPro), NormalizeReasoningEffort(in.ProReasoning)) {
+	if !contains(AllowedReasoningEfforts(ModelPro), NormalizeModelReasoningEffort(ModelPro, in.ProReasoning)) {
 		return invalidInput("proReasoning", "proReasoning must be one of high, max")
 	}
-	if !contains(AllowedReasoningEfforts(ModelFlash), NormalizeReasoningEffort(in.FlashReasoning)) {
+	if !contains(AllowedReasoningEfforts(ModelFlash), NormalizeModelReasoningEffort(ModelFlash, in.FlashReasoning)) {
 		return invalidInput("flashReasoning", "flashReasoning must be one of low, high, max")
 	}
 	if key := strings.TrimSpace(in.APIKey); key != "" && (!strings.HasPrefix(key, "sk-") || len(key) < 8) {
 		return invalidInput("apiKey", "apiKey must be an sk- prefixed key of at least 8 characters")
+	}
+	if in.APIKeyEnv != nil {
+		value := strings.TrimSpace(*in.APIKeyEnv)
+		if value == "" {
+			return invalidInput("apiKeyEnv", "apiKeyEnv must not be empty")
+		}
+		if !regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`).MatchString(value) {
+			return invalidInput("apiKeyEnv", "apiKeyEnv must be a valid environment variable name")
+		}
 	}
 	return nil
 }
@@ -150,23 +185,82 @@ func invalidInput(field, message string) error {
 	return &ServiceError{Kind: ServiceErrorKindInvalidInput, Message: message, Field: &f}
 }
 
+// CredentialSource identifies where the provider's effective API key comes
+// from: a stored value in the config, an environment variable, or nowhere.
+type CredentialSource string
+
+const (
+	CredentialSourceStored      CredentialSource = "stored"
+	CredentialSourceEnvironment CredentialSource = "environment"
+	CredentialSourceNone        CredentialSource = "none"
+)
+
+// CredentialState is the runtime status of the provider credential. It is
+// derived, never persisted to the config graph: while stopped a stored key is
+// not decrypted (no probe), so it reports unverified until the gateway runs or
+// a connection test resolves it.
+type CredentialState string
+
+const (
+	CredentialStateAvailable   CredentialState = "available"
+	CredentialStateMissing     CredentialState = "missing"
+	CredentialStateUnavailable CredentialState = "unavailable"
+	CredentialStateUnverified  CredentialState = "unverified"
+)
+
+// CredentialErrorCode classifies why a stored credential is unavailable. It is
+// non-secret; it never carries the key or ciphertext.
+type CredentialErrorCode string
+
+const (
+	CredentialErrorCodeDecryptFailed       CredentialErrorCode = "decrypt_failed"
+	CredentialErrorCodeMigrationFailed     CredentialErrorCode = "migration_failed"
+	CredentialErrorCodeUnsupportedPlatform CredentialErrorCode = "unsupported_platform"
+)
+
+// DeriveCredential computes the credential source and state for a provider. It
+// is the single formal derivation shared by SnapshotFromGraph and the desktop
+// input preview so a stored key is never inferred from a naive keySet=true.
+//
+// gatewayRunning controls the stored state: while stopped the stored value is
+// not decrypted (no probe) and stays unverified; while running it is available.
+// Environment lookups need no decryption and resolve immediately either way.
+func DeriveCredential(apiKeyRaw, apiKeyEnv string, gatewayRunning bool, lookupEnv func(string) (string, bool)) (CredentialSource, CredentialState) {
+	if apiKeyRaw != "" {
+		if gatewayRunning {
+			return CredentialSourceStored, CredentialStateAvailable
+		}
+		return CredentialSourceStored, CredentialStateUnverified
+	}
+	if apiKeyEnv != "" {
+		if value, ok := lookupEnv(apiKeyEnv); ok && value != "" {
+			return CredentialSourceEnvironment, CredentialStateAvailable
+		}
+	}
+	return CredentialSourceNone, CredentialStateMissing
+}
+
 // Snapshot is the JSON shape surfaced by the DeepSeek bindings. It is
 // compatible with the old DeepSeekStatus fields and adds per-model config.
 type Snapshot struct {
-	GatewayRunning                bool         `json:"gatewayRunning"`
-	ProviderExists                bool         `json:"providerExists"`
-	APIKeySet                     bool         `json:"apiKeySet"`
-	APIKeyMasked                  string       `json:"apiKeyMasked,omitempty"`
-	Configured                    bool         `json:"configured"`
-	Active                        bool         `json:"active"`
-	SelectedModel                 string       `json:"selectedModel,omitempty"`
-	DefaultModel                  string       `json:"defaultModel"`
-	ReasoningEffort               string       `json:"reasoningEffort"`
-	ReasoningExplicitlyConfigured bool         `json:"reasoningExplicitlyConfigured"`
-	AllowedReasoningEfforts       []string     `json:"allowedReasoningEfforts"`
-	RouteAlias                    string       `json:"routeAlias"`
-	Pro                           ModelConfig  `json:"pro"`
-	Flash                         ModelConfig  `json:"flash"`
+	GatewayRunning                bool        `json:"gatewayRunning"`
+	ProviderExists                bool        `json:"providerExists"`
+	APIKeySet                     bool        `json:"apiKeySet"`
+	APIKeyMasked                  string      `json:"apiKeyMasked,omitempty"`
+	APIKeyEnv                     string      `json:"apiKeyEnv"`
+	CredentialSource              string      `json:"credentialSource"`
+	CredentialState               string      `json:"credentialState"`
+	CredentialErrorCode           string      `json:"credentialErrorCode,omitempty"`
+	Configured                    bool        `json:"configured"`
+	Active                        bool        `json:"active"`
+	SelectedModel                 string      `json:"selectedModel,omitempty"`
+	DefaultModel                  string      `json:"defaultModel"`
+	ReasoningEffort               string      `json:"reasoningEffort"`
+	ReasoningExplicitlyConfigured bool        `json:"reasoningExplicitlyConfigured"`
+	AllowedReasoningEfforts       []string    `json:"allowedReasoningEfforts"`
+	RouteAlias                    string      `json:"routeAlias"`
+	Pro                           ModelConfig `json:"pro"`
+	Flash                         ModelConfig `json:"flash"`
 }
 
 // ModelConfig describes one DeepSeek model's current reasoning configuration.
@@ -188,10 +282,20 @@ func SnapshotFromGraph(graph configgraph.Graph, gatewayRunning bool) Snapshot {
 
 	providerExists := provider != nil
 	apiKeyRaw := ""
+	apiKeyEnv := ""
 	if provider != nil {
 		apiKeyRaw = valueString(provider.Value, "api_key")
+		apiKeyEnv = valueString(provider.Value, "api_key_env")
+	}
+	if apiKeyEnv == "" {
+		apiKeyEnv = "DEEPSEEK_API_KEY"
 	}
 	apiKeySet := apiKeyRaw != ""
+	if !apiKeySet && apiKeyEnv != "" {
+		value, ok := os.LookupEnv(apiKeyEnv)
+		apiKeySet = ok && value != ""
+	}
+	credSource, credState := DeriveCredential(apiKeyRaw, apiKeyEnv, gatewayRunning, os.LookupEnv)
 
 	modelsReady := resource(graph, configgraph.ResourceModel, ModelPro) != nil &&
 		resource(graph, configgraph.ResourceModel, ModelFlash) != nil
@@ -214,6 +318,9 @@ func SnapshotFromGraph(graph configgraph.Graph, gatewayRunning bool) Snapshot {
 		ProviderExists:                providerExists,
 		APIKeySet:                     apiKeySet,
 		APIKeyMasked:                  maskAPIKey(apiKeyRaw),
+		APIKeyEnv:                     apiKeyEnv,
+		CredentialSource:              string(credSource),
+		CredentialState:               string(credState),
 		Configured:                    providerExists && apiKeySet && modelsReady && offersReady && active,
 		Active:                        active,
 		SelectedModel:                 selected,
@@ -237,7 +344,18 @@ func NewService(api ManagementAPI) *Service {
 	return &Service{api: api}
 }
 
-// Load returns the current DeepSeek snapshot without mutating state.
+// TestProvider probes the DeepSeek provider's upstream connection through the
+// management API. The gateway resolves the credential with the shared resolver,
+// so no key crosses the Wails boundary.
+func (s *Service) TestProvider(ctx context.Context) (ConnectionTestResult, error) {
+	return s.api.TestProvider(ctx, ProviderID)
+}
+
+// Load returns the current DeepSeek snapshot without mutating state. It
+// combines the config graph (credential source settings) with the runtime
+// credential status the shared resolver recorded at client generation, so a
+// stored key that failed to decrypt or migrate reports unavailable instead of
+// the optimistic available that graph derivation alone would assume.
 func (s *Service) Load(ctx context.Context) (*Snapshot, error) {
 	graph, err := s.api.Graph(ctx)
 	if err != nil {
@@ -248,7 +366,60 @@ func (s *Service) Load(ctx context.Context) (*Snapshot, error) {
 		}
 	}
 	snap := SnapshotFromGraph(graph, true)
+	s.applyRegistryStatus(&snap, ctx)
 	return &snap, nil
+}
+
+// applyRegistryStatus overlays the resolver-recorded credential status onto the
+// snapshot. Registry entries are authoritative for state: they reflect what the
+// runtime actually observed, not what the graph would optimistically imply.
+// When the registry has no entry or the status fetch fails, the graph-derived
+// state is kept (a configured stored key reports available while running).
+func (s *Service) applyRegistryStatus(snap *Snapshot, ctx context.Context) {
+	statuses, err := s.api.CredentialStatus(ctx)
+	if err != nil {
+		return
+	}
+	for _, info := range statuses {
+		if info.ProviderID != ProviderID {
+			continue
+		}
+		switch info.State {
+		case provider.StateAvailable:
+			snap.CredentialSource = info.Source
+			snap.CredentialState = provider.StateAvailable
+			snap.CredentialErrorCode = ""
+		case provider.StateUnavailable:
+			snap.CredentialSource = info.Source
+			snap.CredentialState = provider.StateUnavailable
+			snap.CredentialErrorCode = info.ErrorCode
+		case provider.StateMissing:
+			snap.CredentialSource = provider.SourceNone
+			snap.CredentialState = provider.StateMissing
+			snap.CredentialErrorCode = ""
+		}
+		return
+	}
+}
+
+// ApplyMigrationIssues overrides a snapshot's credential fields when a legacy
+// plaintext key could not be migrated during the store load. The graph keeps
+// the key intact (blanking it would break config validation), so the issue
+// records source=stored / state=unavailable / error code — keeping both the
+// delete-stored-key and re-entry paths usable. It is the stopped-path
+// counterpart to applyRegistryStatus.
+func ApplyMigrationIssues(snap *Snapshot, issues []provider.CredentialInfo) {
+	for _, iss := range issues {
+		if iss.ProviderID != ProviderID {
+			continue
+		}
+		if iss.Source == provider.SourceStored && iss.State == provider.StateUnavailable && iss.ErrorCode != "" {
+			snap.CredentialSource = provider.SourceStored
+			snap.CredentialState = provider.StateUnavailable
+			snap.CredentialErrorCode = iss.ErrorCode
+		}
+		return
+	}
 }
 
 // Validate checks the input without requiring a gateway session.
@@ -329,6 +500,59 @@ func (s *Service) Save(ctx context.Context, input Input) (*Snapshot, error) {
 	}
 }
 
+// Clear removes the stored DeepSeek API key from the config graph. It is
+// idempotent: when the provider is absent or already has no api_key it returns
+// the current snapshot unchanged. The api_key_env setting is left untouched so
+// an environment variable can take over afterwards.
+func (s *Service) Clear(ctx context.Context) (*Snapshot, error) {
+	for attempt := 0; attempt < maxReconcileAttempts; attempt++ {
+		graph, err := s.api.Graph(ctx)
+		if err != nil {
+			return nil, &ServiceError{
+				Kind:      ServiceErrorKindGatewayAPIFailed,
+				Message:   "unable to load current configuration",
+				Retryable: true,
+			}
+		}
+		provider := resource(graph, configgraph.ResourceProvider, ProviderID)
+		if provider == nil || valueString(provider.Value, "api_key") == "" {
+			snap := SnapshotFromGraph(graph, true)
+			return &snap, nil
+		}
+		g, conflict, err := s.apply(ctx, graph, func(ctx context.Context, base string) (configgraph.PatchResponse, error) {
+			return s.api.Patch(ctx, configgraph.PatchRequest{
+				BaseRevision: base,
+				Changes: []configgraph.PatchOp{{
+					Kind:  configgraph.ResourceProvider,
+					ID:    ProviderID,
+					Field: "api_key",
+					Clear: true,
+				}},
+			})
+		})
+		if err != nil {
+			return nil, s.mutationError(err, false)
+		}
+		if conflict {
+			continue
+		}
+		graph = g
+		if final := resource(graph, configgraph.ResourceProvider, ProviderID); final != nil && valueString(final.Value, "api_key") != "" {
+			return nil, &ServiceError{
+				Kind:    ServiceErrorKindVerifyFailed,
+				Message: "saved configuration still contains an API key after clear",
+			}
+		}
+		snap := SnapshotFromGraph(graph, true)
+		return &snap, nil
+	}
+	return nil, &ServiceError{
+		Kind:      ServiceErrorKindRevisionConflictExceeded,
+		Message:   "configuration changed repeatedly; retry clearing the DeepSeek key",
+		Retryable: true,
+	}
+}
+
 type reconcileOutcome struct {
 	conflict bool
 	mutated  bool
@@ -383,7 +607,7 @@ func (s *Service) reconcile(ctx context.Context, graph configgraph.Graph, input 
 	//    the input carries a key; empty keeps the existing one).
 	if resource(graph, configgraph.ResourceProvider, ProviderID) == nil {
 		g, conflict, err := s.apply(ctx, graph, func(ctx context.Context, base string) (configgraph.PatchResponse, error) {
-			return s.api.CreateResource(ctx, base, configgraph.ResourceProvider, ProviderID, providerValue(input.APIKey))
+			return s.api.CreateResource(ctx, base, configgraph.ResourceProvider, ProviderID, providerValue(input.APIKey, input.APIKeyEnvValue()))
 		})
 		if err != nil {
 			return graph, reconcileOutcome{mutated: out.mutated, err: s.mutationError(err, out.mutated)}
@@ -415,6 +639,19 @@ func (s *Service) reconcile(ctx context.Context, graph configgraph.Graph, input 
 		extensions["deepseek_v4"] = map[string]any{"enabled": true}
 		if !valueEqual(current.Value["extensions"], extensions) {
 			add("extensions", extensions)
+		}
+		apiKeyEnv := valueString(current.Value, "api_key_env")
+		if apiKeyEnv == "" {
+			apiKeyEnv = "DEEPSEEK_API_KEY"
+		}
+		if input.APIKeyEnv != nil {
+			apiKeyEnv = *input.APIKeyEnv
+		}
+		if apiKeyEnv == "" {
+			apiKeyEnv = "DEEPSEEK_API_KEY"
+		}
+		if valueString(current.Value, "api_key_env") != apiKeyEnv {
+			add("api_key_env", apiKeyEnv)
 		}
 		if input.APIKey != "" {
 			add("api_key", input.APIKey)
@@ -659,12 +896,12 @@ func residualState(graph configgraph.Graph) map[string]any {
 		return "missing"
 	}
 	return map[string]any{
-		"provider":     state(configgraph.ResourceProvider, ProviderID),
-		"model_pro":    state(configgraph.ResourceModel, ModelPro),
-		"model_flash":  state(configgraph.ResourceModel, ModelFlash),
-		"offer_pro":    state(configgraph.ResourceProviderOffer, ProviderID+"/"+ModelPro),
-		"offer_flash":  state(configgraph.ResourceProviderOffer, ProviderID+"/"+ModelFlash),
-		"route":        state(configgraph.ResourceRoute, RouteID),
+		"provider":    state(configgraph.ResourceProvider, ProviderID),
+		"model_pro":   state(configgraph.ResourceModel, ModelPro),
+		"model_flash": state(configgraph.ResourceModel, ModelFlash),
+		"offer_pro":   state(configgraph.ResourceProviderOffer, ProviderID+"/"+ModelPro),
+		"offer_flash": state(configgraph.ResourceProviderOffer, ProviderID+"/"+ModelFlash),
+		"route":       state(configgraph.ResourceRoute, RouteID),
 	}
 }
 
@@ -709,7 +946,6 @@ func offerPricesFor(model string) offerPrices {
 	return offerProPrices
 }
 
-
 func strField(graph configgraph.Graph, kind configgraph.ResourceKind, id, field string) string {
 	r := resource(graph, kind, id)
 	if r == nil {
@@ -734,7 +970,7 @@ func modelReasoning(graph configgraph.Graph, model string) (string, bool) {
 	if raw == "" {
 		return "", false
 	}
-	return NormalizeReasoningEffort(raw), true
+	return NormalizeModelReasoningEffort(model, raw), true
 }
 
 func modelConfig(graph configgraph.Graph, model string) ModelConfig {
@@ -799,27 +1035,35 @@ func modelValue(model, reasoningEffort string) map[string]any {
 		})
 	}
 	return map[string]any{
-		"context_window":              1000000,
-		"max_output_tokens":           384000,
-		"display_name":                modelDisplayName(model),
-		"description":                 "DeepSeek V4 with model-specific low/high/max reasoning effort.",
-		"supports_reasoning":          true,
-		"default_reasoning_level":     NormalizeReasoningEffort(reasoningEffort),
-		"supported_reasoning_levels":  levels,
+		"context_window":               1000000,
+		"max_output_tokens":            384000,
+		"display_name":                 modelDisplayName(model),
+		"description":                  "DeepSeek V4 with model-specific low/high/max reasoning effort.",
+		"supports_reasoning":           true,
+		"default_reasoning_level":      NormalizeReasoningEffort(reasoningEffort),
+		"supported_reasoning_levels":   levels,
 		"supports_reasoning_summaries": true,
-		"default_reasoning_summary":   "auto",
-		"input_modalities":            []any{"text"},
+		"default_reasoning_summary":    "auto",
+		"input_modalities":             []any{"text"},
 	}
 }
 
-func providerValue(apiKey string) map[string]any {
+func providerValue(apiKey string, envNames ...string) map[string]any {
+	apiKeyEnv := ""
+	if len(envNames) > 0 {
+		apiKeyEnv = envNames[0]
+	}
+	if apiKeyEnv == "" {
+		apiKeyEnv = "DEEPSEEK_API_KEY"
+	}
 	return map[string]any{
-		"base_url":   BaseURL,
-		"api_key":    apiKey,
-		"version":    Version,
-		"protocol":   Protocol,
-		"user_agent": UserAgent,
-		"extensions": map[string]any{"deepseek_v4": map[string]any{"enabled": true}},
+		"base_url":    BaseURL,
+		"api_key":     apiKey,
+		"api_key_env": apiKeyEnv,
+		"version":     Version,
+		"protocol":    Protocol,
+		"user_agent":  UserAgent,
+		"extensions":  map[string]any{"deepseek_v4": map[string]any{"enabled": true}},
 	}
 }
 

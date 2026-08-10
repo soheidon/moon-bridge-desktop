@@ -23,6 +23,33 @@ type ProviderClient interface {
 	StreamMessage(ctx context.Context, req any) (<-chan any, error)
 }
 
+// UnavailableProviderClient preserves the provider's identity while refusing
+// all network operations when its credential is missing or unusable.
+type UnavailableProviderClient struct {
+	Code string
+}
+
+func (c *UnavailableProviderClient) CreateMessage(context.Context, any) (any, error) {
+	return nil, &CredentialUnavailableError{Code: c.Code}
+}
+
+func (c *UnavailableProviderClient) StreamMessage(context.Context, any) (<-chan any, error) {
+	return nil, &CredentialUnavailableError{Code: c.Code}
+}
+
+// CredentialUnavailableError is intentionally local and contains no secret or
+// upstream response body.
+type CredentialUnavailableError struct {
+	Code string
+}
+
+func (e *CredentialUnavailableError) Error() string {
+	if e.Code == "" {
+		return "credential_unavailable"
+	}
+	return e.Code
+}
+
 // AnthropicClientAccessor is implemented by ProviderClient implementations
 // that wrap an *anthropic.Client. Callers that need the concrete client for
 // protocol-specific operations (e.g., web search probing) can use this

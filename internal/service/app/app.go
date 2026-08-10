@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -23,9 +24,12 @@ import (
 	"moonbridge/internal/protocol/chat"
 	"moonbridge/internal/protocol/google"
 	"moonbridge/internal/protocol/openai"
+	"moonbridge/internal/secretstore"
+	"moonbridge/internal/service/configgraph"
 	"moonbridge/internal/service/desktopcontrol"
 	"moonbridge/internal/service/provider"
 	"moonbridge/internal/service/proxy"
+	"moonbridge/internal/service/routingprofile"
 	"moonbridge/internal/service/runtime"
 	"moonbridge/internal/service/server"
 	"moonbridge/internal/service/server/session"
@@ -36,6 +40,25 @@ import (
 	mbtrace "moonbridge/internal/service/trace"
 	"moonbridge/internal/service/trafficanalysis"
 )
+
+// routingProfileResolverAdapter wraps a routingprofile.SlotResolver to satisfy
+// the server.RoutingProfileResolver interface. It converts routingprofile.SlotResult
+// to server.RoutingProfileSlotResult.
+type routingProfileResolverAdapter struct {
+	resolver *routingprofile.SlotResolver
+}
+
+func (a *routingProfileResolverAdapter) ResolveSlot(requestModel string) (server.RoutingProfileSlotResult, bool) {
+	slot, ok := a.resolver.ResolveSlot(requestModel)
+	if !ok {
+		return server.RoutingProfileSlotResult{}, false
+	}
+	return server.RoutingProfileSlotResult{
+		ProviderKey:   slot.ProviderKey,
+		UpstreamModel: slot.UpstreamModel,
+		Reasoning:     slot.Reasoning,
+	}, true
+}
 
 const Name = "Moon Bridge"
 
@@ -77,6 +100,13 @@ type TrafficProvider interface {
 	// Status returns the current capture snapshot for the system status
 	// endpoint.
 	Status() trafficanalysis.State
+	// ModelMappingFor returns the target route for an active exact source model.
+	// Mapping values remain process-local and are never serialized by App.
+	ModelMappingFor(sourceModel string) (string, bool)
+	// ObservedModelFor lazily binds the first relay-proven observed model as the
+	// mapping source, then exact-matches it. It is the resolver surface used by
+	// the Gateway.
+	ObservedModelFor(sourceModel, relayMarker string) (string, bool)
 }
 
 // EndRunReason describes why a Gateway run ended.
@@ -123,6 +153,24 @@ func RunServerWithOptions(ctx context.Context, cfg config.Config, errors io.Writ
 func runTransform(ctx context.Context, cfg config.Config, errors io.Writer, options RunOptions) error {
 	var rt *runtime.Runtime
 
+	// Shared credential resolver: the single place where stored ciphertext is
+	// decrypted, at the client-generation boundary. Its status registry feeds
+	// snapshots and is rebuilt on every manager build (including reload).
+	secretCodec := secretstore.New()
+	credentialRegistry := provider.NewCredentialStatusRegistry()
+	credentialResolver := &provider.CredentialResolver{
+		Codec:     secretCodec,
+		LookupEnv: os.LookupEnv,
+		Registry:  credentialRegistry,
+	}
+
+	// Normalize YAML provider keys to ciphertext before any graph is built or
+	// persisted: the internal config graph and SQLite never carry plaintext
+	// keys (guardrail: YAML読込 → NormalizeProviderSecrets → BuildGraph → 保存).
+	if err := cfg.NormalizeProviderSecrets(secretCodec); err != nil {
+		return fmt.Errorf("normalize provider secrets: %w", err)
+	}
+
 	// Construct domain configs from global config.
 	serverCfg := config.ServerFromGlobalConfig(&cfg)
 	cacheCfg := config.CacheFromGlobalConfig(&cfg)
@@ -166,7 +214,7 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer, opti
 		}
 	}
 
-	providerMgr, err := provider.NewProviderManager(providerDefs, modelRoutes)
+	providerMgr, err := provider.NewProviderManager(providerDefs, modelRoutes, credentialResolver)
 	if err != nil {
 		return fmt.Errorf("init provider manager: %w", err)
 	}
@@ -241,6 +289,12 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer, opti
 	// === Phase 2: ConfigStore bootstrap ===
 	// Check if the store is available and has existing data.
 	cs := configStoreConsumer.Store()
+	var migrationIssues []provider.CredentialInfo
+	if sqlStore, ok := cs.(*store.SQLiteConfigStore); ok {
+		// Inject the codec so LoadAll migrates legacy plaintext keys and writes
+		// never persist plaintext.
+		sqlStore.SetCodec(secretCodec)
+	}
 	if cs != nil {
 		if dbCfg, loadErr := cs.LoadAll(); loadErr == nil {
 			if len(dbCfg.ProviderDefs) > 0 || len(dbCfg.Routes) > 0 {
@@ -249,6 +303,9 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer, opti
 					"providers", len(dbCfg.ProviderDefs),
 					"routes", len(dbCfg.Routes))
 				cfg = *dbCfg
+				if sqlStore, ok := cs.(*store.SQLiteConfigStore); ok {
+					migrationIssues = sqlStore.LastMigrationIssues()
+				}
 				dbProviderCfg := config.ProviderFromGlobalConfig(&cfg)
 
 				// Rebuild provider manager and pricing from DB-loaded config.
@@ -262,7 +319,7 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer, opti
 						providerDefs[key] = def
 					}
 				}
-				providerMgr, err = provider.NewProviderManager(providerDefs, modelRoutes)
+				providerMgr, err = provider.NewSecureProviderManagerWithIssues(providerDefs, modelRoutes, credentialResolver, migrationIssues)
 
 				if err != nil {
 					return fmt.Errorf("rebuild provider manager from DB: %w", err)
@@ -297,7 +354,10 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer, opti
 	}
 
 	// === Phase 3: Build Runtime ===
-	rt = runtime.NewRuntime(cfg, providerMgr, pricing)
+	// The shared resolver is re-injected on every runtime reload so the
+	// credential status registry is re-recorded when the config graph commits a
+	// provider change (e.g. a DeepSeek save) rather than going stale.
+	rt = runtime.NewRuntime(cfg, providerMgr, pricing, credentialResolver)
 
 	// === Phase 4: Build Server with Runtime ===
 	// Create shared cache registry (used by both Bridge and Adapter paths).
@@ -375,25 +435,30 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer, opti
 	usageTrk := usage.NewStatsTracker(sessionStats)
 	traceWtr := trace.NewFileWriter(tracer, errors)
 
+	// Build routing profile slot resolver from the config graph snapshot.
+	slotResolver := buildSlotResolver(cfg)
+
 	handler := server.New(server.Config{
-		ServerCfg:        serverCfg,
-		Provider:         fallbackProvider,
-		ProviderMgr:      providerMgr,
-		ChatClients:      chatClients,
-		GoogleClients:    googleClients,
-		OpenAIHTTPClient: proxyHTTPClient,
-		ProxyHTTPClient:  proxyHTTPClient,
-		Tracer:           tracer,
-		TraceErrors:      errors,
-		Stats:            sessionStats,
-		PluginRegistry:   plugins,
-		AppConfig:        serverCfg,
-		Runtime:          rt,
-		Store:            cs,
-		AdapterRegistry:  adapterReg,
-		SessionManager:   sessMgr,
-		UsageTracker:     usageTrk,
-		TraceWriter:      traceWtr,
+		ServerCfg:              serverCfg,
+		Provider:               fallbackProvider,
+		ProviderMgr:            providerMgr,
+		TrafficRouting:         options.Traffic,
+		RoutingProfileResolver: &routingProfileResolverAdapter{resolver: slotResolver},
+		ChatClients:            chatClients,
+		GoogleClients:          googleClients,
+		OpenAIHTTPClient:       proxyHTTPClient,
+		ProxyHTTPClient:        proxyHTTPClient,
+		Tracer:                 tracer,
+		TraceErrors:            errors,
+		Stats:                  sessionStats,
+		PluginRegistry:         plugins,
+		AppConfig:              serverCfg,
+		Runtime:                rt,
+		Store:                  cs,
+		AdapterRegistry:        adapterReg,
+		SessionManager:         sessMgr,
+		UsageTracker:           usageTrk,
+		TraceWriter:            traceWtr,
 	})
 
 	// The persistence layer may replace the file configuration, including the
@@ -408,9 +473,32 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer, opti
 		options.DesktopControl.WithTrafficAnalysis(options.Traffic.ManagementHandler()).
 			WithTrafficAnalysisStatus(func() any { return options.Traffic.Status() })
 	}
+	if options.DesktopControl != nil {
+		options.DesktopControl.WithRoutingProfileRefresh(func(cfg config.Config) {
+			resolver := buildSlotResolver(cfg)
+			handler.SwapRoutingProfileResolver(&routingProfileResolverAdapter{resolver: resolver})
+		})
+	}
 	wrapped := http.Handler(handler)
 	wrapped = desktopcontrol.Wrap(wrapped, options.DesktopControl)
 	return runHTTPServer(ctx, cfg.Addr, wrapped, errors, sessionStats, options.OnListening)
+}
+
+// buildSlotResolver builds a SlotResolver from the given config.
+// Source of truth: routing_profiles.config.active_profile (from extension
+// resource). When the extension is absent, bootstrap from the moonbridge
+// route's provider (known-profile one-shot derivation, no auto-persist).
+func buildSlotResolver(cfg config.Config) *routingprofile.SlotResolver {
+	graph := configgraph.BuildGraph(cfg, "")
+	resolver := routingprofile.NewSlotResolver(graph)
+	if resolver.BootstrapEligible() {
+		activeProfileID := ""
+		if route, ok := cfg.Routes["moonbridge"]; ok {
+			activeProfileID = route.Provider
+		}
+		resolver = routingprofile.NewSlotResolverFromDefaults(activeProfileID)
+	}
+	return resolver
 }
 
 // resolveDefaultClient returns the provider client for the default key.

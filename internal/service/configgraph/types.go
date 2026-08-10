@@ -109,6 +109,7 @@ type PatchOp struct {
 	ID    string       `json:"id"`
 	Field string       `json:"field"`
 	Value any          `json:"value"`
+	Clear bool         `json:"clear,omitempty"`
 }
 
 type PatchResult string

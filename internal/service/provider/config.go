@@ -20,6 +20,7 @@ func BuildProviderDefsFromConfig(cfg config.ProviderConfig) map[string]ProviderC
 		defs[key] = ProviderConfig{
 			BaseURL:          def.BaseURL,
 			APIKey:           def.APIKey,
+			APIKeyEnv:        def.APIKeyEnv,
 			Version:          def.Version,
 			UserAgent:        def.UserAgent,
 			Protocol:         def.Protocol,

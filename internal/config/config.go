@@ -121,6 +121,7 @@ type RouteEntry struct {
 type ProviderDef struct {
 	BaseURL   string
 	APIKey    string
+	APIKeyEnv string
 	Version   string
 	UserAgent string
 	Protocol  string // "anthropic" (default), "openai-response", "google-genai", or "openai-chat"
@@ -291,9 +292,6 @@ func (cfg Config) validateTransform() error {
 		}
 		if def.BaseURL == "" {
 			return fmt.Errorf("providers.%s.base_url is required", key)
-		}
-		if def.APIKey == "" {
-			return fmt.Errorf("providers.%s.api_key is required", key)
 		}
 		switch def.Protocol {
 		case "", ProtocolAnthropic, ProtocolOpenAIResponse, ProtocolGoogleGenAI, ProtocolOpenAIChat:

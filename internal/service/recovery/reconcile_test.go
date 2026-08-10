@@ -102,6 +102,28 @@ func TestReconcilePendingRestore(t *testing.T) {
 	}
 }
 
+func TestReconcileUnknownPhaseFailsClosedWithoutConfigSideEffect(t *testing.T) {
+	s, dir := testStore(t)
+	if err := s.SetCodexHome(dir); err != nil {
+		t.Fatal(err)
+	}
+	cfg := []byte("model = \"x\"\n")
+	seedRaw(t, s, &State{
+		SchemaVersion: SchemaVersion, IntegrationActive: true, Phase: Phase("finish_started"),
+		ConfigPath: "config.toml", CodexHomeFingerprint: boundHome(t, dir),
+		ConfigHashAfterApply: HashBytes(cfg), ConfigHashBeforeApply: "different",
+		AppliedOpenaiBaseURL: "http://127.0.0.1:38441",
+	})
+	before := append([]byte(nil), cfg...)
+	res, st := runReconcile(t, s, cfg, nil)
+	if res.Status != StatusPendingRestore || res.Phase == nil || *res.Phase != PhaseReconciliationReq {
+		t.Fatalf("result = %#v, want pending restore/reconciliation_required", res)
+	}
+	if st == nil || st.Phase != PhaseReconciliationReq || !st.IntegrationActive || HashBytes(before) != HashBytes(cfg) {
+		t.Fatalf("state/config after unknown phase reconcile = %#v/%q, want recovery-required and unchanged config", st, cfg)
+	}
+}
+
 func TestReconcileAlreadyRestored(t *testing.T) {
 	s, dir := testStore(t)
 	if err := s.SetCodexHome(dir); err != nil {

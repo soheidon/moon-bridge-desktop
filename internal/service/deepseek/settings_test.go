@@ -12,6 +12,7 @@ import (
 
 	"moonbridge/internal/config"
 	"moonbridge/internal/service/configgraph"
+	"moonbridge/internal/service/provider"
 )
 
 // fakeAPI is an in-memory stand-in for the gateway management API. It mirrors
@@ -19,19 +20,23 @@ import (
 // matching base revision on every mutation, and can inject conflicts and
 // transport failures.
 type fakeAPI struct {
-	mu              sync.Mutex
-	revision        int
-	resources       []configgraph.Resource
-	graphErr        error
-	mutateErr       error
-	failAt          int // after this many successful mutations the next fails (0 = never)
-	mutations       int
-	conflictN       int // apply a revision conflict to the next N mutations
+	mu               sync.Mutex
+	revision         int
+	resources        []configgraph.Resource
+	graphErr         error
+	mutateErr        error
+	failAt           int // after this many successful mutations the next fails (0 = never)
+	mutations        int
+	conflictN        int // apply a revision conflict to the next N mutations
 	corruptReasoning bool
-	creates         int
-	patches         int
-	baseConflicts   int
-	effective       config.FileConfig
+	creates          int
+	patches          int
+	baseConflicts    int
+	effective        config.FileConfig
+	credentialStatus []provider.CredentialInfo
+	statusErr        error
+	connectionTest   ConnectionTestResult
+	connectionTestErr error
 }
 
 func newFakeAPI() *fakeAPI {
@@ -51,6 +56,21 @@ func (f *fakeAPI) Effective(context.Context) (config.FileConfig, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.effective, nil
+}
+
+func (f *fakeAPI) CredentialStatus(context.Context) ([]provider.CredentialInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.statusErr != nil {
+		return nil, f.statusErr
+	}
+	return f.credentialStatus, nil
+}
+
+func (f *fakeAPI) TestProvider(context.Context, string) (ConnectionTestResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.connectionTest, f.connectionTestErr
 }
 
 func (f *fakeAPI) CreateResource(_ context.Context, baseRevision string, kind configgraph.ResourceKind, id string, value map[string]any) (configgraph.PatchResponse, error) {
@@ -237,8 +257,8 @@ func TestValidateRejectsUnsupportedDefaultModel(t *testing.T) {
 }
 
 func TestValidateRejectsUnsupportedReasoning(t *testing.T) {
-	if err := (Input{DefaultModel: "pro", ProReasoning: "low", FlashReasoning: "high"}).Validate(); err == nil {
-		t.Fatal("expected proReasoning low to be rejected")
+	if err := (Input{DefaultModel: "pro", ProReasoning: "low", FlashReasoning: "high"}).Validate(); err != nil {
+		t.Fatalf("expected legacy Pro low to migrate successfully, got %v", err)
 	}
 	if err := (Input{DefaultModel: "pro", ProReasoning: "high", FlashReasoning: "bogus"}).Validate(); err == nil {
 		t.Fatal("expected flashReasoning bogus to be rejected")
@@ -256,6 +276,23 @@ func TestValidateAcceptsXHighAsMax(t *testing.T) {
 	norm := in.Normalized()
 	if norm.ProReasoning != ReasoningMax || norm.FlashReasoning != ReasoningMax {
 		t.Fatalf("expected xhigh to normalize to max, got %q and %q", norm.ProReasoning, norm.FlashReasoning)
+	}
+}
+
+func TestNormalizeModelReasoningEffortMigratesLegacyProValues(t *testing.T) {
+	for _, legacy := range []string{ReasoningLow, "medium"} {
+		if got := NormalizeModelReasoningEffort(ModelPro, legacy); got != ReasoningHigh {
+			t.Fatalf("expected Pro %q to migrate to high, got %q", legacy, got)
+		}
+	}
+	if got := NormalizeModelReasoningEffort(ModelFlash, "medium"); got != "medium" {
+		t.Fatalf("expected Flash medium to remain invalid for validation, got %q", got)
+	}
+}
+
+func TestValidateRejectsLegacyFlashMedium(t *testing.T) {
+	if err := (Input{DefaultModel: "flash", ProReasoning: ReasoningHigh, FlashReasoning: "medium"}).Validate(); err == nil {
+		t.Fatal("expected Flash medium to be rejected")
 	}
 }
 
@@ -498,7 +535,108 @@ func TestLoadReturnsSnapshot(t *testing.T) {
 	}
 }
 
+func TestClearRemovesStoredAPIKey(t *testing.T) {
+	t.Setenv("DEEPSEEK_API_KEY", "")
+	fake := newFakeAPI()
+	fake.resources = append(fake.resources, cloneResource(configgraph.Resource{
+		Kind: configgraph.ResourceProvider, ID: ProviderID,
+		Value: map[string]any{"api_key": "sk-raw-12345", "base_url": BaseURL},
+	}))
+	fake.revision = 1
+	svc := NewService(fake)
+
+	snap, err := svc.Clear(context.Background())
+	if err != nil {
+		t.Fatalf("clear failed: %v", err)
+	}
+	if fake.mutations != 1 {
+		t.Fatalf("mutations = %d, want 1", fake.mutations)
+	}
+	provider := fake.find(configgraph.ResourceProvider, ProviderID)
+	if provider == nil {
+		t.Fatal("provider missing after clear")
+	}
+	if k := valueString(provider.Value, "api_key"); k != "" {
+		t.Fatalf("provider api_key = %q, want cleared", k)
+	}
+	// The provider stays present but keyless; the snapshot reports no key.
+	if !snap.ProviderExists {
+		t.Fatal("ProviderExists = false, want the provider to remain present")
+	}
+	if snap.APIKeySet || snap.APIKeyMasked != "" {
+		t.Fatalf("snapshot api key = set:%v masked:%q, want cleared", snap.APIKeySet, snap.APIKeyMasked)
+	}
+	if snap.CredentialSource != string(CredentialSourceNone) || snap.CredentialState != string(CredentialStateMissing) {
+		t.Fatalf("credential = %q/%q, want none/missing after clear", snap.CredentialSource, snap.CredentialState)
+	}
+}
+
+func TestClearIsIdempotentWhenProviderMissing(t *testing.T) {
+	t.Setenv("DEEPSEEK_API_KEY", "")
+	fake := newFakeAPI()
+	svc := NewService(fake)
+
+	snap, err := svc.Clear(context.Background())
+	if err != nil {
+		t.Fatalf("clear failed: %v", err)
+	}
+	if fake.mutations != 0 {
+		t.Fatalf("mutations = %d, want 0 (no provider to clear)", fake.mutations)
+	}
+	if snap.ProviderExists {
+		t.Fatal("ProviderExists = true, want false")
+	}
+}
+
+func TestClearIsIdempotentWhenProviderHasNoKey(t *testing.T) {
+	t.Setenv("DEEPSEEK_API_KEY", "")
+	fake := newFakeAPI()
+	fake.resources = append(fake.resources, cloneResource(configgraph.Resource{
+		Kind: configgraph.ResourceProvider, ID: ProviderID,
+		Value: map[string]any{"api_key": "", "base_url": BaseURL},
+	}))
+	fake.revision = 1
+	svc := NewService(fake)
+
+	snap, err := svc.Clear(context.Background())
+	if err != nil {
+		t.Fatalf("clear failed: %v", err)
+	}
+	if fake.mutations != 0 {
+		t.Fatalf("mutations = %d, want 0 (already keyless)", fake.mutations)
+	}
+	if snap.APIKeySet {
+		t.Fatal("APIKeySet = true, want false")
+	}
+}
+
+func TestClearRetriesRevisionConflictAndSucceeds(t *testing.T) {
+	t.Setenv("DEEPSEEK_API_KEY", "")
+	fake := newFakeAPI()
+	fake.resources = append(fake.resources, cloneResource(configgraph.Resource{
+		Kind: configgraph.ResourceProvider, ID: ProviderID,
+		Value: map[string]any{"api_key": "sk-raw-12345", "base_url": BaseURL},
+	}))
+	fake.revision = 1
+	fake.conflictN = 1
+	svc := NewService(fake)
+
+	snap, err := svc.Clear(context.Background())
+	if err != nil {
+		t.Fatalf("clear failed after retry: %v", err)
+	}
+	if fake.mutations != 2 {
+		t.Fatalf("mutations = %d, want 2 (one conflicted + one committed)", fake.mutations)
+	}
+	if snap.APIKeySet {
+		t.Fatal("APIKeySet = true, want false after retried clear")
+	}
+}
+
 func TestSnapshotReMasksAPIKey(t *testing.T) {
+	t.Setenv("DEEPSEEK_API_KEY", "")
+	t.Setenv("DEEPSEEK_API_KEY", "")
+	t.Setenv("DEEPSEEK_API_KEY", "")
 	snap := SnapshotFromGraph(graphWithProviderAPIKey(apiKeyMasked), true)
 	if !snap.APIKeySet || snap.APIKeyMasked != apiKeyMasked {
 		t.Fatalf("expected masked form preserved, got set=%v masked=%q", snap.APIKeySet, snap.APIKeyMasked)
@@ -511,6 +649,69 @@ func TestSnapshotReMasksAPIKey(t *testing.T) {
 	if snapEmpty.APIKeySet || snapEmpty.APIKeyMasked != "" {
 		t.Fatalf("expected unset key, got set=%v masked=%q", snapEmpty.APIKeySet, snapEmpty.APIKeyMasked)
 	}
+}
+
+func TestDeriveCredential(t *testing.T) {
+	env := map[string]string{"MY_KEY": "sk-set"}
+	lookup := func(name string) (string, bool) {
+		v, ok := env[name]
+		return v, ok
+	}
+	cases := []struct {
+		name           string
+		apiKeyRaw      string
+		apiKeyEnv      string
+		gatewayRunning bool
+		wantSource     CredentialSource
+		wantState      CredentialState
+	}{
+		{"stored running", "sk-stored", "DEEPSEEK_API_KEY", true, CredentialSourceStored, CredentialStateAvailable},
+		{"stored stopped", "sk-stored", "DEEPSEEK_API_KEY", false, CredentialSourceStored, CredentialStateUnverified},
+		{"env running", "", "MY_KEY", true, CredentialSourceEnvironment, CredentialStateAvailable},
+		{"env stopped", "", "MY_KEY", false, CredentialSourceEnvironment, CredentialStateAvailable},
+		{"env named but unset", "", "MISSING", true, CredentialSourceNone, CredentialStateMissing},
+		{"nothing", "", "", true, CredentialSourceNone, CredentialStateMissing},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			source, state := DeriveCredential(tc.apiKeyRaw, tc.apiKeyEnv, tc.gatewayRunning, lookup)
+			if source != tc.wantSource || state != tc.wantState {
+				t.Fatalf("got source=%q state=%q, want source=%q state=%q", source, state, tc.wantSource, tc.wantState)
+			}
+		})
+	}
+}
+
+func TestSnapshotCredentialState(t *testing.T) {
+	t.Run("stored running is available", func(t *testing.T) {
+		snap := SnapshotFromGraph(graphWithProviderAPIKey("sk-raw-12345"), true)
+		if snap.CredentialSource != string(CredentialSourceStored) || snap.CredentialState != string(CredentialStateAvailable) {
+			t.Fatalf("got %q/%q, want stored/available", snap.CredentialSource, snap.CredentialState)
+		}
+	})
+	t.Run("stored stopped is unverified without a probe", func(t *testing.T) {
+		snap := SnapshotFromGraph(graphWithProviderAPIKey("sk-raw-12345"), false)
+		if snap.CredentialSource != string(CredentialSourceStored) || snap.CredentialState != string(CredentialStateUnverified) {
+			t.Fatalf("got %q/%q, want stored/unverified", snap.CredentialSource, snap.CredentialState)
+		}
+	})
+	t.Run("env key resolves while stopped", func(t *testing.T) {
+		t.Setenv("DEEPSEEK_API_KEY", "sk-env-12345")
+		snap := SnapshotFromGraph(graphWithProviderAPIKey(""), false)
+		if snap.CredentialSource != string(CredentialSourceEnvironment) || snap.CredentialState != string(CredentialStateAvailable) {
+			t.Fatalf("got %q/%q, want environment/available", snap.CredentialSource, snap.CredentialState)
+		}
+		if !snap.APIKeySet {
+			t.Fatal("expected env key to count as set")
+		}
+	})
+	t.Run("nothing resolves missing", func(t *testing.T) {
+		t.Setenv("DEEPSEEK_API_KEY", "")
+		snap := SnapshotFromGraph(graphWithProviderAPIKey(""), true)
+		if snap.CredentialSource != string(CredentialSourceNone) || snap.CredentialState != string(CredentialStateMissing) {
+			t.Fatalf("got %q/%q, want none/missing", snap.CredentialSource, snap.CredentialState)
+		}
+	})
 }
 
 func TestSnapshotFieldsMatchCompleteGraph(t *testing.T) {

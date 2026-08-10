@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"moonbridge/internal/config"
+	"moonbridge/internal/db"
 	"moonbridge/internal/service/store"
 )
 
@@ -94,6 +95,9 @@ func TestSQLiteStoreSeedLoadRoundtrip(t *testing.T) {
 		}
 		if def2.BaseURL != def.BaseURL {
 			t.Fatalf("provider %q BaseURL: got %q, want %q", key, def2.BaseURL, def.BaseURL)
+		}
+		if def2.APIKeyEnv != def.APIKeyEnv {
+			t.Fatalf("provider %q APIKeyEnv: got %q, want %q", key, def2.APIKeyEnv, def.APIKeyEnv)
 		}
 		if len(def2.Offers) != len(def.Offers) {
 			t.Fatalf("provider %q offers count: got %d, want %d", key, len(def2.Offers), len(def.Offers))
@@ -388,9 +392,10 @@ func buildTestConfig() *config.Config {
 				},
 			},
 			"openai": {
-				BaseURL:  "https://api.openai.com",
-				APIKey:   "sk-openai-test-key",
-				Protocol: config.ProtocolOpenAIResponse,
+				BaseURL:   "https://api.openai.com",
+				APIKey:    "sk-openai-test-key",
+				APIKeyEnv: "OPENAI_API_KEY",
+				Protocol:  config.ProtocolOpenAIResponse,
 				Offers: []config.OfferEntry{
 					{
 						Model: "claude-fast",
@@ -711,6 +716,76 @@ func TestSQLiteStoreApplyProviderCreateAndDelete(t *testing.T) {
 	}
 	if _, ok := cfgLoaded2.ProviderDefs["new-provider"]; ok {
 		t.Fatal("new provider should have been deleted")
+	}
+}
+
+// TestSQLiteStoreMigrateAddsAPIKeyEnvColumn simulates a pre-existing database
+// whose providers table predates the api_key_env column, then verifies the
+// idempotent migration in NewSQLiteStore adds the column without losing data.
+func TestSQLiteStoreMigrateAddsAPIKeyEnvColumn(t *testing.T) {
+	logger := testLogger(t)
+	c := store.NewConfigStoreConsumer(logger)
+
+	// Build table specs where providers uses the legacy schema (no api_key_env).
+	oldTables := make([]db.TableSpec, 0, len(c.Tables()))
+	for _, tbl := range c.Tables() {
+		if tbl.Name == "providers" {
+			tbl.Schema = `CREATE TABLE IF NOT EXISTS {{table}} (
+    key          TEXT PRIMARY KEY,
+    base_url     TEXT NOT NULL,
+    api_key      TEXT NOT NULL,
+    version      TEXT DEFAULT '',
+    protocol     TEXT DEFAULT 'anthropic',
+    enabled      INTEGER DEFAULT 1,
+    user_agent   TEXT DEFAULT '',
+    web_search   TEXT,
+    extensions   TEXT,
+    created_at   TEXT,
+    updated_at   TEXT
+)`
+		}
+		oldTables = append(oldTables, tbl)
+	}
+
+	ts := newTestStore(t, "config_store", oldTables)
+
+	// Pre-seed a legacy provider row (as an existing database would have).
+	if _, err := ts.ExecContext(context.Background(),
+		"INSERT INTO config_store_providers (key, base_url, api_key) VALUES (?, ?, ?)",
+		"legacy", "https://legacy.example.com", "sk-legacy"); err != nil {
+		t.Fatalf("preseed legacy provider: %v", err)
+	}
+
+	// BindStore triggers NewSQLiteStore → migrateSchema.
+	if err := c.BindStore(ts); err != nil {
+		t.Fatalf("BindStore() error = %v", err)
+	}
+	cs := c.Store()
+	if cs == nil {
+		t.Fatal("Store() returned nil")
+	}
+
+	// The column must now exist, and legacy rows must have survived with ''.
+	var env string
+	if err := ts.QueryRowContext(context.Background(),
+		"SELECT api_key_env FROM config_store_providers WHERE key = ?", "legacy").Scan(&env); err != nil {
+		t.Fatalf("query legacy provider api_key_env: %v", err)
+	}
+	if env != "" {
+		t.Fatalf("legacy provider api_key_env = %q, want empty default", env)
+	}
+
+	// Round-trip an APIKeyEnv value through the migrated schema.
+	cfg := buildTestConfig()
+	if err := cs.SeedFromConfig(cfg); err != nil {
+		t.Fatalf("SeedFromConfig() error = %v", err)
+	}
+	cfg2, err := cs.LoadAll()
+	if err != nil {
+		t.Fatalf("LoadAll() error = %v", err)
+	}
+	if got := cfg2.ProviderDefs["openai"].APIKeyEnv; got != "OPENAI_API_KEY" {
+		t.Fatalf("APIKeyEnv after round-trip = %q, want %q", got, "OPENAI_API_KEY")
 	}
 }
 

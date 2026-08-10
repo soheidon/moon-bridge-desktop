@@ -1,9 +1,87 @@
-import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { save } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { TrafficAnalysisStatus, TrafficCommandError, TrafficExportResult, TrafficObservation, TrafficOperation, TrafficProgress } from "../types/trafficAnalysis";
+import { command, onEvent } from "../platform/desktop";
+import type { ExitConfirmationPayload, TrafficAnalysisStatus, TrafficCommandError, TrafficObservation, TrafficOperation, TrafficProgress } from "../types/trafficAnalysis";
+
+type WailsDesktopSnapshot = {
+  trafficAnalysis?: {
+    mode: string;
+    captureState: string;
+    relayActive: boolean;
+    integrationActive: boolean;
+    httpRequests: number;
+    sseStreams: number;
+    websocketConnections: number;
+    observationCount: number;
+    observationCapacity: number;
+    droppedObservations: number;
+    listening: boolean;
+    autoSaveStatus?: string;
+  };
+  recovery?: {
+    phase: string;
+    reconciliationStatus: string | null;
+    recoveryRequired: boolean;
+    restoreRequired: boolean;
+    conflict: boolean;
+  };
+  trafficObservations?: TrafficObservation[];
+};
+
+// hasRecoveryAvailable mirrors the backend unresolved guard trafficRecoveryWriter.HasUnresolved:
+// reconciliation_required / reconciliation_confirmation surface as recoveryRequired, while the
+// remaining restart_failed phase is detected directly. A config_conflict live state carries
+// recoveryRequired=true.
+export function hasRecoveryAvailable(recovery: WailsDesktopSnapshot["recovery"] | null): boolean {
+  if (!recovery) return false;
+  return recovery.recoveryRequired === true || recovery.phase === "restart_failed";
+}
+
+export function toExitPrompt(payload: ExitConfirmationPayload | undefined): ExitConfirmationPayload | null {
+  return payload ?? null;
+}
+
+function toAutoSaveStatus(raw: string | undefined): "active" | "finalized" | "failed" | null {
+  if (raw === "active" || raw === "finalized" || raw === "failed") return raw;
+  return null;
+}
+
+export function shouldFinishRelay(payload: ExitConfirmationPayload | null | undefined): boolean {
+  return payload?.reason === "traffic_active" || payload?.trafficActive === true;
+}
+
+export function toTrafficStatus(snapshot: WailsDesktopSnapshot): TrafficAnalysisStatus {
+  const traffic = snapshot.trafficAnalysis;
+  const captureState = traffic?.captureState ?? "stopped";
+  return {
+    capture: {
+      state: captureState as TrafficAnalysisStatus["capture"]["state"],
+      sessionId: null,
+      captureAddress: "",
+      upstreamHost: "",
+      startedAt: null,
+      httpRequests: traffic?.httpRequests ?? 0,
+      sseStreams: traffic?.sseStreams ?? 0,
+      websocketConnections: traffic?.websocketConnections ?? 0,
+      observationCount: traffic?.observationCount ?? 0,
+      observationCapacity: traffic?.observationCapacity ?? 0,
+      droppedObservations: traffic?.droppedObservations ?? 0,
+      droppedBackpressure: 0,
+      activeHttpRequests: 0,
+      activeWebsocketConnections: 0,
+      lastSequence: 0,
+      lastSafeError: null,
+    },
+    configPath: "",
+    configExists: false,
+    integrationActive: traffic?.integrationActive ?? false,
+    relayActive: traffic?.relayActive ?? false,
+    autoSaveStatus: toAutoSaveStatus(traffic?.autoSaveStatus),
+    recoveryAvailable: hasRecoveryAvailable(snapshot.recovery),
+    recoveryPhase: snapshot.recovery?.phase ?? null,
+    reconciliationStatus: snapshot.recovery?.reconciliationStatus ?? null,
+    appliedOpenaiBaseUrl: null,
+  };
+}
 
 export function useTrafficAnalysis() {
   const [status, setStatus] = useState<TrafficAnalysisStatus | null>(null);
@@ -12,8 +90,7 @@ export function useTrafficAnalysis() {
   const [error, setError] = useState<TrafficCommandError | null>(null);
   const [operationId, setOperationId] = useState<string | null>(null);
   const [pending, setPending] = useState<Partial<Record<TrafficOperation, boolean>>>({});
-  const [lastExport, setLastExport] = useState<TrafficExportResult | null>(null);
-  const [exitPromptOpen, setExitPromptOpen] = useState(false);
+  const [exitPrompt, setExitPrompt] = useState<ExitConfirmationPayload | null>(null);
   const lastSequence = useRef(0);
   const operationIds = useRef<Partial<Record<TrafficOperation, string>>>({});
   const pendingRef = useRef<Partial<Record<TrafficOperation, boolean>>>(pending);
@@ -24,24 +101,16 @@ export function useTrafficAnalysis() {
 
   const refresh = useCallback(async () => {
     try {
-      const next = await invoke<TrafficAnalysisStatus>("traffic_analysis_status");
-      setStatus(next);
-      if (next.capture.state === "capturing" || next.capture.state === "passthrough" || next.capture.state === "draining" || next.integrationActive) {
-        try {
-          const page = await invoke<{ observations: TrafficObservation[]; dropped: number; lastSequence: number }>("traffic_analysis_observations", {
-            input: { after: lastSequence.current },
-          });
-          const fresh = page.observations.filter((item) => item.sequence > lastSequence.current);
-          if (fresh.length > 0) {
-            setObservations((current) => [...current, ...fresh].slice(-2000));
-            lastSequence.current = Math.max(lastSequence.current, ...fresh.map((item) => item.sequence));
-          }
-        } catch {
-          // The capture may have just drained; keep the already safe local snapshot.
-        }
-      }
+      const next = await command<WailsDesktopSnapshot>("TrafficAnalysisStatus");
+      setStatus(toTrafficStatus(next));
     } catch (reason) {
       setError(asTrafficError(reason, "traffic_analysis_status"));
+    }
+    try {
+      const obs = await command<WailsDesktopSnapshot>("TrafficAnalysisObservations");
+      setObservations(obs.trafficObservations ?? []);
+    } catch (reason) {
+      setError(asTrafficError(reason, "traffic_analysis_observations"));
     }
   }, []);
 
@@ -59,31 +128,23 @@ export function useTrafficAnalysis() {
 
   useEffect(() => {
     let disposed = false;
-    let unlisten: UnlistenFn | undefined;
-    void listen<TrafficProgress>("traffic-analysis-progress", (event) => {
-      if (!disposed && Object.values(operationIds.current).includes(event.payload.operationId)) setProgress(event.payload);
-    }).then((fn) => {
-      if (disposed) fn();
-      else unlisten = fn;
+    const unlisten = onEvent<TrafficProgress>("traffic-analysis-progress", (payload) => {
+      if (!disposed && Object.values(operationIds.current).includes(payload.operationId)) setProgress(payload);
     });
     return () => {
       disposed = true;
-      unlisten?.();
+      unlisten();
     };
   }, []);
 
   useEffect(() => {
     let disposed = false;
-    let unlisten: UnlistenFn | undefined;
-    void listen<string>("desktop-exit-confirmation-requested", (event) => {
-      if (!disposed && event.payload === "traffic_analysis") setExitPromptOpen(true);
-    }).then((fn) => {
-      if (disposed) fn();
-      else unlisten = fn;
+    const unlisten = onEvent<ExitConfirmationPayload>("desktop-exit-confirmation-requested", (payload) => {
+      if (!disposed) setExitPrompt(toExitPrompt(payload));
     });
     return () => {
       disposed = true;
-      unlisten?.();
+      unlisten();
     };
   }, []);
 
@@ -105,15 +166,15 @@ export function useTrafficAnalysis() {
     pendingRef.current = { ...pendingRef.current, [operation]: false };
   }, []);
 
-  const runMutation = useCallback(async <T,>(operation: TrafficOperation, command: string, input: Record<string, unknown>) => {
+  const runMutation = useCallback(async <T,>(operation: TrafficOperation, method: string, input: Record<string, unknown>) => {
     const nextOperationId = beginOperation(operation);
     if (!nextOperationId) return null;
     try {
-      const result = await invoke<T>(command, { input: { ...input, operationId: nextOperationId } });
+      const result = await command<T>(method, input);
       await refresh();
       return result;
     } catch (reason) {
-      setError(asTrafficError(reason, command));
+      setError(asTrafficError(reason, method));
       await refresh();
       return null;
     } finally {
@@ -121,57 +182,42 @@ export function useTrafficAnalysis() {
     }
   }, [beginOperation, finishOperation, refresh]);
 
-  const start = useCallback(() => runMutation("starting", "traffic_analysis_start", {}), [runMutation]);
-  const restartCapture = useCallback(() => runMutation("restarting", "traffic_analysis_restart_capture", {}), [runMutation]);
-  const stop = useCallback(() => runMutation("stopping", "traffic_analysis_stop", {}), [runMutation]);
+  const start = useCallback(() => runMutation("starting", "StartTrafficAnalysis", {}), [runMutation]);
+  const restartCapture = useCallback(() => runMutation("restarting", "RestartTrafficCapture", {}), [runMutation]);
+  const stop = useCallback(() => runMutation("stopping", "StopTrafficAnalysis", {}), [runMutation]);
   const finishRelay = useCallback((discardUnsaved = false) => {
     if (pendingRef.current.stopping === true) return Promise.resolve(null);
-    return runMutation("finalizing", "traffic_analysis_finish_relay", { discardUnsaved });
+    return runMutation("finalizing", "FinishTrafficRelay", { discardUnsaved });
   }, [runMutation]);
-  const retryAutosave = useCallback(() => runMutation("retryingAutosave", "traffic_analysis_retry_autosave", {}), [runMutation]);
 
   const clear = useCallback(async () => {
     if (!window.confirm("観測一覧をクリアしますか？この操作は現在のメモリ上の観測だけを消去します。")) return;
-    const result = await runMutation<TrafficAnalysisStatus>("clearing", "traffic_analysis_clear", {});
+    const result = await runMutation<TrafficAnalysisStatus>("clearing", "ClearTrafficAnalysis", {});
     if (result) {
       setObservations([]);
       lastSequence.current = 0;
     }
   }, [runMutation]);
 
-  const exportObservations = useCallback(async () => {
-    const operation = "exporting" as const;
-    const nextOperationId = beginOperation(operation);
-    if (!nextOperationId) return null;
-    const stamp = new Date().toISOString().replace(/[.:]/g, "-");
-    try {
-      const destination = await save({ defaultPath: `moon-bridge-traffic-analysis-${stamp}.log`, filters: [{ name: "Log", extensions: ["log"] }] });
-      if (!destination) return null;
-      const result = await invoke<TrafficExportResult>("traffic_analysis_export", { input: { operationId: nextOperationId, destination } });
-      setLastExport(result);
-      await refresh();
-      return result;
-    } catch (reason) {
-      setError(asTrafficError(reason, "traffic_analysis_export"));
-      await refresh();
-      return null;
-    } finally {
-      finishOperation(operation);
+  const restore = useCallback((confirmConflict = false) => runMutation("restoring", "RestoreRecovery", { confirmConflict }), [runMutation]);
+
+  const finishRelayResolvingConflict = useCallback(async () => {
+    if (pendingRef.current.stopping === true) return null;
+    if (status?.reconciliationStatus === "config_conflict") {
+      if (!window.confirm("Codex設定に競合があります。分析開始前の設定へ復元して終了しますか？")) return null;
+      // Finish is fail-closed while the conflict is unresolved, so restore first.
+      // The chain is intentionally non-atomic: after a successful restore the relay
+      // stays alive (復元済み・中継継続) and the next call only needs to finish.
+      if (!(await restore(true))) return null;
     }
-  }, [beginOperation, finishOperation, refresh]);
-
-  const restore = useCallback((confirmConflict = false) => runMutation("restoring", "traffic_analysis_restore_config", { confirmConflict }), [runMutation]);
-
-  const revealExport = useCallback(() => {
-    if (!lastExport) return Promise.resolve(null);
-    return runMutation("revealing", "traffic_analysis_reveal_export", { destination: lastExport.destination });
-  }, [lastExport, runMutation]);
+    return finishRelay(false);
+  }, [finishRelay, restore, status?.reconciliationStatus]);
 
   const openLogFolder = useCallback(async () => {
     const nextOperationId = beginOperation("openingFolder");
     if (!nextOperationId) return false;
     try {
-      await invoke("traffic_analysis_open_log_folder");
+      await command("TrafficAnalysisOpenLogFolder");
       return true;
     } catch (reason) {
       setError(asTrafficError(reason, "traffic_analysis_open_log_folder"));
@@ -181,20 +227,51 @@ export function useTrafficAnalysis() {
     }
   }, [beginOperation, finishOperation]);
 
+  const openLogFile = useCallback(async () => {
+    const nextOperationId = beginOperation("openingFile");
+    if (!nextOperationId) return false;
+    try {
+      await command("TrafficAnalysisOpenLogFile");
+      return true;
+    } catch (reason) {
+      setError(asTrafficError(reason, "traffic_analysis_open_log_file"));
+      return false;
+    } finally {
+      finishOperation("openingFile");
+    }
+  }, [beginOperation, finishOperation]);
+
   const cancelExit = useCallback(async () => {
-    await invoke("desktop_cancel_exit");
-    setExitPromptOpen(false);
+    try {
+      await command("CancelExit");
+    } catch (reason) {
+      setError(asTrafficError(reason, "CancelExit"));
+      return;
+    }
+    setExitPrompt(null);
   }, []);
 
   const confirmExit = useCallback(async (discardUnsaved = false) => {
-    if (status?.integrationActive && !await stop()) return;
-    if (!await finishRelay(discardUnsaved)) return;
-    await invoke("desktop_confirm_exit");
-    setExitPromptOpen(false);
-    await getCurrentWindow().close();
-  }, [finishRelay, status?.integrationActive, stop]);
+    setError(null);
+    if (status?.recoveryAvailable) {
+      // A pending restore must be resolved before closing; Disable would fail
+      // with a restore conflict again. Restore keeps the relay alive on error
+      // so the exit stays retryable.
+      if (!(await restore(status?.reconciliationStatus === "config_conflict"))) return;
+    } else if (status?.integrationActive && !(await stop())) {
+      return;
+    }
+    if (shouldFinishRelay(exitPrompt) && !(await finishRelay(discardUnsaved))) return;
+    try {
+      await command("ConfirmExit", { confirm: true, discardUnsaved });
+    } catch (reason) {
+      setError(asTrafficError(reason, "ConfirmExit"));
+      return;
+    }
+    setExitPrompt(null);
+  }, [exitPrompt, finishRelay, restore, status?.integrationActive, status?.recoveryAvailable, status?.reconciliationStatus, stop]);
 
-  return { status, observations, progress, error, operationId, pending, lastExport, start, restartCapture, stop, finishRelay, retryAutosave, clear, exportObservations, revealExport, openLogFolder, restore, refresh, exitPromptOpen, cancelExit, confirmExit };
+  return { status, observations, progress, error, operationId, pending, start, restartCapture, stop, finishRelay, finishRelayResolvingConflict, clear, openLogFolder, openLogFile, restore, refresh, exitPrompt, cancelExit, confirmExit };
 }
 
 function asTrafficError(reason: unknown, operation: string): TrafficCommandError {

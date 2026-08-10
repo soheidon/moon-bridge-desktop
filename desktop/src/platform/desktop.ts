@@ -26,25 +26,44 @@ export type PlatformAdapter = {
   openDialog(options?: unknown): Promise<string | string[] | null>;
   saveDialog(options?: unknown): Promise<string | null>;
   closeWindow(): Promise<void>;
+  getWindowSize?: () => Promise<{ w: number; h: number } | null>;
+  setWindowSize?: (width: number, height: number) => Promise<void>;
 };
+
+// Wails binds Go methods with a fixed arity and rejects calls that pass extra
+// arguments — even `undefined` — with "received N arguments ... expected 0".
+// These generated bindings take no arguments and must be invoked as method(),
+// never method(args). Kept in sync with desktop/wailsjs/go/main/App.
+export const ZERO_ARG_COMMANDS: ReadonlySet<string> = new Set([
+  "CancelExit",
+  "CodexConfigBackups",
+  "CodexStatus",
+  "GatewayStatus",
+  "LoadCodexConfig",
+  "LoadDeepSeekSettings",
+  "LoadRoutingProfiles",
+  "RecoveryStatus",
+  "RefreshRecoveryStatus",
+  "StartTrafficAnalysis",
+  "StopTrafficAnalysis",
+  "TrafficAnalysisObservations",
+  "TrafficAnalysisOpenLogFolder",
+  "TrafficAnalysisStatus",
+]);
 
 type WailsRuntime = {
   EventsOn?: (name: string, callback: (payload: unknown) => void) => Unsubscribe;
   EventsOff?: (name: string) => void;
+  WindowGetSize?: () => Promise<{ w: number; h: number }>;
+  WindowSetSize?: (width: number, height: number) => void;
 };
 
 type WailsApp = Record<string, (args?: unknown) => unknown>;
-
-type TauriRuntime = {
-  invoke: <T>(name: string, args?: unknown) => Promise<T>;
-  listen: <T>(name: string, callback: (event: { payload: T }) => void) => Promise<Unsubscribe>;
-};
 
 type WindowWithRuntimes = Window & {
   go?: { main?: { App?: WailsApp } };
   runtime?: WailsRuntime;
   __MOON_BRIDGE_PLATFORM__?: PlatformAdapter;
-  __TAURI_INTERNALS__?: unknown;
 };
 
 const unsupportedError = (operation: string): CommandError => ({
@@ -100,7 +119,12 @@ function normalizeError(reason: unknown, operation: string): CommandError {
   if (typeof reason === "object" && reason !== null && "code" in reason && "message" in reason) {
     return normalizeCommandError(reason as Partial<CommandError>, operation);
   }
-  return normalizeCommandError({ code: "native_command_failed", message: String(reason) }, operation);
+  // Do not expose arbitrary native/transport error text to the frontend. It
+  // may contain paths, URLs, tokens, or implementation details.
+  return normalizeCommandError(
+    { code: "native_command_failed", message: "Desktop command failed" },
+    operation,
+  );
 }
 
 function wailsAdapter(): PlatformAdapter | null {
@@ -112,7 +136,14 @@ function wailsAdapter(): PlatformAdapter | null {
     async command(name: string, args?: unknown): Promise<NativeCommandResult<unknown>> {
       const method = app[name];
       if (typeof method !== "function") return { ok: false, error: unsupportedError(name) };
-      return method(args) as NativeCommandResult<unknown>;
+      try {
+        // Zero-argument bindings must be called with no arguments at all;
+        // passing undefined/null/{} makes Wails reject the call.
+        const result = ZERO_ARG_COMMANDS.has(name) ? method() : method(args);
+        return (await Promise.resolve(result)) as NativeCommandResult<unknown>;
+      } catch (reason) {
+        return { ok: false, error: normalizeError(reason, name) };
+      }
     },
     onEvent(name: string, listener: EventListener<unknown>): Unsubscribe {
       return runtime.EventsOn!(name, listener);
@@ -120,44 +151,50 @@ function wailsAdapter(): PlatformAdapter | null {
     async openDialog() {
       throw notImplementedError("openDialog");
     },
-    async saveDialog() {
-      throw notImplementedError("saveDialog");
+    async saveDialog(options?: unknown): Promise<string | null> {
+      const method = app.SaveFileDialog;
+      if (typeof method !== "function") return null;
+      const opts = (options ?? {}) as {
+        title?: string;
+        defaultPath?: string;
+        filters?: Array<{ name?: string; extensions?: string[] }>;
+      };
+      // defaultPath may be a bare filename (the export flow) or a full path;
+      // map the former to DefaultFilename and split the latter into directory
+      // + filename. Tauri-style filters become Wails displayName/pattern pairs.
+      let defaultDirectory = "";
+      let defaultFilename = opts.defaultPath ?? "";
+      if (opts.defaultPath) {
+        const lastSep = Math.max(opts.defaultPath.lastIndexOf("/"), opts.defaultPath.lastIndexOf("\\"));
+        if (lastSep >= 0) {
+          defaultDirectory = opts.defaultPath.slice(0, lastSep);
+          defaultFilename = opts.defaultPath.slice(lastSep + 1);
+        }
+      }
+      const filters = (opts.filters ?? []).map((filter) => ({
+        displayName: filter.name ?? "",
+        pattern: (filter.extensions ?? []).map((ext) => `*.${ext}`).join(";"),
+      }));
+      const result = await Promise.resolve(
+        method({ title: opts.title ?? "", defaultDirectory, defaultFilename, filters }),
+      );
+      if (isCommandResult(result) && result.ok && result.value !== undefined) {
+        const saved = (result.value as { saveDialog?: { path?: string; canceled?: boolean } }).saveDialog;
+        if (!saved || saved.canceled) return null;
+        return saved.path ?? null;
+      }
+      return null;
     },
     async closeWindow() {
       throw notImplementedError("closeWindow");
     },
-  };
-}
-
-async function tauriAdapter(): Promise<PlatformAdapter | null> {
-  const target = currentWindow();
-  if (!target.__TAURI_INTERNALS__) return null;
-  const [core, event] = await Promise.all([
-    import("@tauri-apps/api/core"),
-    import("@tauri-apps/api/event"),
-  ]);
-  return {
-    async command(name: string, args?: unknown): Promise<NativeCommandResult<unknown>> {
-      try {
-        return { ok: true, value: await core.invoke<unknown>(name, args as never) };
-      } catch (reason) {
-        return { ok: false, error: normalizeError(reason, name) };
-      }
+    async getWindowSize() {
+      if (typeof runtime.WindowGetSize !== "function") return null;
+      return runtime.WindowGetSize();
     },
-    onEvent(name: string, listener: EventListener<unknown>): Promise<Unsubscribe> {
-      return event.listen(name, (received) => listener(received.payload));
-    },
-    async openDialog(options) {
-      const dialog = await import("@tauri-apps/plugin-dialog");
-      return dialog.open(options as never) as Promise<string | string[] | null>;
-    },
-    async saveDialog(options) {
-      const dialog = await import("@tauri-apps/plugin-dialog");
-      return dialog.save(options as never);
-    },
-    async closeWindow() {
-      const { getCurrentWindow } = await import("@tauri-apps/api/window");
-      await getCurrentWindow().close();
+    async setWindowSize(width: number, height: number) {
+      if (typeof runtime.WindowSetSize !== "function") throw notImplementedError("setWindowSize");
+      runtime.WindowSetSize(width, height);
     },
   };
 }
@@ -167,8 +204,6 @@ async function resolveAdapter(): Promise<PlatformAdapter> {
   if (target.__MOON_BRIDGE_PLATFORM__) return target.__MOON_BRIDGE_PLATFORM__;
   const wails = wailsAdapter();
   if (wails) return wails;
-  const tauri = await tauriAdapter();
-  if (tauri) return tauri;
   return {
     async command(name: string): Promise<NativeCommandResult<unknown>> {
       return { ok: false, error: unsupportedError(name) };
@@ -185,6 +220,12 @@ async function resolveAdapter(): Promise<PlatformAdapter> {
     async closeWindow() {
       throw unsupportedError("closeWindow");
     },
+    async getWindowSize() {
+      return null;
+    },
+    async setWindowSize() {
+      throw unsupportedError("setWindowSize");
+    },
   };
 }
 
@@ -199,7 +240,13 @@ function isCommandResult(value: unknown): value is NativeCommandResult<unknown> 
 export async function command<T>(name: string, args?: unknown): Promise<T> {
   const result = await (await resolveAdapter()).command(name, args);
   if (!isCommandResult(result)) throw invalidResponseError(name);
-  if (result.ok) return result.value as T;
+  if (result.ok) {
+    // Every binding populates value on success; a missing value means the
+    // response shape is wrong, and silently returning undefined would surface
+    // as phantom "stopped"/empty state in the UI.
+    if (result.value === undefined) throw invalidResponseError(name);
+    return result.value as T;
+  }
   if (result.error) throw normalizeCommandError(result.error, name);
   throw invalidResponseError(name);
 }
@@ -238,4 +285,12 @@ export async function saveDialog(options?: unknown): Promise<string | null> {
 
 export async function closeWindow(): Promise<void> {
   return (await resolveAdapter()).closeWindow();
+}
+
+export async function getWindowSize(): Promise<{ w: number; h: number } | null> {
+  return (await resolveAdapter()).getWindowSize?.() ?? null;
+}
+
+export async function setWindowSize(width: number, height: number): Promise<void> {
+  await (await resolveAdapter()).setWindowSize?.(width, height);
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,25 +18,31 @@ import (
 	"moonbridge/internal/service/codexlauncher"
 	"moonbridge/internal/service/deepseek"
 	"moonbridge/internal/service/gateway"
+	"moonbridge/internal/service/recovery"
+	"moonbridge/internal/service/routingprofile"
 	"moonbridge/internal/service/trafficanalysis"
+	"moonbridge/internal/service/traffictransaction"
 )
 
 const (
 	roundTripEvent     = "desktop:roundtrip"
 	gatewayStatusEvent = "gateway-status"
+	gatewayLogEvent    = "gateway-log"
 )
 
 type CommandError struct {
-	Operation          string         `json:"operation"`
-	Stage              string         `json:"stage"`
-	Code               string         `json:"code"`
-	Message            string         `json:"message"`
-	Field              *string        `json:"field"`
-	Retryable          bool           `json:"retryable"`
-	MutationStarted    bool           `json:"mutationStarted"`
-	GatewayLeftRunning bool           `json:"gatewayLeftRunning"`
-	GatewaySnapshot    any            `json:"gatewaySnapshot"`
-	Details            map[string]any `json:"details,omitempty"`
+	Operation            string         `json:"operation"`
+	Stage                string         `json:"stage"`
+	Code                 string         `json:"code"`
+	Message              string         `json:"message"`
+	Field                *string        `json:"field"`
+	Retryable            bool           `json:"retryable"`
+	MutationStarted      bool           `json:"mutationStarted"`
+	GatewayLeftRunning   bool           `json:"gatewayLeftRunning"`
+	ConfirmationRequired bool           `json:"confirmationRequired,omitempty"`
+	RecoveryRequired     bool           `json:"recoveryRequired,omitempty"`
+	GatewaySnapshot      any            `json:"gatewaySnapshot"`
+	Details              map[string]any `json:"details,omitempty"`
 }
 
 type RoundTripRequest struct {
@@ -88,19 +95,20 @@ type gatewayController interface {
 	Start(ctx context.Context, opts gateway.StartOptions) (gateway.State, error)
 	Stop(ctx context.Context) error
 	Status() gateway.State
+	RefreshRoutingProfile(cfg config.Config)
 }
 
 // gatewaySession is the per-run identity/config bundle the DeepSeek and Codex
 // bindings derive from. The secrets (ControlToken / ServerToken) never leave
 // this struct.
 type gatewaySession struct {
-	InstanceID   string        // matches svc.Status().InstanceID; guards against stale sessions
-	Address      string        // management API base / codex base URL source
-	ControlToken string        // DeepSeek management API bearer. Secret.
-	ServerToken  string        // codex auth.json token. Secret.
-	ConfigPath   string        // config the session started from / reloads after saves
-	Config       config.Config // codex config generation source (loaded at start)
-	ConfigValid  bool          // Config matches the current on-disk config
+	InstanceID             string        // matches svc.Status().InstanceID; guards against stale sessions
+	Address                string        // management API base / codex base URL source
+	ControlToken           string        // DeepSeek management API bearer. Secret.
+	ServerToken            string        // codex auth.json token. Secret.
+	ConfigPath             string        // config the session started from / reloads after saves
+	Config                 config.Config // codex config generation source (loaded at start)
+	ConfigValid            bool          // Config matches the current on-disk config
 }
 
 // codexController is the codex terminal-session controller the App drives. It
@@ -117,12 +125,20 @@ type codexController interface {
 type deepSeekController interface {
 	Load(ctx context.Context) (*deepseek.Snapshot, error)
 	Save(ctx context.Context, input deepseek.Input) (*deepseek.Snapshot, error)
+	Clear(ctx context.Context) (*deepseek.Snapshot, error)
+	TestProvider(ctx context.Context) (deepseek.ConnectionTestResult, error)
 	Validate(input deepseek.Input) error
 }
 
 // deepSeekFactory builds a controller per operation from the live session, so
 // a gateway restart's fresh control token is always used.
 type deepSeekFactory func(address, controlToken string) deepSeekController
+
+// routingProfileFactory builds a controller per operation from the live
+// session, so a gateway restart's fresh control token is always used. The
+// routingProfileController interface it returns lives in
+// routing_profile_bindings.go.
+type routingProfileFactory func(address, controlToken string) routingProfileController
 
 // codexConfigController is the user codex-config editor the App drives.
 type codexConfigController interface {
@@ -144,39 +160,83 @@ type App struct {
 	operationMu      sync.Mutex // Gateway lifecycle + DeepSeek 管理 API
 	codexMu          sync.Mutex // Codex terminal process
 	configMu         sync.Mutex // ユーザー実 Codex config
+	trafficMu        sync.Mutex // Desktop traffic transaction coordination
+	lifecycleMu      sync.Mutex
+	lifecycle        appLifecycle
+	startupOnce      sync.Once
+	startupErr       error
+	domReadySeen     bool
+	shutdownMu       sync.Mutex
+	shutdownDone     chan struct{}
+	shutdownStarted  bool
+	exitMu           sync.Mutex
+	exitState        exitState
 	svc              gatewayController
 	traffic          *trafficanalysis.Service
 	configuredPath   string // AppOptions で指定された Start 候補
 	activeConfigPath string // 最後に成功した Start の path（snapshot にのみ表示）
 	newIdentity      func() (string, string)
 	emitEvents       func(name string, payload any)
+	gatewayLogs      *gatewayLogBridge
 	closed           atomic.Bool
 
-	session     *gatewaySession
-	codex       codexController
-	codexConfig codexConfigController
-	newDeepSeek deepSeekFactory
-	deriveCodex codexConfigDeriver
-	codexOp     string // current codex operation for progress events（codexMu で保護）
+	session           *gatewaySession
+	codex             codexController
+	codexConfig       codexConfigController
+	newDeepSeek       deepSeekFactory
+	newRoutingProfile routingProfileFactory
+	deriveCodex       codexConfigDeriver
+	quitDesktop       func(context.Context)
+	codexOp           string // current codex operation for progress events（codexMu で保護）
+	trafficTx         *traffictransaction.Service
+	recovery          *recovery.Store
+	recoveryHome      string
+	trafficConfigPath string
+	trafficBackupDir  string
+
+	// trafficLog holds the autosave writer for the current capture session. It
+	// is atomic so EndRun (which must not take trafficMu) and TrafficAnalysisStatus
+	// (which reads the snapshot without trafficMu) can access it safely.
+	trafficLog        atomic.Pointer[trafficLogWriter]
+	trafficLogInitErr atomic.Pointer[string]
+	trafficLogDir     string
+	exportMu          sync.Mutex
+	lastTrafficExport string
+	saveDialogFunc    func(context.Context, runtime.SaveDialogOptions) (string, error)
+	explorerFunc      func(args ...string) error
+
+	// routingProfileRefresh rebuilds the Gateway's runtime SlotResolver from a
+	// fresh config snapshot. Set by the gateway run via desktop control hook.
+	routingProfileRefresh func(cfg config.Config)
 }
 
 type AppOptions struct {
-	Service     gatewayController              // nil → gateway.NewService(ServiceOptions{Errors: os.Stderr})
-	NewIdentity func() (string, string)        // nil → gateway.NewDesktopIdentity
-	ConfigPath  string                         // Start 候補。"" → 既定パス（lazy resolve）
-	EmitEvents  func(name string, payload any) // nil → runtime.EventsEmit（a.ctx 非nil時のみ）
-	Codex       codexController                // nil → codexlauncher.New(Options{Progress: …})
-	CodexConfig codexConfigController          // nil → codexconfig.New(codexconfig.Options{})
-	NewDeepSeek deepSeekFactory                // nil → NewHTTPClient ベースの既定 factory
-	DeriveCodex codexConfigDeriver             // nil → 稼働中 Gateway の effective config から導出
-	Traffic     *trafficanalysis.Service       // nil → 長寿命 Service を新規生成・所有
+	Service            gatewayController              // nil → gateway.NewService(ServiceOptions{Errors: os.Stderr})
+	NewIdentity        func() (string, string)        // nil → gateway.NewDesktopIdentity
+	ConfigPath         string                         // Start 候補。"" → 既定パス（lazy resolve）
+	EmitEvents         func(name string, payload any) // nil → runtime.EventsEmit（a.ctx 非nil時のみ）
+	Codex              codexController                // nil → codexlauncher.New(Options{Progress: …})
+	CodexConfig        codexConfigController          // nil → codexconfig.New(codexconfig.Options{})
+	NewDeepSeek        deepSeekFactory                // nil → NewHTTPClient ベースの既定 factory
+	NewRoutingProfile  routingProfileFactory          // nil → routingprofile.NewService(NewHTTPClient) の既定 factory
+	DeriveCodex        codexConfigDeriver             // nil → 稼働中 Gateway の effective config から導出
+	Quit               func(context.Context)          // nil → Wails runtime.Quit; test seam only
+	Traffic            *trafficanalysis.Service       // nil → 長寿命 Service を新規生成・所有
+	TrafficTransaction *traffictransaction.Service
+	Recovery           *recovery.Store
+	// RecoveryHome identifies the Codex profile associated with an injected
+	// Recovery store. It is primarily a test/embedding seam; the normal Wails
+	// path resolves the profile from codexconfig.Service.
+	RecoveryHome string
+	// BackupDir scopes transaction backups for an injected profile. The normal
+	// Wails path leaves it empty and uses the platform app-data root.
+	BackupDir string
+	// RoutingProfileRefresh rebuilds the Gateway's runtime SlotResolver from a
+	// fresh config snapshot. Set by the gateway run via desktop control hook.
+	RoutingProfileRefresh func(cfg config.Config)
 }
 
 func NewApp(opts AppOptions) *App {
-	svc := opts.Service
-	if svc == nil {
-		svc = gateway.NewService(gateway.ServiceOptions{Errors: os.Stderr})
-	}
 	newIdentity := opts.NewIdentity
 	if newIdentity == nil {
 		newIdentity = gateway.NewDesktopIdentity
@@ -191,6 +251,12 @@ func NewApp(opts AppOptions) *App {
 			return deepseek.NewService(deepseek.NewHTTPClient(address, controlToken))
 		}
 	}
+	newRoutingProfile := opts.NewRoutingProfile
+	if newRoutingProfile == nil {
+		newRoutingProfile = func(address, controlToken string) routingProfileController {
+			return routingprofile.NewService(deepseek.NewHTTPClient(address, controlToken))
+		}
+	}
 	deriveCodex := opts.DeriveCodex
 	if deriveCodex == nil {
 		deriveCodex = deriveCodexLive
@@ -201,17 +267,29 @@ func NewApp(opts AppOptions) *App {
 	}
 	appCtx, cancel := context.WithCancel(context.Background())
 	a := &App{
-		appCtx:         appCtx,
-		cancel:         cancel,
-		svc:            svc,
-		traffic:        traffic,
-		configuredPath: opts.ConfigPath,
-		newIdentity:    newIdentity,
-		emitEvents:     opts.EmitEvents,
-		codexConfig:    codexConfig,
-		newDeepSeek:    newDeepSeek,
-		deriveCodex:    deriveCodex,
+		appCtx:            appCtx,
+		cancel:            cancel,
+		svc:               opts.Service,
+		traffic:           traffic,
+		configuredPath:    opts.ConfigPath,
+		newIdentity:       newIdentity,
+		emitEvents:        opts.EmitEvents,
+		trafficTx:         opts.TrafficTransaction,
+		recovery:          opts.Recovery,
+		recoveryHome:      opts.RecoveryHome,
+		trafficBackupDir:  opts.BackupDir,
+		codexConfig:           codexConfig,
+		newDeepSeek:           newDeepSeek,
+		newRoutingProfile:     newRoutingProfile,
+		deriveCodex:           deriveCodex,
+		quitDesktop:           opts.Quit,
+		routingProfileRefresh: opts.RoutingProfileRefresh,
 	}
+	if a.quitDesktop == nil {
+		a.quitDesktop = runtime.Quit
+	}
+	a.saveDialogFunc = runtime.SaveFileDialog
+	a.explorerFunc = defaultExplorerFunc
 	if opts.Codex == nil {
 		a.codex = codexlauncher.New(codexlauncher.Options{
 			// Progress runs synchronously inside Launch/Restart, which the
@@ -230,24 +308,95 @@ func NewApp(opts AppOptions) *App {
 			}
 		}
 	}
+	// The gateway's runtime notices are bridged to the "gateway-log" Wails
+	// event while the existing os.Stderr output is preserved. Construction is
+	// deferred until after emitEvents is set so the bridge can emit safely
+	// (a.ctx may still be nil here; the default emitEvents drops events then).
+	if a.svc == nil {
+		a.gatewayLogs = newGatewayLogBridge(a.safeEmit)
+		a.svc = gateway.NewService(gateway.ServiceOptions{
+			Errors: io.MultiWriter(os.Stderr, a.gatewayLogs),
+		})
+	}
 	return a
 }
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	a.startupOnce.Do(func() {
+		a.lifecycleMu.Lock()
+		a.lifecycle = lifecycleStarting
+		a.lifecycleMu.Unlock()
+		configPath, pathErr := a.resolveCodexConfigPath(ctx)
+		if pathErr != nil {
+			a.startupErr = pathErr
+		}
+		if configPath == "" {
+			a.startupErr = errors.New("codex config path is unavailable")
+		} else if err := a.ensureRecoveryStore(filepath.Dir(configPath)); err != nil {
+			a.startupErr = err
+		} else if a.recovery != nil {
+			reconcileCtx, cancel := context.WithTimeout(a.appCtx, 10*time.Second)
+			_, a.startupErr = a.recovery.ReconcileStartup(reconcileCtx, func(path string) ([]byte, error) {
+				return os.ReadFile(path)
+			})
+			cancel()
+		}
+		a.lifecycleMu.Lock()
+		a.lifecycle = lifecycleStarted
+		a.lifecycleMu.Unlock()
+	})
 }
 
 func (a *App) shutdown(context.Context) {
-	if !a.closed.CompareAndSwap(false, true) {
-		return // 多重 shutdown を防ぐ
+	a.shutdownMu.Lock()
+	if a.shutdownStarted {
+		done := a.shutdownDone
+		a.shutdownMu.Unlock()
+		<-done
+		return
 	}
-	a.cancel() // run 全体の親 context を cancel → 進行中 Start / Launch を中断、稼働中 Gateway の停止も開始
+	a.shutdownStarted = true
+	a.shutdownDone = make(chan struct{})
+	done := a.shutdownDone
+	a.shutdownMu.Unlock()
+
+	a.closed.Store(true)
+	a.lifecycleMu.Lock()
+	a.lifecycle = lifecycleClosing
+	a.lifecycleMu.Unlock()
+	defer func() {
+		a.lifecycleMu.Lock()
+		a.lifecycle = lifecycleClosed
+		a.lifecycleMu.Unlock()
+		close(done)
+	}()
+
+	a.cancel() // cancel active App operations, then continue independent cleanup
 
 	a.operationMu.Lock()
 	defer a.operationMu.Unlock()
 
-	// Codex terminal first (reason=shutdown), gateway-independent. Lock order
-	// operationMu → codexMu only; both waits are bounded.
+	// Traffic cleanup is best effort and never blocks later Codex/Gateway
+	// cleanup. A confirmation-required Finish is retained as Recovery evidence;
+	// shutdown never invents discard consent.
+	a.trafficMu.Lock()
+	if a.trafficTx != nil {
+		trafficCtx, trafficCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		st := a.traffic.Status()
+		if st.Mode == trafficanalysis.ModeDesktop {
+			_, _ = a.trafficTx.Disable(trafficCtx)
+		} else if st.Mode == trafficanalysis.ModeCaptureOnly && st.CaptureState == "passthrough" {
+			_, _ = a.trafficTx.Finish(trafficCtx, false)
+		}
+		trafficCancel()
+	}
+	// Close the autosave log after the traffic transaction cleanup: the final
+	// drain needs the observations that Disable/Finish still expose.
+	a.closeTrafficAutosaveLocked(true)
+	a.trafficMu.Unlock()
+
+	// Codex terminal first (reason=shutdown), gateway-independent.
 	a.codexMu.Lock()
 	codexStopCtx, codexCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	_, _ = a.codex.Stop(codexStopCtx, codexlauncher.StopReasonShutdown)
@@ -255,8 +404,8 @@ func (a *App) shutdown(context.Context) {
 	a.codexMu.Unlock()
 
 	gwStopCtx, gwCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer gwCancel()
-	_ = a.svc.Stop(gwStopCtx) // cleanup 完了を待つ
+	_ = a.svc.Stop(gwStopCtx) // cleanup continues even after traffic failure
+	gwCancel()
 
 	a.session = nil
 	a.emitStatus()
@@ -351,6 +500,13 @@ func (a *App) startGatewayLocked(requestPath string) GatewayCommandResult {
 		return a.fail("gateway.start", "loading_config", "gateway_config_load_failed", "unable to load config", false, err)
 	}
 	instanceID, token := a.newIdentity()
+	// Wire the routing profile refresh callback so that binding-layer mutations
+	// (SaveRoutingProfile, ActivateProfile) can trigger a live resolver swap
+	// via gateway.Service.RefreshRoutingProfile. Only set if the caller didn't
+	// provide one (production path via main.go leaves it nil; tests may inject).
+	if a.routingProfileRefresh == nil {
+		a.routingProfileRefresh = func(cfg config.Config) { a.svc.RefreshRoutingProfile(cfg) }
+	}
 	// Start derives the whole run context from ctx, so it must not carry a
 	// timeout: a timeout here would auto-stop the running gateway.
 	_, err = a.svc.Start(a.appCtx, gateway.StartOptions{
@@ -367,8 +523,16 @@ func (a *App) startGatewayLocked(requestPath string) GatewayCommandResult {
 			},
 			EndRun: func(id string, reason app.EndRunReason) {
 				a.traffic.MarkGatewayLost(id, reason != app.EndRunStopped)
+				// Abnormal EndRun must not take trafficMu (StopGateway holds
+				// operationMu while waiting for EndRun; trafficGatewayProvider
+				// snapshots take operationMu via bindings → lock-order
+				// inversion). The atomic pointer + writer mutex are enough.
+				if w := a.trafficLog.Load(); w != nil {
+					w.Close(false)
+				}
 			},
 		},
+		RoutingProfileRefresh: a.routingProfileRefresh,
 	})
 	if err != nil {
 		return a.startError("gateway.start", err)
@@ -486,7 +650,7 @@ func (a *App) snapshotPtr() *GatewaySnapshot {
 }
 
 func (a *App) emitStatus() {
-	a.emitEvents(gatewayStatusEvent, a.snapshotPtr())
+	a.safeEmit(gatewayStatusEvent, a.snapshotPtr())
 }
 
 // invalidateStaleSession clears the session when the running gateway no longer

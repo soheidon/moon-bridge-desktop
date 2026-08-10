@@ -91,6 +91,7 @@ func ResourceDefinitions() []ResourceDefinition {
 			Fields: []FieldSchema{
 				stringField("base_url", "Base URL", true, false, "critical"),
 				stringField("api_key", "API Key", true, true, "critical"),
+				stringField("api_key_env", "API Key Environment Variable", true, false, "critical"),
 				stringField("version", "Version", true, false, "normal"),
 				stringField("user_agent", "User Agent", true, false, "normal"),
 				enumField("protocol", "Protocol", []string{"anthropic", "openai-response", "google-genai", "openai-chat"}, true, "critical"),

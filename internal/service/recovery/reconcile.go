@@ -126,6 +126,10 @@ func (c classification) PhasePtr() *Phase {
 //   - original: current hash == configHashBeforeApply (reverted)
 //   - neither:  external change during an active integration → conflict
 func (s *Store) classifyCur(cur *State, curHash string) classification {
+	if !IsKnownPhase(cur.Phase) {
+		return classification{Status: StatusPendingRestore, Phase: PhaseReconciliationReq,
+			Detail: "Recovery phase is not supported; explicit recovery handling is required"}
+	}
 	applied := cur.ConfigHashAfterApply != "" && curHash == cur.ConfigHashAfterApply
 	original := cur.ConfigHashBeforeApply != "" && curHash == cur.ConfigHashBeforeApply
 
@@ -164,6 +168,7 @@ func (s *Store) resolveConfigPath(st *State) (string, error) {
 	if stored == "" {
 		return "", &Error{Kind: KindConfigPathInvalid, Message: "recovery config path is empty"}
 	}
+	stored = stripVerbatimPrefix(stored)
 	if filepath.IsAbs(stored) {
 		if s.paths.CodexHome == "" {
 			return "", &Error{Kind: KindConfigPathChangedError, Message: "codex home is unavailable for legacy absolute path"}

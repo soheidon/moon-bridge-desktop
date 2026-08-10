@@ -15,6 +15,8 @@ import (
 
 	"moonbridge/internal/config"
 	"moonbridge/internal/db"
+	"moonbridge/internal/secretstore"
+	"moonbridge/internal/service/provider"
 )
 
 // SQLiteConfigStore implements ConfigStore backed by a SQLite database.
@@ -23,13 +25,73 @@ type SQLiteConfigStore struct {
 	logger         *slog.Logger
 	applyMu        sync.Mutex
 	extensionSpecs []config.ExtensionConfigSpec
+	codec          secretstore.SecretCodec
+	issueMu        sync.Mutex
+	issues         []provider.CredentialInfo
 }
 
 const graphRevisionSettingKey = "__graph_revision"
 
-// NewSQLiteStore creates a new SQLiteConfigStore.
-func NewSQLiteStore(s db.Store, logger *slog.Logger, extensionSpecs ...config.ExtensionConfigSpec) *SQLiteConfigStore {
-	return &SQLiteConfigStore{db: s, logger: logger, extensionSpecs: extensionSpecs}
+// NewSQLiteStore creates a new SQLiteConfigStore. It applies idempotent schema
+// migrations for pre-existing databases (e.g. adding the provider api_key_env
+// column) before returning.
+func NewSQLiteStore(s db.Store, logger *slog.Logger, extensionSpecs ...config.ExtensionConfigSpec) (*SQLiteConfigStore, error) {
+	store := &SQLiteConfigStore{db: s, logger: logger, extensionSpecs: extensionSpecs}
+	if err := store.migrateSchema(context.Background()); err != nil {
+		return nil, err
+	}
+	return store, nil
+}
+
+// SetCodec injects the secret codec used to encrypt provider API keys on write
+// and to migrate legacy plaintext keys on LoadAll. Without a codec, keys pass
+// through unchanged and no migration runs.
+func (s *SQLiteConfigStore) SetCodec(codec secretstore.SecretCodec) {
+	s.codec = codec
+}
+
+// LastMigrationIssues returns the provider credential issues recorded by the
+// most recent LoadAll migration (legacy plaintext keys that could not be
+// encrypted). It is a non-persistent runtime status.
+func (s *SQLiteConfigStore) LastMigrationIssues() []provider.CredentialInfo {
+	s.issueMu.Lock()
+	defer s.issueMu.Unlock()
+	return append([]provider.CredentialInfo(nil), s.issues...)
+}
+
+// migrateSchema brings a pre-existing database's providers table up to date.
+// The providers table historically had no api_key_env column (api_key_env was
+// dropped on every round-trip), so it is added idempotently via a PRAGMA check
+// rather than the unused schema_migrations table.
+func (s *SQLiteConfigStore) migrateSchema(ctx context.Context) error {
+	table := s.table("providers")
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return fmt.Errorf("inspect providers table: %w", err)
+	}
+	hasEnv := false
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan providers table_info: %w", err)
+		}
+		if name == "api_key_env" {
+			hasEnv = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close providers table_info: %w", err)
+	}
+	if hasEnv {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN api_key_env TEXT DEFAULT ''"); err != nil {
+		return fmt.Errorf("add api_key_env column: %w", err)
+	}
+	return nil
 }
 
 // Compile-time interface check.
@@ -55,6 +117,11 @@ func nowStr() string {
 // Clears existing data then writes settings, models, providers+offers, and routes.
 func (s *SQLiteConfigStore) SeedFromConfig(cfg *config.Config) error {
 	fc := cfg.ToFileConfig()
+	// Defensive: normalize should already have run at the graph boundary, but
+	// seeding must never persist a plaintext key.
+	if err := fc.NormalizeProviderSecrets(s.codec); err != nil {
+		return fmt.Errorf("seed config: normalize secrets: %w", err)
+	}
 	return s.db.WithTx(context.Background(), func(tx db.Tx) error {
 		revision, err := nextRevisionTx(context.Background(), tx)
 		if err != nil {
@@ -72,6 +139,11 @@ func (s *SQLiteConfigStore) SaveConfig(ctx context.Context, cfg *config.Config) 
 		return "", fmt.Errorf("save config: validate: %w", err)
 	}
 	fc := cfg.ToFileConfig()
+	// Defensive: normalize should already have run at the graph boundary, but a
+	// save must never persist a plaintext key.
+	if err := fc.NormalizeProviderSecrets(s.codec); err != nil {
+		return "", fmt.Errorf("save config: normalize secrets: %w", err)
+	}
 
 	var revision string
 	if err := s.db.WithTx(ctx, func(tx db.Tx) error {
@@ -168,9 +240,9 @@ func replaceConfigTx(ctx context.Context, tx db.Tx, fc config.FileConfig, revisi
 
 		if _, err := tx.ExecContext(ctx,
 			"INSERT OR REPLACE INTO "+providersTable+
-				" (key, base_url, api_key, version, protocol, enabled, user_agent, web_search, extensions, created_at, updated_at)"+
-				" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-			key, p.BaseURL, p.APIKey, p.Version, p.Protocol, 1, p.UserAgent,
+				" (key, base_url, api_key, api_key_env, version, protocol, enabled, user_agent, web_search, extensions, created_at, updated_at)"+
+				" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			key, p.BaseURL, p.APIKey, p.APIKeyEnv, p.Version, p.Protocol, 1, p.UserAgent,
 			string(wsJSON), string(extJSON), ts, ts); err != nil {
 			return fmt.Errorf("insert provider %s: %w", key, err)
 		}
@@ -347,6 +419,18 @@ func (s *SQLiteConfigStore) LoadAll() (*config.Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load file config: %w", err)
 	}
+	// Post-load legacy migration: encrypt any plaintext provider API keys left
+	// by older versions. Successful providers have their DB value replaced with
+	// ciphertext; failed providers keep their DB plaintext (recoverable) and are
+	// reported so callers can surface stored/unavailable instead of starting
+	// them with the plaintext.
+	issues, err := s.migrateLegacyPlaintextKeys(context.Background(), &fc)
+	if err != nil {
+		return nil, fmt.Errorf("migrate legacy plaintext keys: %w", err)
+	}
+	s.issueMu.Lock()
+	s.issues = issues
+	s.issueMu.Unlock()
 	if fc.Mode == "" {
 		return nil, fmt.Errorf("%w: mode is empty", ErrConfigNotSeeded)
 	}
@@ -355,6 +439,81 @@ func (s *SQLiteConfigStore) LoadAll() (*config.Config, error) {
 		return nil, fmt.Errorf("convert file config: %w", err)
 	}
 	return &cfg, nil
+}
+
+// migrateLegacyPlaintextKeys encrypts any legacy plaintext provider API keys in
+// a single transaction. Providers whose encryption succeeds have their DB value
+// replaced with ciphertext and their FileConfig key updated. Providers whose
+// encryption is impossible or fails keep the DB plaintext recoverable, but their
+// FileConfig key is cleared before the config graph is built. The issue records
+// the stored credential as unavailable so the provider cannot start with it. Key
+// values (plaintext or ciphertext) are never logged.
+func (s *SQLiteConfigStore) migrateLegacyPlaintextKeys(ctx context.Context, fc *config.FileConfig) ([]provider.CredentialInfo, error) {
+	var issues []provider.CredentialInfo
+	if s.codec == nil {
+		for key, p := range fc.Providers {
+			if p.APIKey == "" || secretstore.IsCiphertext(p.APIKey) {
+				continue
+			}
+			p.APIKey = ""
+			fc.Providers[key] = p
+			issues = append(issues, provider.CredentialInfo{
+				ProviderID: key,
+				Source:     provider.SourceStored,
+				State:      provider.StateUnavailable,
+				ErrorCode:  provider.ErrCodeUnsupportedPlatform,
+			})
+		}
+		return issues, nil
+	}
+	type migratedKey struct {
+		key    string
+		cipher string
+	}
+	var succeeded []migratedKey
+	for key, p := range fc.Providers {
+		if p.APIKey == "" || secretstore.IsCiphertext(p.APIKey) {
+			continue
+		}
+		issue := provider.CredentialInfo{
+			ProviderID: key,
+			Source:     provider.SourceStored,
+			State:      provider.StateUnavailable,
+		}
+		if !s.codec.Supported() {
+			issue.ErrorCode = provider.ErrCodeUnsupportedPlatform
+			p.APIKey = ""
+			fc.Providers[key] = p
+			issues = append(issues, issue)
+			continue
+		}
+		cipher, err := secretstore.EncryptIfPlaintext(s.codec, p.APIKey)
+		if err != nil {
+			issue.ErrorCode = provider.ErrCodeMigrationFailed
+			p.APIKey = ""
+			fc.Providers[key] = p
+			issues = append(issues, issue)
+			continue
+		}
+		p.APIKey = cipher
+		fc.Providers[key] = p
+		succeeded = append(succeeded, migratedKey{key: key, cipher: cipher})
+	}
+	if len(succeeded) == 0 {
+		return issues, nil
+	}
+	table := s.table("providers")
+	if err := s.db.WithTx(ctx, func(tx db.Tx) error {
+		for _, m := range succeeded {
+			if _, err := tx.ExecContext(ctx, "UPDATE "+table+" SET api_key = ? WHERE key = ?", m.cipher, m.key); err != nil {
+				return fmt.Errorf("migrate provider %s api_key: %w", m.key, err)
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return issues, nil
 }
 
 func (s *SQLiteConfigStore) loadFileConfig() (config.FileConfig, error) {
@@ -408,21 +567,22 @@ func (s *SQLiteConfigStore) loadFileConfig() (config.FileConfig, error) {
 	fc.Providers = make(map[string]config.ProviderDefFileConfig)
 	providersTable := s.table("providers")
 	prows, err := s.db.QueryContext(context.Background(),
-		"SELECT key, base_url, api_key, version, protocol, enabled, user_agent, web_search, extensions FROM "+providersTable)
+		"SELECT key, base_url, api_key, api_key_env, version, protocol, enabled, user_agent, web_search, extensions FROM "+providersTable)
 	if err != nil {
 		return fc, fmt.Errorf("query providers: %w", err)
 	}
 	defer prows.Close()
 	for prows.Next() {
-		var key, baseURL, apiKey, version, protocol, userAgent string
+		var key, baseURL, apiKey, apiKeyEnv, version, protocol, userAgent string
 		var enabled int
 		var webSearchStr, extensionsStr sql.NullString
-		if err := prows.Scan(&key, &baseURL, &apiKey, &version, &protocol, &enabled, &userAgent, &webSearchStr, &extensionsStr); err != nil {
+		if err := prows.Scan(&key, &baseURL, &apiKey, &apiKeyEnv, &version, &protocol, &enabled, &userAgent, &webSearchStr, &extensionsStr); err != nil {
 			return fc, fmt.Errorf("scan provider: %w", err)
 		}
 		p := config.ProviderDefFileConfig{
 			BaseURL:   baseURL,
 			APIKey:    apiKey,
+			APIKeyEnv: apiKeyEnv,
 			Version:   version,
 			Protocol:  protocol,
 			UserAgent: userAgent,
@@ -705,6 +865,10 @@ func (s *SQLiteConfigStore) upsertResourceTx(ctx context.Context, tx db.Tx, reso
 		if err != nil {
 			return err
 		}
+		// Defensive: never persist a plaintext provider key.
+		if err := normalizeProviderKeyField(s.codec, fields); err != nil {
+			return err
+		}
 		var count int
 		tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table+" WHERE key = ?", key).Scan(&count)
 		if count > 0 {
@@ -712,6 +876,7 @@ func (s *SQLiteConfigStore) upsertResourceTx(ctx context.Context, tx db.Tx, reso
 			args := []any{}
 			addField(&setClauses, &args, "base_url", fields)
 			addField(&setClauses, &args, "api_key", fields)
+			addField(&setClauses, &args, "api_key_env", fields)
 			addField(&setClauses, &args, "version", fields)
 			addField(&setClauses, &args, "protocol", fields)
 			addField(&setClauses, &args, "user_agent", fields)
@@ -736,10 +901,11 @@ func (s *SQLiteConfigStore) upsertResourceTx(ctx context.Context, tx db.Tx, reso
 			}
 		} else {
 			if _, err := tx.ExecContext(ctx,
-				"INSERT INTO "+table+" (key, base_url, api_key, version, protocol, enabled, user_agent, web_search, extensions, created_at, updated_at)"+
-					" VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
+				"INSERT INTO "+table+" (key, base_url, api_key, api_key_env, version, protocol, enabled, user_agent, web_search, extensions, created_at, updated_at)"+
+					" VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
 				key, stringField(fields, "base_url"), stringField(fields, "api_key"),
-				stringField(fields, "version"), stringField(fields, "protocol"),
+				stringField(fields, "api_key_env"), stringField(fields, "version"),
+				stringField(fields, "protocol"),
 				stringField(fields, "user_agent"), stringField(fields, "web_search"),
 				stringField(fields, "extensions"), ts, ts); err != nil {
 				return fmt.Errorf("insert provider %s: %w", key, err)
@@ -928,6 +1094,28 @@ func addField(clauses *[]string, args *[]any, name string, fields map[string]any
 		*clauses = append(*clauses, name+" = ?")
 		*args = append(*args, v)
 	}
+}
+
+// normalizeProviderKeyField encrypts a provider api_key field before it is
+// written. It is a no-op when the codec is nil or the value is already
+// ciphertext (no double encryption).
+func normalizeProviderKeyField(codec secretstore.SecretCodec, fields map[string]any) error {
+	raw, ok := fields["api_key"]
+	if !ok || codec == nil {
+		return nil
+	}
+	key, ok := raw.(string)
+	if !ok {
+		return nil
+	}
+	encrypted, err := secretstore.EncryptIfPlaintext(codec, key)
+	if err != nil {
+		return fmt.Errorf("encrypt provider api_key: %w", err)
+	}
+	if encrypted != key {
+		fields["api_key"] = encrypted
+	}
+	return nil
 }
 
 func stringField(fields map[string]any, key string) string {
