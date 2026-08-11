@@ -196,6 +196,23 @@ exact source model
 
 誤providerへ送るより解決失敗を優先する。
 
+## 10. Routing profiles and reasoning policy
+
+The routing-profile extension is authoritative when present: `config.active_profile` is the only active-profile source. The exact picker IDs are `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`; suffixes and case variants do not match.
+
+The resolved slot keeps its slot ID, active-profile identity, provider, upstream model, mode, and reasoning override through ProviderManager and adapter dispatch. A normal slot sets typed `thinking.type=disabled` and clears only the typed effort field. A thinking slot sets `thinking.type=enabled` and canonicalizes `low|medium|high` to `high` and `xhigh|max` to `max`.
+
+For DeepSeek V4's Anthropic compatibility, `budget_tokens` is not a control field: the provider documents it as accepted but ignored. The supported observable contract is `thinking.type` plus `output_config.effort`. Invalid mode or effort fails before provider conversion and transport.
+
+## 11. Internal observability boundary
+
+After JSON decode, Gateway creates an in-process correlation key. Traffic Analysis aliases it to `req#N` and the active profile to `profile#N`; raw values never enter headers, public APIs, DTOs, autosave, errors, or trace output. Two structured event kinds use the existing bounded ring:
+
+- `routing_resolved`: requested model, slot/profile alias, provider, upstream model, mode, configured effort.
+- `provider_request_prepared`: provider/protocol/final model and typed thinking/effective effort after provider conversion.
+
+Trace remains the full-payload diagnostic channel. Traffic Analysis remains the secret-safe user-facing channel.
+
 ## 9. Provider resolution
 
 基本方針:

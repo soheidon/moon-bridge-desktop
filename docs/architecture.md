@@ -87,6 +87,10 @@ flowchart TB
 - `internal/service/store` — 配置持久化存储（SQLite / D1）
 - `internal/service/runtime` — 运行时上下文
 
+#### Routing observability boundary
+
+Gateway emits two secret-safe structured events into the existing Traffic Analysis ring: `routing_resolved` immediately after slot/provider selection and `provider_request_prepared` immediately after typed provider conversion. A context-local opaque key correlates the pair; Traffic Analysis exposes only session-local `req#N` and `profile#N` aliases. This path is separate from full-payload Trace and never adds response headers or raw-body persistence.
+
 ### Extension 层
 
 可插拔的功能扩展，位于 `internal/extension/`：

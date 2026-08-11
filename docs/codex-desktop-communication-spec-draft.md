@@ -464,6 +464,12 @@ HIST-01の観測で、複数POST・複数ターンの`response_id_aliases`に同
 
 `protocolEvents`で確認済みのevent typeだけをliteralで出力する。未知event typeは常に固定文字列`unknown`へ分類し、raw event type、HMAC、digest、cross-event correlationを保存・DTO/autosave/frontend出力しない。
 
+## 15.10 Moon Bridge routing observability
+
+The picker model is an exact request field, not a promise that the same name is sent upstream. Moon Bridge resolves it to a routing slot and keeps that provenance through provider conversion. Traffic Analysis may show only the allowlisted requested model, slot, provider/upstream labels, and typed thinking/effort state; it never exposes Codex authorization, cookies, prompt content, tool content, raw bodies, or response IDs. The two internal events are correlated by a session-local `req#N` alias.
+
+The final acceptance path uses a loopback mock provider and the network contract (`POST /responses`, including streaming when selected by the fixture), so an external Codex Desktop session and credential-backed API call are not required.
+
 ## 16. 更新条件
 
 次を確認した時点で更新する。

@@ -24,7 +24,8 @@
 
 ## Active plan
 
-- The approved active plan is `docs/plans/plan-3s-crash-recovery.md`.
+- `docs/plans/plan-routing-observability-and-thinking-correctness.md` is complete and is no longer the active implementation plan.
+- `docs/plans/plan-3s-crash-recovery.md` is complete and is no longer the active implementation plan.
 - `docs/plans/plan-3-traffic-analysis.md` remains approved but is not the active implementation plan; its live Codex Desktop feasibility experiment is still pending.
 - `docs/plans/plan-3.md` is superseded by the traffic-analysis plan. Its launcher implementation remains in the worktree only as inactive legacy code until a later cleanup plan removes it.
 - `docs/plans/plan-2b.md` remains the completed prior implementation plan with manual credential-backed acceptance still recorded as pending.

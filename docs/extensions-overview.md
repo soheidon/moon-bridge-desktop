@@ -100,6 +100,10 @@ var (
 
 插件的 `EnabledForModel` 函数通过 `Config.ExtensionEnabled("deepseek_v4", model)` 检查模型别名是否启用该 extension。
 
+### Routing profile thinking contract
+
+The Gateway applies an explicit routing policy before provider conversion. `normal` is represented as typed `thinking.type=disabled`; `thinking` is represented as `enabled` with a validated `output_config.effort`. The DeepSeek plugin preserves explicit policy, is safe to invoke repeatedly, and does not create `budget_tokens` or a duplicate `Extensions["thinking"]` field. When no explicit policy exists, the plugin keeps DeepSeek's default enabled thinking without a token budget.
+
 ---
 
 ## web_search_injected（注入式 Web Search 模块）
