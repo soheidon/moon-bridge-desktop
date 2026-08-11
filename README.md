@@ -173,8 +173,6 @@ Internal provider and integration tests outside the supported DeepSeek scope are
 
 ## Development Status
 
-Moon Bridge Desktop is under active development.
-
 The next development phase will focus on:
 
 * Simpler Gateway and ChatGPT desktop app Codex startup behavior
