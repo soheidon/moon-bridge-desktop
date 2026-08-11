@@ -35,6 +35,12 @@ const (
 // always discarded, and the header never reaches traces or the upstream.
 const RelayMarkerHeader = "X-Moonbridge-Relay"
 
+// RequestCorrelationHeader is an internal loopback-only bridge from the
+// Capture request observation to the Gateway event context. Capture removes
+// any client-supplied value, stamps a short-lived local key, and Gateway
+// consumes it before tracing or provider dispatch.
+const RequestCorrelationHeader = "X-Moonbridge-Request"
+
 type CaptureConfig struct {
 	ListenAddr      string
 	UpstreamBase    string
@@ -97,6 +103,7 @@ type CaptureProxy struct {
 	sseCount            uint64
 	wsCount             uint64
 	droppedBackpressure uint64
+	requestSequence     uint64
 
 	connections map[*websocket.Conn]struct{}
 
@@ -364,6 +371,22 @@ func (p *CaptureProxy) Observations(after uint64) ([]Observation, uint64) {
 	return items, dropped + droppedBackpressure
 }
 
+// RecordGatewayEvent records a secret-safe internal event in the same ring as
+// payload observations. It is a no-op while paused or after shutdown.
+func (p *CaptureProxy) RecordGatewayEvent(input GatewayEventInput) {
+	p.observationGate.RLock()
+	defer p.observationGate.RUnlock()
+	if !p.recording.Load() {
+		return
+	}
+	p.mu.Lock()
+	analyzer := p.analyzer
+	p.mu.Unlock()
+	if analyzer != nil {
+		analyzer.RecordGatewayEvent(input)
+	}
+}
+
 func (p *CaptureProxy) Clear() {
 	p.mu.Lock()
 	analyzer := p.analyzer
@@ -468,10 +491,14 @@ func (p *CaptureProxy) serveHTTPForward(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	requestPath := r.URL.EscapedPath()
+	correlationKey := fmt.Sprintf("capture-request-%d", atomic.AddUint64(&p.requestSequence, 1))
+	inputHeaders := r.Header.Clone()
+	inputHeaders.Del(RequestCorrelationHeader)
 	requestInput := PayloadInput{Direction: DirectionClientToUpstream, Transport: TransportHTTP, Method: r.Method,
 		RequestModelEligible: r.Method == http.MethodPost && (requestPath == "/responses" || requestPath == "/v1/responses"),
+		CorrelationKey:       correlationKey,
 		ReceivedHost:         r.Host, ReceivedPath: requestPath, UpstreamHost: upstream.Host, UpstreamPath: upstream.EscapedPath(),
-		QueryParameterNames: queryNames(r.URL), Headers: r.Header, ContentType: r.Header.Get("Content-Type"), ContentEncoding: r.Header.Get("Content-Encoding")}
+		QueryParameterNames: queryNames(r.URL), Headers: inputHeaders, ContentType: r.Header.Get("Content-Type"), ContentEncoding: r.Header.Get("Content-Encoding")}
 	body := r.Body
 	if body == nil {
 		body = http.NoBody
@@ -493,9 +520,11 @@ func (p *CaptureProxy) serveHTTPForward(w http.ResponseWriter, r *http.Request, 
 	// client value, so it is stripped first and exactly one Capture-generated
 	// value is set when the relay owns a gateway identity.
 	outgoing.Header.Del(RelayMarkerHeader)
+	outgoing.Header.Del(RequestCorrelationHeader)
 	if p.config.InstanceID != "" {
 		outgoing.Header.Set(RelayMarkerHeader, p.config.InstanceID)
 	}
+	outgoing.Header.Set(RequestCorrelationHeader, correlationKey)
 	if requestTap != nil {
 		outgoing.Body = requestTap
 	} else {
@@ -525,7 +554,7 @@ func (p *CaptureProxy) serveHTTPForward(w http.ResponseWriter, r *http.Request, 
 			_, _ = io.Copy(flushingWriter{ResponseWriter: w}, response.Body)
 			return
 		}
-		relay := newSSERelay(p, analyzer, response.Body, w, r, upstream, response.StatusCode, response.Header)
+		relay := newSSERelay(p, analyzer, response.Body, w, r, upstream, response.StatusCode, response.Header, correlationKey)
 		_ = relay.copy()
 		return
 	}
@@ -533,7 +562,7 @@ func (p *CaptureProxy) serveHTTPForward(w http.ResponseWriter, r *http.Request, 
 		_, _ = io.Copy(flushingWriter{ResponseWriter: w}, response.Body)
 		return
 	}
-	responseInput := PayloadInput{Direction: DirectionUpstreamToClient, Transport: TransportHTTP, Method: r.Method,
+	responseInput := PayloadInput{Direction: DirectionUpstreamToClient, Transport: TransportHTTP, Method: r.Method, CorrelationKey: correlationKey,
 		ReceivedHost: r.Host, ReceivedPath: r.URL.EscapedPath(), UpstreamHost: upstream.Host, UpstreamPath: upstream.EscapedPath(),
 		QueryParameterNames: queryNames(r.URL), Headers: response.Header, StatusCode: response.StatusCode,
 		ContentType: response.Header.Get("Content-Type"), ContentEncoding: response.Header.Get("Content-Encoding")}
@@ -754,24 +783,29 @@ func (w *wsWriter) control(kind int, payload []byte) error {
 }
 
 type sseRelay struct {
-	proxy    *CaptureProxy
-	analyzer *Analyzer
-	reader   io.Reader
-	writer   http.ResponseWriter
-	request  *http.Request
-	upstream *url.URL
-	status   int
-	headers  http.Header
-	pending  []byte
-	event    string
-	data     []byte
-	hasData  bool
-	hmac     hash.Hash
-	size     int
+	proxy          *CaptureProxy
+	analyzer       *Analyzer
+	reader         io.Reader
+	writer         http.ResponseWriter
+	request        *http.Request
+	upstream       *url.URL
+	status         int
+	headers        http.Header
+	correlationKey string
+	pending        []byte
+	event          string
+	data           []byte
+	hasData        bool
+	hmac           hash.Hash
+	size           int
 }
 
-func newSSERelay(proxy *CaptureProxy, analyzer *Analyzer, reader io.Reader, writer http.ResponseWriter, request *http.Request, upstream *url.URL, status int, headers http.Header) *sseRelay {
-	return &sseRelay{proxy: proxy, analyzer: analyzer, reader: reader, writer: writer, request: request, upstream: upstream, status: status, headers: headers, hmac: hmac.New(sha256.New, analyzer.key)}
+func newSSERelay(proxy *CaptureProxy, analyzer *Analyzer, reader io.Reader, writer http.ResponseWriter, request *http.Request, upstream *url.URL, status int, headers http.Header, correlationKeys ...string) *sseRelay {
+	correlationKey := ""
+	if len(correlationKeys) > 0 {
+		correlationKey = correlationKeys[0]
+	}
+	return &sseRelay{proxy: proxy, analyzer: analyzer, reader: reader, writer: writer, request: request, upstream: upstream, status: status, headers: headers, correlationKey: correlationKey, hmac: hmac.New(sha256.New, analyzer.key)}
 }
 func (s *sseRelay) copy() error {
 	buf := make([]byte, 32*1024)
@@ -841,7 +875,7 @@ func (s *sseRelay) finish(partial bool) {
 	if !s.hasData && s.event == "" {
 		return
 	}
-	input := PayloadInput{Direction: DirectionUpstreamToClient, Transport: TransportSSE, Method: s.request.Method, ReceivedHost: s.request.Host, ReceivedPath: s.request.URL.EscapedPath(), UpstreamHost: s.upstream.Host, UpstreamPath: s.upstream.EscapedPath(), QueryParameterNames: queryNames(s.request.URL), Headers: s.headers, ContentType: "text/event-stream", StatusCode: s.status, SSEEventType: s.event, Partial: partial}
+	input := PayloadInput{Direction: DirectionUpstreamToClient, Transport: TransportSSE, Method: s.request.Method, CorrelationKey: s.correlationKey, ReceivedHost: s.request.Host, ReceivedPath: s.request.URL.EscapedPath(), UpstreamHost: s.upstream.Host, UpstreamPath: s.upstream.EscapedPath(), QueryParameterNames: queryNames(s.request.URL), Headers: s.headers, ContentType: "text/event-stream", StatusCode: s.status, SSEEventType: s.event, Partial: partial}
 	s.proxy.enqueue(s.analyzer, input, s.data, s.size, hex.EncodeToString(s.hmac.Sum(nil)))
 	s.event = ""
 	s.data = s.data[:0]

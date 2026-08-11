@@ -19,6 +19,7 @@ import (
 	"moonbridge/internal/protocol/anthropic"
 	"moonbridge/internal/protocol/openai"
 	"moonbridge/internal/service/provider"
+	"moonbridge/internal/service/trafficanalysis"
 )
 
 type exactTrafficMapping struct {
@@ -29,6 +30,14 @@ type exactTrafficMapping struct {
 }
 
 type routingRoundTripFunc func(*http.Request) (*http.Response, error)
+
+type routingEventSink struct {
+	events []trafficanalysis.GatewayEventInput
+}
+
+func (s *routingEventSink) RecordGatewayEvent(event trafficanalysis.GatewayEventInput) {
+	s.events = append(s.events, event)
+}
 
 func (fn routingRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return fn(req)
@@ -319,6 +328,39 @@ func TestLunaPayloadControlNoOverride(t *testing.T) {
 	}
 	if payload.Thinking == nil || payload.Thinking.Type != "enabled" || payload.Thinking.BudgetTokens != 0 {
 		t.Fatalf("control: thinking = %+v, want enabled without budget", payload.Thinking)
+	}
+}
+
+func TestRoutingObservationEmitsCorrelatedSafeEvents(t *testing.T) {
+	var calls int
+	transport := routingRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"id":"msg-observe","type":"message","role":"assistant","model":"deepseek-v4-flash","content":[],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))}, nil
+	})
+	pm, err := provider.NewProviderManager(map[string]provider.ProviderConfig{"deepseek": {BaseURL: "https://deepseek.example.test", APIKeyEnv: "DEEPSEEK_API_KEY", ClientOverride: &http.Client{Transport: transport}}}, nil, newTestCredentialResolver())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &routingEventSink{}
+	mapping := &exactTrafficMapping{target: "deepseek-v4-flash", ok: true}
+	handler := New(Config{AdapterRegistry: newRoutingTestAdapterRegistry(t), ProviderMgr: pm, TrafficRouting: mapping, RoutingObservationSink: sink, RoutingProfileResolver: &stubSlotResolver{slots: map[string]RoutingProfileSlotResult{"gpt-5.6-luna": {SlotID: "luna", ActiveProfileID: "deepseek", ProviderKey: "deepseek", UpstreamModel: "deepseek-v4-flash", Mode: "normal"}}}})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`{"model":"gpt-5.6-luna","reasoning":{"effort":"medium"},"input":"hello"}`)))
+	if response.Code != http.StatusOK || calls != 1 {
+		t.Fatalf("status=%d calls=%d body=%s", response.Code, calls, response.Body.String())
+	}
+	if len(sink.events) != 2 || sink.events[0].Kind != trafficanalysis.ObservationRoutingResolved || sink.events[1].Kind != trafficanalysis.ObservationProviderRequestPrepared {
+		t.Fatalf("events = %#v, want routing/prepared pair", sink.events)
+	}
+	if sink.events[0].CorrelationKey == "" || sink.events[0].CorrelationKey != sink.events[1].CorrelationKey {
+		t.Fatalf("correlation = %#v", sink.events)
+	}
+	if len(mapping.source) != 0 {
+		t.Fatalf("traffic fallback was consulted before exact routing slot: %#v", mapping.source)
+	}
+	prepared := sink.events[1]
+	if prepared.RequestedModel != "gpt-5.6-luna" || prepared.RoutingSlot != "luna" || prepared.Mode != "normal" || prepared.Provider != "deepseek" || prepared.UpstreamModel != "deepseek-v4-flash" || prepared.Thinking != "disabled" {
+		t.Fatalf("prepared provenance = %#v", prepared)
 	}
 }
 

@@ -98,6 +98,21 @@ type captureProxy interface {
 	StateFailed() bool
 }
 
+// RecordGatewayEvent is the optional observation sink used by Gateway. It is
+// deliberately not part of captureProxy so deterministic fakes need not know
+// about gateway internals.
+func (s *Service) RecordGatewayEvent(input GatewayEventInput) {
+	s.mu.Lock()
+	proxy := s.proxy
+	s.mu.Unlock()
+	if proxy == nil {
+		return
+	}
+	if recorder, ok := proxy.(interface{ RecordGatewayEvent(GatewayEventInput) }); ok {
+		recorder.RecordGatewayEvent(input)
+	}
+}
+
 type proxyFactory func(CaptureConfig) captureProxy
 
 type closeOperation struct {

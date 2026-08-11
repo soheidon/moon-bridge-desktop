@@ -91,8 +91,10 @@ func TestCaptureHTTPForwardsPayloadAndSanitizesObservation(t *testing.T) {
 
 func TestCaptureStampsSingleRelayMarkerAndRejectsClientSpoof(t *testing.T) {
 	var markerValues []string
+	var correlationValues []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		markerValues = r.Header.Values(RelayMarkerHeader)
+		correlationValues = r.Header.Values(RequestCorrelationHeader)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
@@ -123,6 +125,9 @@ func TestCaptureStampsSingleRelayMarkerAndRejectsClientSpoof(t *testing.T) {
 	if len(markerValues) != 1 || markerValues[0] != "gateway-1" {
 		t.Fatalf("upstream marker = %v, want [gateway-1]", markerValues)
 	}
+	if len(correlationValues) != 1 || !strings.HasPrefix(correlationValues[0], "capture-request-") {
+		t.Fatalf("upstream request correlation = %v, want one Capture-generated local key", correlationValues)
+	}
 
 	// Without an InstanceID the Capture strips any client marker and adds none.
 	markerValues = nil
@@ -147,6 +152,47 @@ func TestCaptureStampsSingleRelayMarkerAndRejectsClientSpoof(t *testing.T) {
 	}
 	if len(markerValues) != 0 {
 		t.Fatalf("upstream marker without InstanceID = %v, want none", markerValues)
+	}
+	if len(correlationValues) != 1 || !strings.HasPrefix(correlationValues[0], "capture-request-") {
+		t.Fatalf("upstream request correlation without InstanceID = %v, want one Capture-generated local key", correlationValues)
+	}
+}
+
+func TestCapturePayloadAndGatewayCorrelationUsesOneRequestAlias(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+	proxy := NewCaptureProxy(CaptureConfig{ListenAddr: "127.0.0.1:0", UpstreamBase: upstream.URL, QueueSize: 16})
+	defer proxy.Close()
+	if err := proxy.Start(); err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, "http://"+proxy.Status().CaptureAddress+"/responses", strings.NewReader(`{"model":"gpt-5.6-luna","input":"smoke"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	items := waitForObservations(t, proxy, 2)
+	var requestAlias string
+	for _, item := range items {
+		if item.Direction == DirectionClientToUpstream {
+			requestAlias = item.RequestID
+		}
+	}
+	if requestAlias == "" || !strings.HasPrefix(requestAlias, "req#") {
+		t.Fatalf("capture request alias = %q, want req#N", requestAlias)
+	}
+	for _, item := range items {
+		if item.RequestID != requestAlias {
+			t.Fatalf("observation aliases = %q and %q, want one request alias", requestAlias, item.RequestID)
+		}
 	}
 }
 

@@ -441,11 +441,16 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer, opti
 	// Build routing profile slot resolver from the config graph snapshot.
 	slotResolver := buildSlotResolver(cfg)
 
+	var routingObservationSink server.RoutingObservationSink
+	if sink, ok := options.Traffic.(server.RoutingObservationSink); ok {
+		routingObservationSink = sink
+	}
 	handler := server.New(server.Config{
 		ServerCfg:              serverCfg,
 		Provider:               fallbackProvider,
 		ProviderMgr:            providerMgr,
 		TrafficRouting:         options.Traffic,
+		RoutingObservationSink: routingObservationSink,
 		RoutingProfileResolver: &routingProfileResolverAdapter{resolver: slotResolver},
 		ChatClients:            chatClients,
 		GoogleClients:          googleClients,

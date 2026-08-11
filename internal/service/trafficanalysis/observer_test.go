@@ -567,6 +567,45 @@ func TestRingBufferSnapshotsAndCapacity(t *testing.T) {
 	}
 }
 
+func TestGatewayEventsAliasAndSanitizeWithoutRawKeys(t *testing.T) {
+	analyzer, err := NewAnalyzer(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := analyzer.RecordGatewayEvent(GatewayEventInput{Kind: ObservationRoutingResolved, CorrelationKey: "opaque-request-secret", ProfileID: "profile-secret", RequestedModel: "gpt-5.6-luna", RoutingSlot: "luna", Provider: "deepseek", UpstreamModel: "deepseek-v4-flash", Mode: "normal", ConfiguredEffort: ""})
+	second := analyzer.RecordGatewayEvent(GatewayEventInput{Kind: ObservationProviderRequestPrepared, CorrelationKey: "opaque-request-secret", ProfileID: "profile-secret", Provider: "deepseek", Protocol: "anthropic", Model: "deepseek-v4-flash", Thinking: "disabled"})
+	if first.GatewayEvent == nil || second.GatewayEvent == nil || first.GatewayEvent.RequestAlias != second.GatewayEvent.RequestAlias {
+		t.Fatalf("event aliases = %#v / %#v, want correlated", first.GatewayEvent, second.GatewayEvent)
+	}
+	if first.GatewayEvent.ActiveProfile != "profile#1" {
+		t.Fatalf("profile alias = %q, want profile#1", first.GatewayEvent.ActiveProfile)
+	}
+	encoded, err := json.Marshal(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(encoded)
+	for _, sentinel := range []string{"opaque-request-secret", "profile-secret", "Authorization", "api-key"} {
+		if strings.Contains(text, sentinel) {
+			t.Fatalf("serialized event contains sentinel %q: %s", sentinel, text)
+		}
+	}
+	if first.Kind != ObservationRoutingResolved || second.Kind != ObservationProviderRequestPrepared {
+		t.Fatalf("kinds = %q / %q", first.Kind, second.Kind)
+	}
+	payload := analyzer.Record(PayloadInput{CorrelationKey: "opaque-request-secret", RequestModelEligible: true, Payload: []byte(`{"model":"gpt-5.6-luna"}`), ContentType: "application/json"})
+	if payload.RequestID != first.GatewayEvent.RequestAlias {
+		t.Fatalf("payload request alias = %q, gateway alias = %q", payload.RequestID, first.GatewayEvent.RequestAlias)
+	}
+	encoded, err = json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "opaque-request-secret") {
+		t.Fatalf("payload serialized raw correlation key: %s", encoded)
+	}
+}
+
 func TestHeaderSummaryNeverCopiesSensitiveValues(t *testing.T) {
 	observation := analyzePayload([]byte("key"), PayloadInput{Headers: http.Header{
 		"Authorization":          {"Bearer SENTINEL_AUTH_SECRET"},

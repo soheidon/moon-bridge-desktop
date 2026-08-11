@@ -232,6 +232,7 @@ func (s *Server) handleWithAdapters(
 		writeOpenAIError(w, http.StatusInternalServerError, payload)
 		return
 	}
+	s.recordProviderRequestPrepared(ctx, openAIReq.Model, preferred, upstreamAny)
 	// Protocol-specific type assertion and upstream call.
 	var coreResp *format.CoreResponse
 	switch preferred.Protocol {

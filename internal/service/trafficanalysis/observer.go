@@ -61,6 +61,14 @@ const (
 	PayloadUnknown PayloadKind = "unknown"
 )
 
+type ObservationKind string
+
+const (
+	ObservationPayload                 ObservationKind = "payload"
+	ObservationRoutingResolved         ObservationKind = "routing_resolved"
+	ObservationProviderRequestPrepared ObservationKind = "provider_request_prepared"
+)
+
 type DecodingStatus string
 
 const (
@@ -85,8 +93,11 @@ const (
 // PayloadInput is the sanitized analyzer input contract. Payload is read by
 // the caller and is never retained after Record returns.
 type PayloadInput struct {
-	Direction             Direction
-	Transport             Transport
+	Direction Direction
+	Transport Transport
+	// CorrelationKey is an in-process Capture-to-Gateway bridge. It is mapped
+	// to the session-local req#N alias and is never serialized or logged raw.
+	CorrelationKey        string
 	Method                string
 	ReceivedHost          string
 	ReceivedPath          string
@@ -107,7 +118,27 @@ type PayloadInput struct {
 	hasRawPayloadOverride bool
 }
 
+// GatewayEventInput is the internal, non-payload observation contract. Raw
+// correlation/profile values are accepted only for in-process aliasing and are
+// never serialized.
+type GatewayEventInput struct {
+	Kind             ObservationKind `json:"kind"`
+	CorrelationKey   string          `json:"-"`
+	ProfileID        string          `json:"-"`
+	RequestedModel   string          `json:"requestedModel,omitempty"`
+	RoutingSlot      string          `json:"routingSlot,omitempty"`
+	Provider         string          `json:"provider,omitempty"`
+	UpstreamModel    string          `json:"upstreamModel,omitempty"`
+	Mode             string          `json:"mode,omitempty"`
+	ConfiguredEffort string          `json:"configuredEffort,omitempty"`
+	Protocol         string          `json:"protocol,omitempty"`
+	Model            string          `json:"model,omitempty"`
+	Thinking         string          `json:"thinking,omitempty"`
+	EffectiveEffort  string          `json:"effectiveEffort,omitempty"`
+}
+
 type Observation struct {
+	Kind                   ObservationKind      `json:"kind"`
 	Sequence               uint64               `json:"sequence"`
 	SessionID              string               `json:"sessionId"`
 	ConnectionID           string               `json:"connectionId,omitempty"`
@@ -140,6 +171,22 @@ type Observation struct {
 	Disposition            Disposition          `json:"disposition"`
 	ErrorClass             string               `json:"errorClass,omitempty"`
 	Usage                  *UsageSummary        `json:"usage,omitempty"`
+	GatewayEvent           *GatewayEventSummary `json:"gatewayEvent,omitempty"`
+}
+
+type GatewayEventSummary struct {
+	RequestAlias     string `json:"requestAlias"`
+	RequestedModel   string `json:"requestedModel,omitempty"`
+	RoutingSlot      string `json:"routingSlot,omitempty"`
+	ActiveProfile    string `json:"activeProfile,omitempty"`
+	Provider         string `json:"provider,omitempty"`
+	UpstreamModel    string `json:"upstreamModel,omitempty"`
+	Mode             string `json:"mode,omitempty"`
+	ConfiguredEffort string `json:"configuredEffort,omitempty"`
+	Protocol         string `json:"protocol,omitempty"`
+	Model            string `json:"model,omitempty"`
+	Thinking         string `json:"thinking,omitempty"`
+	EffectiveEffort  string `json:"effectiveEffort,omitempty"`
 }
 
 type HeaderSummary struct {
@@ -234,12 +281,16 @@ type UsageSummary struct {
 const maxUsageTokens = 1_000_000_000
 
 type Analyzer struct {
-	key       []byte
-	session   string
-	buffer    *RingBuffer
-	aliasMu   sync.Mutex
-	aliases   map[string]string
-	nextAlias uint64
+	key              []byte
+	session          string
+	buffer           *RingBuffer
+	aliasMu          sync.Mutex
+	aliases          map[string]string
+	nextAlias        uint64
+	requestAliases   map[string]string
+	profileAliases   map[string]string
+	nextRequestAlias uint64
+	nextProfileAlias uint64
 }
 
 // NewAnalyzer creates a session-scoped analyzer. The HMAC key is held only in
@@ -252,7 +303,7 @@ func NewAnalyzer(capacity int) (*Analyzer, error) {
 	if _, err := io.ReadFull(rand.Reader, key); err != nil {
 		return nil, fmt.Errorf("generate analysis key: %w", err)
 	}
-	return &Analyzer{key: key, session: uuid.NewString(), buffer: NewRingBuffer(capacity), aliases: make(map[string]string)}, nil
+	return &Analyzer{key: key, session: uuid.NewString(), buffer: NewRingBuffer(capacity), aliases: make(map[string]string), requestAliases: make(map[string]string), profileAliases: make(map[string]string)}, nil
 }
 
 // String and GoString prevent accidental formatting of the private HMAC key.
@@ -263,6 +314,7 @@ func (a *Analyzer) SessionID() string { return a.session }
 
 func (a *Analyzer) Record(input PayloadInput) Observation {
 	obs := analyzePayload(a.key, input)
+	obs.Kind = ObservationPayload
 	obs.Identifiers = a.aliasIdentifiers(obs.Identifiers)
 	if obs.PayloadShape != nil {
 		a.aliasInputFingerprints(obs.PayloadShape.InputItemFingerprints)
@@ -270,8 +322,80 @@ func (a *Analyzer) Record(input PayloadInput) Observation {
 	obs.SessionID = a.session
 	obs.Timestamp = time.Now().UTC()
 	obs.ConnectionID = a.hmacString(uuid.NewString())
-	obs.RequestID = a.hmacString(uuid.NewString())
+	if input.CorrelationKey != "" {
+		a.aliasMu.Lock()
+		obs.RequestID = a.aliasGatewayKey(a.requestAliases, input.CorrelationKey, "req", &a.nextRequestAlias)
+		a.aliasMu.Unlock()
+	} else {
+		obs.RequestID = a.hmacString(uuid.NewString())
+	}
 	return a.buffer.Append(obs)
+}
+
+func (a *Analyzer) RecordGatewayEvent(input GatewayEventInput) Observation {
+	a.aliasMu.Lock()
+	requestAlias := a.aliasGatewayKey(a.requestAliases, input.CorrelationKey, "req", &a.nextRequestAlias)
+	profileAlias := ""
+	if input.ProfileID != "" {
+		profileAlias = a.aliasGatewayKey(a.profileAliases, input.ProfileID, "profile", &a.nextProfileAlias)
+	}
+	a.aliasMu.Unlock()
+
+	obs := Observation{Kind: sanitizeObservationKind(input.Kind), SessionID: a.session, Timestamp: time.Now().UTC(), Direction: DirectionClientToUpstream, Transport: TransportHTTP, PayloadKind: PayloadEmpty, DecodingStatus: DecodingIdentity, Disposition: DispositionRecorded, RequestID: requestAlias, GatewayEvent: &GatewayEventSummary{
+		RequestAlias: requestAlias, RequestedModel: safeRequestedModel(input.RequestedModel), RoutingSlot: safeEnum(input.RoutingSlot, "sol", "terra", "luna"), ActiveProfile: profileAlias, Provider: safeIdentifier(input.Provider), UpstreamModel: safeIdentifier(input.UpstreamModel), Mode: safeEnum(input.Mode, "normal", "thinking"), ConfiguredEffort: safeEnumDefault(input.ConfiguredEffort, "none", "high", "max"), Protocol: safeEnum(input.Protocol, "anthropic", "openai-chat", "google-genai", "openai-response"), Model: safeIdentifier(input.Model), Thinking: safeEnumDefault(input.Thinking, "none", "enabled", "disabled", "not_applicable"), EffectiveEffort: safeEnumDefault(input.EffectiveEffort, "none", "high", "max"),
+	}}
+	return a.buffer.Append(obs)
+}
+
+func (a *Analyzer) aliasGatewayKey(m map[string]string, raw, prefix string, next *uint64) string {
+	if raw == "" {
+		return ""
+	}
+	if alias, ok := m[raw]; ok {
+		return alias
+	}
+	*next = *next + 1
+	alias := fmt.Sprintf("%s#%d", prefix, *next)
+	m[raw] = alias
+	return alias
+}
+
+func sanitizeObservationKind(kind ObservationKind) ObservationKind {
+	if kind == ObservationRoutingResolved || kind == ObservationProviderRequestPrepared {
+		return kind
+	}
+	return ObservationProviderRequestPrepared
+}
+
+func safeRequestedModel(value string) string {
+	switch value {
+	case "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna":
+		return value
+	}
+	return "unknown"
+}
+
+func safeIdentifier(value string) string {
+	if value == "" || len(value) > 128 || !tokenPattern.MatchString(value) {
+		return "unknown"
+	}
+	return value
+}
+
+func safeEnum(value string, allowed ...string) string {
+	for _, item := range allowed {
+		if value == item {
+			return value
+		}
+	}
+	return "unknown"
+}
+
+func safeEnumDefault(value, zero string, allowed ...string) string {
+	if value == "" {
+		return zero
+	}
+	return safeEnum(value, allowed...)
 }
 
 func (a *Analyzer) Snapshot(after uint64) ([]Observation, uint64) {
@@ -421,6 +545,10 @@ func cloneObservation(in Observation) Observation {
 	if in.Usage != nil {
 		usage := *in.Usage
 		out.Usage = &usage
+	}
+	if in.GatewayEvent != nil {
+		event := *in.GatewayEvent
+		out.GatewayEvent = &event
 	}
 	return out
 }

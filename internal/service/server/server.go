@@ -23,6 +23,7 @@ import (
 	"moonbridge/internal/service/runtime"
 	"moonbridge/internal/service/stats"
 	"moonbridge/internal/service/store"
+	"moonbridge/internal/service/trafficanalysis"
 	"moonbridge/internal/service/webui"
 
 	"moonbridge/internal/service/server/session"
@@ -42,6 +43,7 @@ type Config struct {
 	Provider               provider.ProviderClient // fallback provider for non-adapter path
 	ProviderMgr            *provider.ProviderManager
 	TrafficRouting         TrafficRouting
+	RoutingObservationSink RoutingObservationSink
 	RoutingProfileResolver RoutingProfileResolver
 	OpenAIHTTPClient       *http.Client
 	ProxyHTTPClient        *http.Client
@@ -64,11 +66,20 @@ type Config struct {
 // the Gateway validates it before a source model may be lazily bound.
 const RelayMarkerHeader = "X-Moonbridge-Relay"
 
+// RequestCorrelationHeader is stamped by the in-process Capture relay and
+// consumed before tracing or provider dispatch. Its value is a short-lived,
+// process-local correlation key and is never exposed in the public DTO.
+const RequestCorrelationHeader = "X-Moonbridge-Request"
+
 // TrafficRouting is the narrow, read-only bridge from the active Traffic
 // relay to model resolution. Implementations lazily bind and exact-match a
 // process-local source mapping for requests that provably traversed the relay.
 type TrafficRouting interface {
 	ObservedModelFor(sourceModel, relayMarker string) (targetRoute string, ok bool)
+}
+
+type RoutingObservationSink interface {
+	RecordGatewayEvent(trafficanalysis.GatewayEventInput)
 }
 
 // RoutingProfileSlotResult is the output of a routing profile slot resolution.
@@ -101,6 +112,7 @@ type Server struct {
 	provider               provider.ProviderClient
 	providerMgr            *provider.ProviderManager
 	trafficRouting         TrafficRouting
+	routingObservationSink RoutingObservationSink
 	routingProfileResolver atomic.Pointer[routingProfileResolverHolder]
 	openAIHTTP             *http.Client
 	proxyHTTP              *http.Client
@@ -218,28 +230,29 @@ func New(cfg Config) *Server {
 		cfg.SessionManager = newDefaultSessionManager(cfg)
 	}
 	s := &Server{
-		adapterRegistry: cfg.AdapterRegistry,
-		provider:        cfg.Provider,
-		providerMgr:     cfg.ProviderMgr,
-		trafficRouting:  cfg.TrafficRouting,
-		openAIHTTP:      cfg.OpenAIHTTPClient,
-		proxyHTTP:       cfg.ProxyHTTPClient,
-		tracer:          cfg.Tracer,
-		traceErrors:     cfg.TraceErrors,
-		stats:           cfg.Stats,
-		pluginRegistry:  cfg.PluginRegistry,
-		mux:             http.NewServeMux(),
-		appConfig:       cfg.AppConfig,
-		serverCfg:       cfg.ServerCfg,
-		chatClients:     cfg.ChatClients,
-		googleClients:   cfg.GoogleClients,
-		runtime:         cfg.Runtime,
-		store:           cfg.Store,
-		sessionManager:  cfg.SessionManager,
-		usageTracker:    cfg.UsageTracker,
-		traceWriter:     cfg.TraceWriter,
-		clientCache:     make(map[string]*chat.Client),
-		googleCache:     make(map[string]*google.Client),
+		adapterRegistry:        cfg.AdapterRegistry,
+		provider:               cfg.Provider,
+		providerMgr:            cfg.ProviderMgr,
+		trafficRouting:         cfg.TrafficRouting,
+		routingObservationSink: cfg.RoutingObservationSink,
+		openAIHTTP:             cfg.OpenAIHTTPClient,
+		proxyHTTP:              cfg.ProxyHTTPClient,
+		tracer:                 cfg.Tracer,
+		traceErrors:            cfg.TraceErrors,
+		stats:                  cfg.Stats,
+		pluginRegistry:         cfg.PluginRegistry,
+		mux:                    http.NewServeMux(),
+		appConfig:              cfg.AppConfig,
+		serverCfg:              cfg.ServerCfg,
+		chatClients:            cfg.ChatClients,
+		googleClients:          cfg.GoogleClients,
+		runtime:                cfg.Runtime,
+		store:                  cfg.Store,
+		sessionManager:         cfg.SessionManager,
+		usageTracker:           cfg.UsageTracker,
+		traceWriter:            cfg.TraceWriter,
+		clientCache:            make(map[string]*chat.Client),
+		googleCache:            make(map[string]*google.Client),
 	}
 	if cfg.RoutingProfileResolver != nil {
 		s.routingProfileResolver.Store(&routingProfileResolverHolder{resolver: cfg.RoutingProfileResolver})

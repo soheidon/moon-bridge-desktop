@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"moonbridge/internal/config"
@@ -20,6 +22,23 @@ import (
 
 	mbtrace "moonbridge/internal/service/trace"
 )
+
+type routingObservationContextKey struct{}
+
+var routingObservationSequence uint64
+
+func withRoutingObservationContext(request *http.Request, correlationKey string) *http.Request {
+	key := correlationKey
+	if key == "" {
+		key = fmt.Sprintf("gateway-request-%d", atomic.AddUint64(&routingObservationSequence, 1))
+	}
+	return request.WithContext(context.WithValue(request.Context(), routingObservationContextKey{}, key))
+}
+
+func routingObservationKey(ctx context.Context) string {
+	value, _ := ctx.Value(routingObservationContextKey{}).(string)
+	return value
+}
 
 func (server *Server) onRequestCompleted(model, actualModel, providerKey string, startTime time.Time, usage plugin.RequestUsage, cost float64, status, errMsg string) {
 	if server.pluginRegistry == nil {
@@ -56,6 +75,8 @@ func (server *Server) handleResponses(writer http.ResponseWriter, request *http.
 	// may qualify a source model for lazy binding.
 	relayMarker := request.Header.Get(RelayMarkerHeader)
 	request.Header.Del(RelayMarkerHeader)
+	requestCorrelation := request.Header.Get(RequestCorrelationHeader)
+	request.Header.Del(RequestCorrelationHeader)
 	if request.Method != http.MethodPost {
 		log.Warn("方法不允许", "method", request.Method)
 		writeOpenAIError(writer, http.StatusMethodNotAllowed, openai.ErrorResponse{Error: openai.ErrorObject{
@@ -164,6 +185,7 @@ func (server *Server) handleResponses(writer http.ResponseWriter, request *http.
 	}
 
 	record.Model = responsesRequest.Model
+	request = withRoutingObservationContext(request, requestCorrelation)
 	resolvedRoute, routingAlias, resolveErr := server.resolveModelOrFallback(responsesRequest.Model, relayMarker)
 	if resolveErr == nil {
 		var candidateInfo string
@@ -226,6 +248,9 @@ func (server *Server) handleResponses(writer http.ResponseWriter, request *http.
 		server.writeTrace(record)
 		writeOpenAIError(writer, http.StatusBadGateway, payload)
 		return
+	}
+	if preferred.RoutingSlot != "" {
+		server.recordRoutingResolved(request.Context(), responsesRequest.Model, preferred)
 	}
 
 	if preferred.Protocol == config.ProtocolOpenAIResponse {
