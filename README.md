@@ -120,18 +120,15 @@ Traffic Analysis records safe routing observations such as:
 
 API keys, authorization headers, prompts, raw request bodies, and correlation headers are not intended to be written to autosave logs.
 
-## Current Limitations
+## Supported External Provider
 
-* DeepSeek is the current production-supported provider.
-* Google tool-use is not supported.
-* MiniMax, Kimi, MiMo, and OpenRouter entries are placeholders and are not production-ready.
-* Multiple-plugin E2E behavior remains unresolved.
-* The Windows race-test environment currently fails to start with `0xC0000139`.
-* Gateway switching is not yet seamless; restart the ChatGPT desktop app after changing the Gateway state.
-* The Windows installer is unsigned.
-* Install and uninstall smoke testing was not performed for v0.1.0.
+Version 0.1.0 supports DeepSeek V4 as its external model API.
 
-See [Known Issues](docs/known-issues.md) for the maintained list.
+## Technical Preview Limitations
+
+* Gateway changes currently require restarting the ChatGPT desktop app.
+* The Windows installer is not digitally signed.
+* Install and uninstall smoke testing was not completed before the v0.1.0 release.
 
 ## Verification
 
@@ -145,7 +142,7 @@ The v0.1.0 release includes:
 * Force-mock E2E validation without real provider credentials
 * Static inspection of the Windows installer and executable metadata
 
-The accepted E2E limitations are documented in [Known Issues](docs/known-issues.md).
+Internal provider and integration tests outside the supported DeepSeek scope are not part of the product support contract.
 
 ## Development Status
 
@@ -158,6 +155,7 @@ The next development phase will focus on:
 * Installer validation and signing
 * Improved credential management
 * Expansion of supported providers after the DeepSeek path is stable
+* DeepSeek routing and Traffic Analysis improvements
 
 ## Release
 
