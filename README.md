@@ -25,8 +25,8 @@ Different tasks do not always need the same model or billing source. Moon Bridge
 Version 0.1.0 implements the DeepSeek V4 routing path. It provides:
 
 * A local Windows gateway for Codex in the ChatGPT desktop app
-* Sol, Terra, and Luna routing profiles
-* Maximum, high, or disabled reasoning behavior
+* Three named routing slots: Sol, Terra, and Luna
+* Configurable reasoning behavior for each routing slot
 * Request-level routing provenance
 * Traffic Analysis and request correlation
 * Safe autosave of routing observations
@@ -39,11 +39,12 @@ Seamless switching for each task or work plan is a product goal for a future ver
 
 * Local gateway for routing OpenAI Responses API traffic from Codex in the ChatGPT desktop app to DeepSeek V4
 * OpenAI Responses API-compatible endpoint
-* Three routing profiles:
-
-  * **Sol** — maximum reasoning
-  * **Terra** — high reasoning
-  * **Luna** — thinking disabled
+* Three named routing slots: Sol, Terra, and Luna
+* Independently configurable provider, upstream model, operating mode, reasoning policy, and active routing profile for each slot
+* Explicit routing-slot and profile provenance
+* Configurable reasoning behavior for each routing slot
+* Active-profile routing information preserved through provider dispatch and displayed in Traffic Analysis
+* When a DeepSeek profile is configured with reasoning disabled, the request is explicitly prepared without DeepSeek thinking and remains disabled during processing
 * Explicit routing-slot and profile provenance
 * Request correlation using safe local aliases
 * Traffic Analysis for resolved routing and prepared provider requests
@@ -79,23 +80,33 @@ Install and uninstall smoke testing was not completed before the v0.1.0 Technica
 
 1. Open the ChatGPT desktop app and select Codex.
 2. Start Moon Bridge Desktop.
-3. Configure your DeepSeek API credential.
-4. Configure the Sol, Terra, and Luna routing profiles.
+3. Configure the provider, upstream model, operating mode, and reasoning policy for each routing slot.
+4. Select the active routing profile.
 5. Start the Gateway.
 6. Start or restart the ChatGPT desktop app after the Gateway is running.
 7. Use Traffic Analysis when you need to inspect routing decisions and request correlation.
 
 In v0.1.0, gateway selection should be treated as startup-time configuration. After starting or stopping the Gateway, restart the ChatGPT desktop app before changing between subscription-backed Codex access and DeepSeek API routing.
 
-## Routing Profiles
+## Routing Slots
 
-| Profile   | Reasoning behavior | Intended use                                            |
-| --------- | ------------------ | ------------------------------------------------------- |
-| **Sol**   | Maximum reasoning  | Complex tasks requiring the strongest reasoning setting |
-| **Terra** | High reasoning     | General coding and reasoning work                       |
-| **Luna**  | Thinking disabled  | Faster requests without DeepSeek thinking               |
+Moon Bridge Desktop provides three named routing slots: **Sol**, **Terra**, and **Luna**.
 
-Luna requests are explicitly prepared with thinking disabled and remain disabled after DeepSeek request processing.
+These names are stable aliases, not fixed model tiers. Each slot can be configured independently with:
+
+* A provider
+* An upstream model
+* An operating mode
+* A reasoning policy
+* An active routing profile
+
+For example, you may configure one slot for complex reasoning, another for everyday coding, and another for faster or lower-cost requests. These are possible configurations, not predefined meanings enforced by the slot names.
+
+The active profile determines the actual provider, model, and reasoning behavior used for a request. Moon Bridge preserves this routing information through provider dispatch and displays it in Traffic Analysis.
+
+When a DeepSeek profile is configured with reasoning disabled, Moon Bridge explicitly prepares the request without DeepSeek thinking and preserves that setting during request processing.
+
+The v0.1.0 implementation uses the configured routing profile and slot assignments; it does not impose fixed Sol, Terra, or Luna reasoning tiers.
 
 ## Traffic Analysis
 
