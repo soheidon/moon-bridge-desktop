@@ -43,6 +43,19 @@ export function formatNumber(value: number | undefined) {
   return typeof value === "number" ? new Intl.NumberFormat().format(value) : "0";
 }
 
+// Currency symbol follows the UI locale (e.g. CNY + en-US/zh-CN -> ¥ U+00A5,
+// ja-JP -> ￥ U+FFE5). Never omit the locale, which would fall back to the
+// host default and vary by machine.
+export function formatCurrency(amount: number, currency: string, locale: string): string {
+  return new Intl.NumberFormat(locale, {
+    style: "currency",
+    currency,
+    currencyDisplay: "narrowSymbol",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  }).format(amount);
+}
+
 export function FieldHint({ children }: { children: ReactNode }) {
   return <small className="field-hint">{children}</small>;
 }

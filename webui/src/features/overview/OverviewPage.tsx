@@ -13,7 +13,7 @@ import { listContainer, listItem } from "../../theme/motion";
 import { useConfigGraph } from "../configGraph/useConfigGraph";
 import { LogPanel } from "../logs/LogPanel";
 import { mockUsageStats } from "./mockUsage";
-import { PageHeader, QueryErrorState } from "../shared";
+import { formatCurrency, PageHeader, QueryErrorState } from "../shared";
 
 const usageRanges: UsageRange[] = ["session", "24h", "7d", "30d", "all"];
 
@@ -26,7 +26,7 @@ const usageRangeLabelKeys: Record<UsageRange, MessageKey> = {
 };
 
 export function OverviewPage() {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const graph = useConfigGraph();
   const [range, setRange] = useState<UsageRange>("session");
   const [demoData, setDemoData] = useState(false);
@@ -135,7 +135,7 @@ function useLiveUsageDuration(rawDuration: string | undefined, active: boolean) 
 }
 
 function UsageDashboard({ stats }: { stats: UsageStats }) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const hasUsage = stats.totals.requests > 0 || stats.by_model.length > 0;
 
   return (
@@ -157,7 +157,7 @@ function UsageDashboard({ stats }: { stats: UsageStats }) {
         <UsageMetric icon="north_east" tone="tertiary" value={t("overview.outputValue", { count: formatTokenValue(stats.totals.output_tokens) })} label={t("overview.outputTokens")} />
         <UsageMetric icon="bolt" tone="secondary" value={t("overview.cacheHitValue", { rate: formatPercent(stats.totals.cache_hit_rate) })} label={t("overview.cacheHit")} />
         <UsageMetric icon="sync_alt" tone="secondary" value={t("overview.cacheRatioValue", { ratio: formatRatio(stats.totals.cache_rw_ratio) })} label={t("overview.cacheReadWrite")} />
-        <UsageMetric icon="payments" tone="tertiary" value={t("overview.totalCostValue", { cost: formatCurrency(stats.totals.total_cost) })} label={t("overview.totalCost")} />
+        <UsageMetric icon="payments" tone="tertiary" value={t("overview.totalCostValue", { cost: formatCurrency(stats.totals.total_cost, "CNY", locale) })} label={t("overview.totalCost")} />
       </motion.div>
 
       <div className="usage-chart-grid">
@@ -287,7 +287,7 @@ function UsageBarChart({
 }
 
 function UsageModelRow({ row }: { row: UsageStatsModelRow }) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   return (
     <tr aria-label={t("overview.modelUsageRow", { model: row.model })}>
       <td>{row.model}</td>
@@ -298,8 +298,8 @@ function UsageModelRow({ row }: { row: UsageStatsModelRow }) {
       <td>{formatTokenValue(row.cache_creation)}</td>
       <td>{formatTokenValue(row.cache_read)}</td>
       <td>{formatPercent(row.cache_hit_rate)}</td>
-      <td>{formatCurrency(row.cost)}</td>
-      <td>{formatCurrency(row.avg_cost_per_mtoken)}{t("overview.costPerMillionSuffix")}</td>
+      <td>{formatCurrency(row.cost, "CNY", locale)}</td>
+      <td>{formatCurrency(row.avg_cost_per_mtoken, "CNY", locale)}{t("overview.costPerMillionSuffix")}</td>
     </tr>
   );
 }
@@ -364,16 +364,6 @@ function formatPercent(value: number) {
 
 function formatRatio(value: number) {
   return new Intl.NumberFormat(undefined, {
-    maximumFractionDigits: 2
-  }).format(value);
-}
-
-function formatCurrency(value: number) {
-  return new Intl.NumberFormat(undefined, {
-    style: "currency",
-    currency: "CNY",
-    currencyDisplay: "narrowSymbol",
-    minimumFractionDigits: 2,
     maximumFractionDigits: 2
   }).format(value);
 }
