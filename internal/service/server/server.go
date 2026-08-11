@@ -73,10 +73,12 @@ type TrafficRouting interface {
 
 // RoutingProfileSlotResult is the output of a routing profile slot resolution.
 type RoutingProfileSlotResult struct {
-	ProviderKey   string
-	UpstreamModel string
-	Mode          string
-	Reasoning     *string
+	SlotID          string
+	ActiveProfileID string
+	ProviderKey     string
+	UpstreamModel   string
+	Mode            string
+	Reasoning       *string
 }
 
 // RoutingProfileResolver is the read-only bridge from the active routing
@@ -435,6 +437,38 @@ func (s *Server) resolveModelOrFallback(modelName, relayMarker string) (*provide
 		if !isModelNotFound(err) {
 			return nil, "", err
 		}
+		// Routing-profile slots are exact Codex model identities and must win
+		// over the generic Capture relay fallback. Otherwise the first Desktop
+		// request is mapped to the moonbridge route before its slot policy is
+		// applied, which loses routing provenance and lets provider defaults
+		// re-enable thinking for Luna.
+		if h := s.routingProfileResolver.Load(); h != nil && h.resolver != nil {
+			slot, ok := h.resolver.ResolveSlot(modelName)
+			if ok {
+				// Build a provider/model direct ref so the ProviderManager
+				// resolves to the slot's specific provider, not an ambiguous
+				// model name that could match multiple providers.
+				targetRef := slot.ProviderKey + "/" + slot.UpstreamModel
+				mapped, mappedErr := pm.ResolveModel(targetRef)
+				if mappedErr == nil {
+					mode, modeErr := routingprofile.NormalizeSlotMode(slot.Mode, slot.Reasoning)
+					if modeErr != nil {
+						return nil, "", modeErr
+					}
+					for i := range mapped.Candidates {
+						mapped.Candidates[i].ReasoningMode = mode
+						mapped.Candidates[i].RoutingSlot = slot.SlotID
+						mapped.Candidates[i].RoutingProfileID = slot.ActiveProfileID
+					}
+					if mode == routingprofile.ModeThinking && slot.Reasoning != nil {
+						for i := range mapped.Candidates {
+							mapped.Candidates[i].ReasoningOverride = slot.Reasoning
+						}
+					}
+					return mapped, slot.UpstreamModel, nil
+				}
+			}
+		}
 		// Traffic relay fallback (existing)
 		if s.trafficRouting != nil {
 			resolveDiag := func(hit, attempted, success bool) {
@@ -454,35 +488,6 @@ func (s *Server) resolveModelOrFallback(modelName, relayMarker string) (*provide
 					return mapped, targetAlias, nil
 				}
 				resolveDiag(true, true, false)
-			}
-		}
-		// Routing profile slot resolver: maps Codex request model identifiers
-		// (gpt-5.6-sol/terra/luna) to the active profile's slot configuration.
-		// Read-only; never patches the graph. Uses provider/model direct ref
-		// to honor slot.ProviderKey so mixed-provider profiles resolve correctly.
-		if h := s.routingProfileResolver.Load(); h != nil && h.resolver != nil {
-			slot, ok := h.resolver.ResolveSlot(modelName)
-			if ok {
-				// Build a provider/model direct ref so the ProviderManager
-				// resolves to the slot's specific provider, not an ambiguous
-				// model name that could match multiple providers.
-				targetRef := slot.ProviderKey + "/" + slot.UpstreamModel
-				mapped, mappedErr := pm.ResolveModel(targetRef)
-				if mappedErr == nil {
-					mode, modeErr := routingprofile.NormalizeSlotMode(slot.Mode, slot.Reasoning)
-					if modeErr != nil {
-						return nil, "", err
-					}
-					for i := range mapped.Candidates {
-						mapped.Candidates[i].ReasoningMode = mode
-					}
-					if mode == routingprofile.ModeThinking && slot.Reasoning != nil {
-						for i := range mapped.Candidates {
-							mapped.Candidates[i].ReasoningOverride = slot.Reasoning
-						}
-					}
-					return mapped, slot.UpstreamModel, nil
-				}
 			}
 		}
 		return nil, "", err

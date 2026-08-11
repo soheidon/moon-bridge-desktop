@@ -31,6 +31,47 @@ func TestStripReasoningContentStripsField(t *testing.T) {
 	}
 }
 
+func TestMutateCoreRequestPreservesExplicitThinkingPolicyAndIsIdempotent(t *testing.T) {
+	p := NewPlugin(func(string) bool { return true })
+	for _, tc := range []struct {
+		name       string
+		thinking   *format.CoreThinkingConfig
+		effort     string
+		wantType   string
+		wantEffort string
+	}{
+		{"disabled", &format.CoreThinkingConfig{Type: "disabled"}, "medium", "disabled", "medium"},
+		{"enabled max", &format.CoreThinkingConfig{Type: "enabled"}, "max", "enabled", "max"},
+		{"enabled high", &format.CoreThinkingConfig{Type: "enabled"}, "medium", "enabled", "high"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := &format.CoreRequest{Thinking: tc.thinking, Output: &format.CoreOutputConfig{Effort: tc.effort}, Extensions: map[string]any{"thinking": map[string]any{"budget_tokens": 32000}}}
+			p.MutateCoreRequest(nil, req)
+			p.MutateCoreRequest(nil, req)
+			if req.Thinking == nil || req.Thinking.Type != tc.wantType {
+				t.Fatalf("thinking = %#v, want %s", req.Thinking, tc.wantType)
+			}
+			if req.Output == nil || req.Output.Effort != tc.wantEffort {
+				t.Fatalf("output = %#v, want effort %s", req.Output, tc.wantEffort)
+			}
+			if _, ok := req.Extensions["thinking"]; ok {
+				t.Fatal("duplicate thinking extension should be removed")
+			}
+			if req.Thinking.BudgetTokens != 0 {
+				t.Fatalf("BudgetTokens = %d, want 0", req.Thinking.BudgetTokens)
+			}
+		})
+	}
+}
+
+func TestMutateCoreRequestUsesDefaultThinkingWithoutBudget(t *testing.T) {
+	req := &format.CoreRequest{}
+	NewPlugin().MutateCoreRequest(nil, req)
+	if req.Thinking == nil || req.Thinking.Type != "enabled" || req.Thinking.BudgetTokens != 0 {
+		t.Fatalf("thinking = %#v, want enabled without budget", req.Thinking)
+	}
+}
+
 func TestStripReasoningContentLeavesStringInputAlone(t *testing.T) {
 	input := json.RawMessage(`"hello"`)
 	out := StripReasoningContent(input)

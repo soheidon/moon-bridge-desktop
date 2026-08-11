@@ -54,9 +54,12 @@ func (a *routingProfileResolverAdapter) ResolveSlot(requestModel string) (server
 		return server.RoutingProfileSlotResult{}, false
 	}
 	return server.RoutingProfileSlotResult{
-		ProviderKey:   slot.ProviderKey,
-		UpstreamModel: slot.UpstreamModel,
-		Reasoning:     slot.Reasoning,
+		SlotID:          slot.SlotID,
+		ActiveProfileID: slot.ActiveProfileID,
+		ProviderKey:     slot.ProviderKey,
+		UpstreamModel:   slot.UpstreamModel,
+		Mode:            slot.Mode,
+		Reasoning:       slot.Reasoning,
 	}, true
 }
 

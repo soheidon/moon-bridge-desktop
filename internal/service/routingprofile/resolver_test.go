@@ -42,6 +42,12 @@ func TestSlotResolverExactMatchOnly(t *testing.T) {
 			if result.ProviderKey != deepseek.ProviderID {
 				t.Fatalf("ProviderKey = %q, want %q", result.ProviderKey, deepseek.ProviderID)
 			}
+			if result.SlotID != tc.wantSlot {
+				t.Fatalf("SlotID = %q, want %q", result.SlotID, tc.wantSlot)
+			}
+			if result.ActiveProfileID != deepseek.ProviderID {
+				t.Fatalf("ActiveProfileID = %q, want %q", result.ActiveProfileID, deepseek.ProviderID)
+			}
 			if result.UpstreamModel != tc.wantModel {
 				t.Fatalf("UpstreamModel = %q, want %q", result.UpstreamModel, tc.wantModel)
 			}

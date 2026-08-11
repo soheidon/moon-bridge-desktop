@@ -61,7 +61,9 @@ type ProviderCandidate struct {
 	Protocol          string // "anthropic" | "openai-response"
 	Client            ProviderClient
 	ReasoningOverride *string // nil = use model default; non-nil = override (from routing profile slot)
-	ReasoningMode     string // "thinking" | "normal" | "" (no routing profile slot)
+	ReasoningMode     string  // "thinking" | "normal" | "" (no routing profile slot)
+	RoutingSlot       string
+	RoutingProfileID  string
 }
 
 // ResolvedRoute contains the result of model resolution.

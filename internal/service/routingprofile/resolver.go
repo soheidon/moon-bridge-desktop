@@ -7,10 +7,12 @@ import (
 // SlotResult is the output of a slot resolution. Reasoning is nil when the
 // slot carries no reasoning override (Luna).
 type SlotResult struct {
-	ProviderKey   string
-	UpstreamModel string
-	Mode          string
-	Reasoning     *string
+	SlotID          string
+	ActiveProfileID string
+	ProviderKey     string
+	UpstreamModel   string
+	Mode            string
+	Reasoning       *string
 }
 
 // modelToSlot is the fixed mapping from Codex request model identifiers to
@@ -117,9 +119,11 @@ func (r *SlotResolver) ResolveSlot(requestModel string) (SlotResult, bool) {
 		reasoning = cloneReasoning(slot.Reasoning)
 	}
 	return SlotResult{
-		ProviderKey:   slot.Provider,
-		UpstreamModel: slot.UpstreamModel,
-		Mode:          mode,
-		Reasoning:     reasoning,
+		SlotID:          slotID,
+		ActiveProfileID: r.activeProfileID,
+		ProviderKey:     slot.Provider,
+		UpstreamModel:   slot.UpstreamModel,
+		Mode:            mode,
+		Reasoning:       reasoning,
 	}, true
 }

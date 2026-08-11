@@ -193,38 +193,16 @@ func (s *Server) handleWithAdapters(
 	// the upstream provider receives the correct model identifier.
 	coreReq.Model = preferred.UpstreamModel
 
-	// Apply reasoning policy from routing profile slot.
-	// "thinking": slot reasoning overrides input-derived effort.
-	// "normal": explicitly clear all reasoning/thinking (model default is no thinking).
-	// "": no routing profile slot — pass through input-derived values unchanged.
-	switch preferred.ReasoningMode {
-	case "thinking":
-		if preferred.ReasoningOverride != nil {
-			effort := *preferred.ReasoningOverride
-			if coreReq.Output == nil {
-				coreReq.Output = &format.CoreOutputConfig{}
-			}
-			coreReq.Output.Effort = effort
-		}
-	case "normal":
-		// Explicitly clear input-derived reasoning/thinking.
-		// This ensures "no thinking" regardless of model defaults.
-		coreReq.Output = nil
-		coreReq.Thinking = nil
-		if coreReq.Extensions != nil {
-			if openai, ok := coreReq.Extensions["openai"].(map[string]any); ok {
-				delete(openai, "reasoning")
-			}
-		}
-	case "":
-		// No routing profile slot — pass through unchanged.
-	default:
-		log.Error("adapter path: unknown reasoning mode", "mode", preferred.ReasoningMode)
+	// Apply routing reasoning policy before provider conversion. This helper is
+	// shared by streaming and non-streaming dispatch because both paths enter
+	// here after the initial client conversion.
+	if err := applyRoutingReasoningPolicy(coreReq, preferred.ReasoningMode, preferred.ReasoningOverride); err != nil {
+		log.Error("adapter path: invalid routing reasoning policy", "mode", preferred.ReasoningMode, "error", err)
 		payload := openai.ErrorResponse{
 			Error: openai.ErrorObject{
-				Message: fmt.Sprintf("unsupported reasoning mode: %q", preferred.ReasoningMode),
+				Message: err.Error(),
 				Type:    "server_error",
-				Code:    "unsupported_reasoning_mode",
+				Code:    reasoningPolicyErrorCode(err),
 			},
 		}
 		writeOpenAIError(w, http.StatusInternalServerError, payload)

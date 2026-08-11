@@ -6,12 +6,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"moonbridge/internal/config"
+	deepseekv4 "moonbridge/internal/extension/deepseek_v4"
+	"moonbridge/internal/extension/plugin"
 	"moonbridge/internal/format"
 	"moonbridge/internal/protocol/anthropic"
 	"moonbridge/internal/protocol/openai"
@@ -135,15 +138,28 @@ func newTestCredentialResolver() *provider.CredentialResolver {
 // and Anthropic provider adapters for routing tests.
 func newRoutingTestAdapterRegistry(t *testing.T) *format.Registry {
 	t.Helper()
+	cfg := config.Config{ProviderDefs: map[string]config.ProviderDef{
+		"deepseek": {Protocol: config.ProtocolAnthropic, Models: map[string]config.ModelMeta{
+			"deepseek-v4-flash": {Extensions: map[string]config.ExtensionSettings{
+				deepseekv4.PluginName: {Enabled: boolPtr(true)},
+			}},
+		}},
+	}}
+	plugins := plugin.NewRegistry(slog.Default())
+	plugins.Register(deepseekv4.NewPlugin(func(model string) bool { return model == "deepseek-v4-flash" }))
+	if err := plugins.InitAll(&cfg); err != nil {
+		t.Fatalf("InitAll() error = %v", err)
+	}
+	hooks := plugins.CorePluginHooks()
 	adapterReg := format.NewRegistry()
-	clientAdapter := openai.NewOpenAIAdapter(format.CorePluginHooks{})
+	clientAdapter := openai.NewOpenAIAdapter(hooks)
 	if err := adapterReg.RegisterClient(clientAdapter); err != nil {
 		t.Fatalf("RegisterClient() error = %v", err)
 	}
 	if err := adapterReg.RegisterClientStream(clientAdapter); err != nil {
 		t.Fatalf("RegisterClientStream() error = %v", err)
 	}
-	providerAdapter := anthropic.NewAnthropicProviderAdapter(128, serverNoopCacheManager{}, format.CorePluginHooks{})
+	providerAdapter := anthropic.NewAnthropicProviderAdapter(128, serverNoopCacheManager{}, hooks)
 	if err := adapterReg.RegisterProvider(providerAdapter); err != nil {
 		t.Fatalf("RegisterProvider() error = %v", err)
 	}
@@ -152,6 +168,8 @@ func newRoutingTestAdapterRegistry(t *testing.T) *format.Registry {
 	}
 	return adapterReg
 }
+
+func boolPtr(v bool) *bool { return &v }
 
 func TestLunaPayloadIntegrationFromHTTPEntry(t *testing.T) {
 	// Exercises the OpenAI Responses HTTP entrypoint with reasoning: {"effort":"medium"}
@@ -228,10 +246,13 @@ func TestLunaPayloadIntegrationFromHTTPEntry(t *testing.T) {
 			} else if payload.OutputConfig != nil {
 				t.Fatalf("Luna output_config = %+v, want field absent", payload.OutputConfig)
 			}
-			// Thinking is set by the provider plugin (e.g. DeepSeek MutateCoreRequest),
-			// not by adapter_dispatch. These tests use a bare adapter registry without
-			// plugins, so Thinking is always nil here. The mode=normal clearing of
-			// OutputConfig is the key assertion for Luna.
+			if tc.wantEffort == "" {
+				if payload.Thinking == nil || payload.Thinking.Type != "disabled" {
+					t.Fatalf("Luna thinking = %+v, want disabled", payload.Thinking)
+				}
+			} else if payload.Thinking == nil || payload.Thinking.Type != "enabled" {
+				t.Fatalf("thinking = %+v, want enabled", payload.Thinking)
+			}
 		})
 	}
 }
@@ -291,14 +312,13 @@ func TestLunaPayloadControlNoOverride(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("upstream calls = %d, want 1", calls)
 	}
-	// Control: without routing profile, input reasoning.effort does NOT
-	// reach the Anthropic upstream as OutputConfig.Effort (it stays in Extensions).
-	// This confirms that Luna's clearing is due to mode=normal, not path leakage.
+	// Control: without routing profile, the production DeepSeek plugin applies
+	// its documented default enabled thinking, but no invented token budget.
 	if payload.OutputConfig != nil {
 		t.Fatalf("control: output_config = %+v, want nil (no routing override)", payload.OutputConfig)
 	}
-	if payload.Thinking != nil {
-		t.Fatalf("control: thinking = %+v, want nil", payload.Thinking)
+	if payload.Thinking == nil || payload.Thinking.Type != "enabled" || payload.Thinking.BudgetTokens != 0 {
+		t.Fatalf("control: thinking = %+v, want enabled without budget", payload.Thinking)
 	}
 }
 
