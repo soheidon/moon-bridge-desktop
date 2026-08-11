@@ -1,15 +1,43 @@
 # Moon Bridge Desktop
 
-Moon Bridge Desktop is a Windows desktop gateway that routes OpenAI Responses API traffic from Codex to DeepSeek V4.
+Choose the right model and billing path for each task.
 
-It provides three routing profiles—Sol, Terra, and Luna—together with request-level observability, local Traffic Analysis, and a desktop interface for managing the gateway.
+Moon Bridge Desktop is a Windows routing companion for Codex in the ChatGPT desktop app. Its goal is to let you decide, for each task or work plan, whether to use the Codex access included with your ChatGPT subscription or route the work to a separately billed model API such as DeepSeek—without changing your desktop workflow.
+
+This makes it possible to reserve your ChatGPT subscription usage for tasks where you prefer OpenAI models, while using external provider APIs for other workloads.
 
 > [!IMPORTANT]
 > Moon Bridge Desktop v0.1.0 is a Technical Preview. The current production-supported provider scope is DeepSeek.
 
+## Why Moon Bridge Desktop?
+
+Different tasks do not always need the same model or billing source. Moon Bridge Desktop is being developed to provide a flexible way to:
+
+* Use the Codex access included with a ChatGPT subscription
+* Route selected workloads to an external model API
+* Choose the appropriate reasoning profile for each task
+* Keep using Codex in the ChatGPT desktop app
+* Confirm which provider and routing profile handled each request
+* Avoid permanently reconfiguring separate development environments
+
+## Current Technical Preview
+
+Version 0.1.0 implements the DeepSeek V4 routing path. It provides:
+
+* A local Windows gateway for Codex in the ChatGPT desktop app
+* Sol, Terra, and Luna routing profiles
+* Maximum, high, or disabled reasoning behavior
+* Request-level routing provenance
+* Traffic Analysis and request correlation
+* Safe autosave of routing observations
+
+In v0.1.0, switching is still startup-based. Start or stop the Gateway, then restart the ChatGPT desktop app before changing between subscription-backed Codex access and DeepSeek API routing.
+
+Seamless switching for each task or work plan is a product goal for a future version.
+
 ## Features
 
-* Local gateway for routing Codex requests to DeepSeek V4
+* Local gateway for routing OpenAI Responses API traffic from Codex in the ChatGPT desktop app to DeepSeek V4
 * OpenAI Responses API-compatible endpoint
 * Three routing profiles:
 
@@ -30,8 +58,8 @@ It provides three routing profiles—Sol, Terra, and Luna—together with reques
 ## Requirements
 
 * Windows 10 or Windows 11, x64
-* Codex
-* A DeepSeek API credential
+* Codex in the ChatGPT desktop app
+* A DeepSeek API credential for separately billed DeepSeek API usage
 * Microsoft WebView2 Runtime
 
 If WebView2 Runtime is not already installed, the installer may require an internet connection to download it.
@@ -49,14 +77,15 @@ Install and uninstall smoke testing was not completed before the v0.1.0 Technica
 
 ## Basic Usage
 
-1. Start Moon Bridge Desktop.
-2. Configure your DeepSeek API credential.
-3. Configure the Sol, Terra, and Luna routing profiles.
-4. Start the Gateway.
-5. Start Codex after the Gateway is running.
-6. Use Traffic Analysis when you need to inspect routing decisions and request correlation.
+1. Open the ChatGPT desktop app and select Codex.
+2. Start Moon Bridge Desktop.
+3. Configure your DeepSeek API credential.
+4. Configure the Sol, Terra, and Luna routing profiles.
+5. Start the Gateway.
+6. Start or restart the ChatGPT desktop app after the Gateway is running.
+7. Use Traffic Analysis when you need to inspect routing decisions and request correlation.
 
-In v0.1.0, gateway selection should be treated as startup-time configuration. After starting or stopping the Gateway, restart Codex before changing between Moon Bridge routing and the original OpenAI connection.
+In v0.1.0, gateway selection should be treated as startup-time configuration. After starting or stopping the Gateway, restart the ChatGPT desktop app before changing between subscription-backed Codex access and DeepSeek API routing.
 
 ## Routing Profiles
 
@@ -87,7 +116,7 @@ API keys, authorization headers, prompts, raw request bodies, and correlation he
 * MiniMax, Kimi, MiMo, and OpenRouter entries are placeholders and are not production-ready.
 * Multiple-plugin E2E behavior remains unresolved.
 * The Windows race-test environment currently fails to start with `0xC0000139`.
-* Gateway switching is not yet seamless; Codex should be restarted after changing the Gateway state.
+* Gateway switching is not yet seamless; restart the ChatGPT desktop app after changing the Gateway state.
 * The Windows installer is unsigned.
 * Install and uninstall smoke testing was not performed for v0.1.0.
 
@@ -113,7 +142,7 @@ Moon Bridge Desktop is under active development.
 
 The next development phase will focus on:
 
-* Simpler Gateway and Codex startup behavior
+* Simpler Gateway and ChatGPT desktop app Codex startup behavior
 * More practical switching between Moon Bridge and the original OpenAI connection
 * Installer validation and signing
 * Improved credential management
