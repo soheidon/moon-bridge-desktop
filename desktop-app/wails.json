@@ -11,8 +11,10 @@
     "name": "Moon Bridge"
   },
   "info": {
+    "companyName": "Sohei Ide",
     "productName": "Moon Bridge Desktop",
     "productVersion": "0.1.0",
-    "copyright": "Moon Bridge"
+    "copyright": "Copyright © 2026 Sohei Ide",
+    "comments": "Moon Bridge Desktop Technical Preview"
   }
 }
