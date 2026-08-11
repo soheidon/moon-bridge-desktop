@@ -34,12 +34,13 @@ export interface TrafficAnalysisStatus {
   reconciledAt?: string | null;
 }
 
-// TrafficObservation is the secret-free Desktop summary of one recorded
-// observation. It mirrors the Wails DTO and never carries prompts, bodies,
-// responses, headers, URL paths/query, API keys, or model/provider names.
+// TrafficObservation mirrors the Wails DTO. Payload observations remain
+// secret-free reductions; gatewayEvent contains only validated routing labels.
 export interface TrafficObservation {
   sequence: number;
   timestamp: string;
+  kind: string;
+  requestAlias?: string;
   direction: string;
   transport: string;
   method?: string;
@@ -103,6 +104,20 @@ export interface TrafficObservation {
   truncated?: boolean;
   disposition: string;
   errorClass?: string;
+  gatewayEvent?: {
+    requestAlias: string;
+    requestedModel?: string;
+    routingSlot?: string;
+    activeProfile?: string;
+    provider?: string;
+    upstreamModel?: string;
+    mode?: string;
+    configuredEffort?: string;
+    protocol?: string;
+    model?: string;
+    thinking?: string;
+    effectiveEffort?: string;
+  };
 }
 
 export interface TrafficObservationPage {

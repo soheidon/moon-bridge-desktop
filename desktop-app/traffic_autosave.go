@@ -381,6 +381,24 @@ func renderLogFooter(sessionID, startedAt, endedAt string, observations, gaps, d
 func renderObservationLine(o TrafficObservation) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s #%d %s %s\n", o.Timestamp, o.Sequence, o.Direction, o.Transport)
+	appendLogField(&b, "  kind", o.Kind)
+	if o.GatewayEvent != nil {
+		e := o.GatewayEvent
+		appendLogField(&b, "  request_alias", e.RequestAlias)
+		appendLogField(&b, "  requested_model", e.RequestedModel)
+		appendLogField(&b, "  routing_slot", e.RoutingSlot)
+		appendLogField(&b, "  active_profile", e.ActiveProfile)
+		appendLogField(&b, "  provider", e.Provider)
+		appendLogField(&b, "  upstream_model", e.UpstreamModel)
+		appendLogField(&b, "  mode", e.Mode)
+		appendLogField(&b, "  configured_effort", e.ConfiguredEffort)
+		appendLogField(&b, "  protocol", e.Protocol)
+		appendLogField(&b, "  model", e.Model)
+		appendLogField(&b, "  thinking", e.Thinking)
+		appendLogField(&b, "  effective_effort", e.EffectiveEffort)
+		return b.String()
+	}
+	appendLogField(&b, "  request_alias", o.RequestAlias)
 	appendLogField(&b, "  method", o.Method)
 	if o.StatusCode != 0 {
 		fmt.Fprintf(&b, "  status_code: %d\n", o.StatusCode)

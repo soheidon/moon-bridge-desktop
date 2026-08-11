@@ -143,15 +143,29 @@ function ObservationList({ traffic, observations }: { traffic: TrafficState; obs
       {observations.length === 0 ? <p className="traffic-empty">まだ観測はありません。</p> : observations.slice().reverse().map((item) => (
         <article className="traffic-observation" key={`${item.transport}-${item.sequence}`}>
           <div className="traffic-observation-head"><strong>#{item.sequence}</strong><span>{item.direction} · {item.transport}</span><time>{new Date(item.timestamp).toLocaleTimeString()}</time></div>
-          <div className="traffic-observation-fields">
+          {item.gatewayEvent ? <div className="traffic-observation-fields">
+            <span>{item.kind}</span>
+            <span>{item.gatewayEvent.requestAlias}</span>
+            {item.gatewayEvent.requestedModel && <span>{item.gatewayEvent.requestedModel}</span>}
+            {item.gatewayEvent.routingSlot && <span>slot: {item.gatewayEvent.routingSlot}</span>}
+            {item.gatewayEvent.activeProfile && <span>profile: {item.gatewayEvent.activeProfile}</span>}
+            {item.gatewayEvent.provider && <span>provider: {item.gatewayEvent.provider}</span>}
+            {item.gatewayEvent.upstreamModel && <span>upstream: {item.gatewayEvent.upstreamModel}</span>}
+            {item.gatewayEvent.mode && <span>mode: {item.gatewayEvent.mode}</span>}
+            {item.gatewayEvent.configuredEffort && <span>configured: {item.gatewayEvent.configuredEffort}</span>}
+            {item.gatewayEvent.protocol && <span>protocol: {item.gatewayEvent.protocol}</span>}
+            {item.gatewayEvent.thinking && <span>thinking: {item.gatewayEvent.thinking}</span>}
+            {item.gatewayEvent.effectiveEffort && <span>effective: {item.gatewayEvent.effectiveEffort}</span>}
+          </div> : <div className="traffic-observation-fields">
             <span>{item.method ?? "event"}</span>
+            {item.requestAlias && <span>{item.requestAlias}</span>}
             {item.statusCode !== undefined && <span>HTTP {item.statusCode}</span>}
             <span>{item.payloadKind} · {item.decodingStatus}</span>
             <span>{item.rawPayloadSize} B / decoded {item.decodedObservationSize} B</span>
             {item.partial && <span>partial</span>}
             {item.truncated && <span>truncated</span>}
             {item.errorClass && <span className="error-text">{item.errorClass}</span>}
-          </div>
+          </div>}
         </article>
       ))}
       </div>

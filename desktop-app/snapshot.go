@@ -39,11 +39,11 @@ type DesktopSnapshot struct {
 	// Connection-test fields are flat because the command envelope unwraps Value
 	// (a *DesktopSnapshot) and the hook reads operationId/result/warning/gatewaySnapshot
 	// at the top level. They are present only on a TestDeepSeekConnection result.
-	ConnectionTestOperationID     string               `json:"operationId,omitempty"`
-	ConnectionTest                *DeepSeekConnectionTest `json:"result,omitempty"`
-	ConnectionTestWarning         *string              `json:"warning,omitempty"`
-	ConnectionGatewaySnapshot     *GatewaySnapshot     `json:"gatewaySnapshot,omitempty"`
-	ConnectionGatewayLeftRunning  bool                 `json:"gatewayLeftRunning,omitempty"`
+	ConnectionTestOperationID    string                  `json:"operationId,omitempty"`
+	ConnectionTest               *DeepSeekConnectionTest `json:"result,omitempty"`
+	ConnectionTestWarning        *string                 `json:"warning,omitempty"`
+	ConnectionGatewaySnapshot    *GatewaySnapshot        `json:"gatewaySnapshot,omitempty"`
+	ConnectionGatewayLeftRunning bool                    `json:"gatewayLeftRunning,omitempty"`
 }
 
 // DeepSeekConnectionTest is the structured, secret-free connection probe result.
@@ -104,12 +104,14 @@ type TrafficRevealSnapshot struct {
 }
 
 // TrafficObservation is the deliberately reduced, secret-free Desktop summary
-// of one recorded observation. Prompts, bodies, responses, headers, URL
-// paths/query, API keys, and model/provider names are dropped at the backend
-// boundary — they never exist on this type or cross the Wails layer.
+// of one recorded observation. Payload observations retain their existing
+// reduction; structured gateway events may carry only validated, allowlisted
+// routing labels and aliases.
 type TrafficObservation struct {
+	Kind                   string                   `json:"kind"`
 	Sequence               uint64                   `json:"sequence"`
 	Timestamp              string                   `json:"timestamp"`
+	RequestAlias           string                   `json:"requestAlias,omitempty"`
 	Direction              string                   `json:"direction,omitempty"`
 	Transport              string                   `json:"transport"`
 	Method                 string                   `json:"method,omitempty"`
@@ -127,6 +129,22 @@ type TrafficObservation struct {
 	Disposition            string                   `json:"disposition"`
 	ErrorClass             string                   `json:"errorClass,omitempty"`
 	Usage                  *TrafficUsageSummary     `json:"usage,omitempty"`
+	GatewayEvent           *TrafficGatewayEvent     `json:"gatewayEvent,omitempty"`
+}
+
+type TrafficGatewayEvent struct {
+	RequestAlias     string `json:"requestAlias"`
+	RequestedModel   string `json:"requestedModel,omitempty"`
+	RoutingSlot      string `json:"routingSlot,omitempty"`
+	ActiveProfile    string `json:"activeProfile,omitempty"`
+	Provider         string `json:"provider,omitempty"`
+	UpstreamModel    string `json:"upstreamModel,omitempty"`
+	Mode             string `json:"mode,omitempty"`
+	ConfiguredEffort string `json:"configuredEffort,omitempty"`
+	Protocol         string `json:"protocol,omitempty"`
+	Model            string `json:"model,omitempty"`
+	Thinking         string `json:"thinking,omitempty"`
+	EffectiveEffort  string `json:"effectiveEffort,omitempty"`
 }
 
 type TrafficUsageSummary struct {
@@ -528,8 +546,10 @@ func desktopObservations(items []trafficanalysis.Observation) []TrafficObservati
 	out := make([]TrafficObservation, 0, len(items))
 	for _, o := range items {
 		out = append(out, TrafficObservation{
+			Kind:                   string(o.Kind),
 			Sequence:               o.Sequence,
 			Timestamp:              publicTime(o.Timestamp),
+			RequestAlias:           o.RequestID,
 			Direction:              string(o.Direction),
 			Transport:              string(o.Transport),
 			Method:                 o.Method,
@@ -547,9 +567,17 @@ func desktopObservations(items []trafficanalysis.Observation) []TrafficObservati
 			Disposition:            string(o.Disposition),
 			ErrorClass:             o.ErrorClass,
 			Usage:                  safeTrafficUsage(o.Usage),
+			GatewayEvent:           safeTrafficGatewayEvent(o.GatewayEvent),
 		})
 	}
 	return out
+}
+
+func safeTrafficGatewayEvent(event *trafficanalysis.GatewayEventSummary) *TrafficGatewayEvent {
+	if event == nil {
+		return nil
+	}
+	return &TrafficGatewayEvent{RequestAlias: event.RequestAlias, RequestedModel: event.RequestedModel, RoutingSlot: event.RoutingSlot, ActiveProfile: event.ActiveProfile, Provider: event.Provider, UpstreamModel: event.UpstreamModel, Mode: event.Mode, ConfiguredEffort: event.ConfiguredEffort, Protocol: event.Protocol, Model: event.Model, Thinking: event.Thinking, EffectiveEffort: event.EffectiveEffort}
 }
 
 // ---- error conversion ----
