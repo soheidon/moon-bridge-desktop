@@ -1,24 +1,34 @@
 # Moon Bridge Desktop
 
-Choose the right model and billing path for each task.
+**Plan with Sol. Implement with DeepSeek. Make your ChatGPT Plus usage last longer.**
 
-Moon Bridge Desktop is a Windows routing companion for Codex in the ChatGPT desktop app. Its goal is to let you decide, for each task or work plan, whether to use the Codex access included with your ChatGPT subscription or route the work to a separately billed model API such as DeepSeek—without changing your desktop workflow.
+Moon Bridge Desktop is a Windows routing companion for Codex in the ChatGPT desktop app. Its goal is to help divide a development workflow between subscription-backed Codex and a separately billed external model API such as DeepSeek.
 
-This makes it possible to reserve your ChatGPT subscription usage for tasks where you prefer OpenAI models, while using external provider APIs for other workloads.
+Moon Bridge Desktop does not increase ChatGPT usage limits or convert subscription usage into API credits. It lets you decide which billing path handles each phase of development.
+
+External models may not behave identically to OpenAI models. The goal is to combine strong planning and review with a practical, separately billed implementation path.
 
 > [!IMPORTANT]
 > Moon Bridge Desktop v0.1.0 is a Technical Preview. The current production-supported provider scope is DeepSeek.
 
 ## Why Moon Bridge Desktop?
 
-Different tasks do not always need the same model or billing source. Moon Bridge Desktop is being developed to provide a flexible way to:
+ChatGPT Plus includes access to Codex, but its usage limits can be restrictive during long or intensive development sessions.
 
-* Use the Codex access included with a ChatGPT subscription
-* Route selected workloads to an external model API
-* Choose the appropriate reasoning profile for each task
-* Keep using Codex in the ChatGPT desktop app
-* Confirm which provider and routing profile handled each request
-* Avoid permanently reconfiguring separate development environments
+Moon Bridge Desktop is designed to divide a development workflow between two billing paths:
+
+1. **Plan with subscription-backed Codex**
+   Use Sol through your ChatGPT subscription for architecture, difficult reasoning, task planning, and review.
+2. **Implement with an external API**
+   Start the Moon Bridge Gateway and route implementation work to a separately billed external model API such as DeepSeek.
+3. **Preserve your ChatGPT Plus usage**
+   Keep the limited subscription allowance available for the stages where you value Sol and OpenAI models most.
+
+The goal is to make sustained software development practical even with a ChatGPT Plus plan: use subscription-backed Codex for high-value planning and use external API capacity for token-intensive implementation work, while continuing to work in the ChatGPT desktop app.
+
+Moon Bridge Desktop does not increase ChatGPT usage limits or convert subscription usage into API credits. It lets you decide which billing path handles each phase of development.
+
+External models may not behave identically to OpenAI models. The goal is to combine strong planning and review with a practical, separately billed implementation path.
 
 ## Current Technical Preview
 
