@@ -94,3 +94,6 @@ logs/
 *.log
 .omx/
 omx_wiki/
+
+# Local implementation plans are kept outside the published history.
+docs/plans/
