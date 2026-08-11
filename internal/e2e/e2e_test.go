@@ -143,7 +143,21 @@ func newTestRegistry(t testing.TB, cfg config.Config, hooks format.CorePluginHoo
 
 func TestMain(m *testing.M) {
 	loadDotEnv(nil)
+	if os.Getenv("MOONBRIDGE_E2E_FORCE_MOCK") == "1" {
+		forceMockE2EEnv()
+	}
 	os.Exit(m.Run())
+}
+
+func forceMockE2EEnv() {
+	for _, key := range []string{
+		"TEST_ANTHROPIC_API_KEY", "TEST_ANTHROPIC_BASE_URL", "TEST_ANTHROPIC_MODEL",
+		"TEST_OPENAI_API_KEY", "TEST_OPENAI_BASE_URL", "TEST_OPENAI_MODEL",
+		"TEST_GEMINI_API_KEY", "TEST_GEMINI_BASE_URL", "TEST_GEMINI_MODEL",
+		"TEST_GEMINI_PROJECT", "TEST_GEMINI_LOCATION", "TEST_GEMINI_VERSION",
+	} {
+		_ = os.Unsetenv(key)
+	}
 }
 
 func loadTestEnv(t testing.TB) map[string]string {
@@ -162,6 +176,15 @@ func loadTestEnv(t testing.TB) map[string]string {
 		}
 	}
 	return env
+}
+
+func TestForceMockE2EEnvClearsProviderSelectors(t *testing.T) {
+	t.Setenv("TEST_ANTHROPIC_API_KEY", "present")
+	t.Setenv("TEST_OPENAI_BASE_URL", "present")
+	forceMockE2EEnv()
+	if os.Getenv("TEST_ANTHROPIC_API_KEY") != "" || os.Getenv("TEST_OPENAI_BASE_URL") != "" {
+		t.Fatal("force mock did not clear provider selectors")
+	}
 }
 
 // ============================================================================
@@ -232,7 +255,9 @@ func loadDotEnv(t testing.TB) {
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			t.Log(".env.test not found — relying on OS env vars")
+			if t != nil {
+				t.Log(".env.test not found — relying on OS env vars")
+			}
 			return
 		}
 		dir = parent
