@@ -30,6 +30,23 @@ Moon Bridge Desktop does not increase ChatGPT usage limits or convert subscripti
 
 External models may not behave identically to OpenAI models. The goal is to combine strong planning and review with a practical, separately billed implementation path.
 
+## Sister Project: Anthro Bridge
+
+If your development workflow also uses Claude Code Desktop, see [Anthro Bridge](https://github.com/soheidon/anthro-bridge).
+
+While Claude Code CLI allows the use of third-party API providers and custom routing configurations, the Claude Desktop application does not permit this level of flexibility and is restricted to Anthropic's official backend. This creates a gap for developers who want to use Claude's interface while still routing requests through external model providers or alternative billing sources.
+
+Anthro Bridge exists to solve this limitation.
+
+Anthro Bridge takes a different approach from Moon Bridge Desktop, using a 3P Gateway-based architecture to route Anthropic-compatible workflows. It allows users to assign external model providers to configurable Opus, Sonnet, and Haiku routes and manage them through a desktop application.
+
+Moon Bridge Desktop and Anthro Bridge are independently developed sister projects that share a common goal: giving developers more control over which models, providers, and billing sources handle different parts of their work.
+
+* Moon Bridge Desktop focuses on Codex in the ChatGPT desktop app and OpenAI Responses API routing.
+* Anthro Bridge focuses on Claude Code Desktop, Claude Cowork, and Anthropic-compatible routing.
+
+Both projects are completely independent and can be used separately.
+
 ## Current Technical Preview
 
 Version 0.1.0 implements the DeepSeek V4 routing path. It provides:
