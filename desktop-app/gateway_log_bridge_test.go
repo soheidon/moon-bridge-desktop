@@ -48,9 +48,35 @@ func gatewayLogs(t *testing.T, events []capturedEvent) []GatewayLogDTO {
 	return out
 }
 
-// millisRFC3339 matches the emitted timestamp format: RFC3339 with local offset
-// and millisecond precision (e.g. 2026-08-07T06:13:54.426+09:00).
-var millisRFC3339 = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}$`)
+// millisRFC3339 matches the emitted timestamp format: RFC3339 with millisecond
+// precision and either a UTC "Z" or a numeric offset
+// (e.g. 2026-08-07T06:13:54.426Z or 2026-08-07T06:13:54.426+09:00).
+var millisRFC3339 = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}(?:Z|[+-]\d{2}:\d{2})$`)
+
+func TestGatewayLogBridgeTimestampFormat(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		match bool
+	}{
+		{"UTC Z", "2026-08-12T22:08:13.931Z", true},
+		{"positive offset", "2026-08-13T07:08:13.931+09:00", true},
+		{"negative offset", "2026-08-12T17:08:13.931-05:00", true},
+		{"no timezone", "2026-08-12T22:08:13.931", false},
+		{"offset without colon", "2026-08-13T07:08:13.931+0900", false},
+		{"missing milliseconds", "2026-08-13T07:08:13+09:00", false},
+		{"missing seconds and milliseconds", "2026-08-13T07:08+09:00", false},
+		{"trailing garbage", "2026-08-12T22:08:13.931Z extra", false},
+		{"invalid timezone string", "2026-08-12T22:08:13.931UTC", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := millisRFC3339.MatchString(tt.input); got != tt.match {
+				t.Errorf("MatchString(%q) = %v, want %v", tt.input, got, tt.match)
+			}
+		})
+	}
+}
 
 func TestGatewayLogBridgeEmitsPerLine(t *testing.T) {
 	emit, events := captureEmit(t)
