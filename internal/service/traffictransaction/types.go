@@ -18,6 +18,7 @@ const (
 	OperationDisable Operation = "disable"
 	OperationRestore Operation = "restore"
 	OperationDiscard Operation = "discard"
+	OperationCleanup Operation = "cleanup"
 )
 
 type Phase string
@@ -93,6 +94,13 @@ type ConfigEditor interface {
 
 type BackupRef struct{ ID string }
 
+type CleanupPending struct {
+	TransactionID       string
+	BackupID            string
+	RouteMutationResult string
+	Status              string
+}
+
 type BackupManager interface {
 	Create(context.Context) (BackupRef, error)
 	Remove(context.Context, BackupRef) error
@@ -130,6 +138,9 @@ type RecoveryWriter interface {
 	HasUnresolved(context.Context) (bool, error)
 	Checkpoint(context.Context, Checkpoint) error
 	Current(context.Context) (Checkpoint, error)
+	SetCleanupPending(context.Context, CleanupPending) error
+	GetCleanupPending(context.Context) (*CleanupPending, error)
+	ClearCleanupPending(context.Context, string, string) error
 }
 
 type IDGenerator interface{ New() string }
@@ -153,6 +164,7 @@ type Snapshot struct {
 	IntegrationActive    bool
 	Retryable            bool
 	ConfirmationRequired bool
+	CleanupPending       *CleanupPending
 }
 
 type FailureCause string

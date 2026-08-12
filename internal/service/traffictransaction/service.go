@@ -3,7 +3,9 @@ package traffictransaction
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -48,6 +50,51 @@ func New(deps Dependencies) *Service {
 // services; New remains as a concise alias for tests and adapters.
 func NewService(deps Dependencies) *Service { return New(deps) }
 
+// RetryBackupCleanup removes only the pending backup artifact. It never reruns
+// a route mutation, and stale transaction IDs are safe no-ops.
+func validateBackupID(id string) error {
+	if id == "" || id == "." || id == ".." || filepath.IsAbs(id) ||
+		strings.ContainsAny(id, `/\\`) || id != filepath.Base(id) {
+		return errors.New("invalid backup id")
+	}
+	for _, r := range id {
+		if r < 0x20 || r == 0x7f {
+			return errors.New("invalid backup id")
+		}
+	}
+	return nil
+}
+
+func (s *Service) RetryBackupCleanup(ctx context.Context, transactionID string) (bool, error) {
+	s.mu.Lock()
+	if s.active != nil {
+		s.mu.Unlock()
+		return false, safeError(KindTransactionInProgress, "another traffic operation is in progress", true)
+	}
+	s.active = &activeTransaction{id: transactionID, operation: OperationCleanup}
+	s.mu.Unlock()
+	defer s.releaseOperation(transactionID)
+
+	if transactionID == "" {
+		return false, nil
+	}
+	writer := s.deps.Recovery
+	pending, err := writer.GetCleanupPending(ctx)
+	if err != nil || pending == nil || pending.TransactionID != transactionID || pending.BackupID == "" {
+		return false, err
+	}
+	if err := validateBackupID(pending.BackupID); err != nil {
+		return false, err
+	}
+	if err := s.deps.Backup.Remove(ctx, BackupRef{ID: pending.BackupID}); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return false, err
+	}
+	if err := writer.ClearCleanupPending(ctx, transactionID, pending.BackupID); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // OwnerID returns the transaction identity that currently claims Desktop
 // capture ownership in this process, or "" when none is held. Enable stores the
 // same identity in s.ownerID and the capture's desktopOwnerID, and a failed
@@ -73,6 +120,11 @@ func (s *Service) Enable(ctx context.Context) (Snapshot, error) {
 		return Snapshot{}, err
 	}
 	defer s.releaseOperation(txID)
+	if pending, err := s.deps.Recovery.GetCleanupPending(ctx); err != nil {
+		return Snapshot{}, safeError(KindRecoveryRequired, "cleanup state is unavailable", true)
+	} else if pending != nil {
+		return Snapshot{}, safeError(KindTransactionInProgress, "backup cleanup is pending", false)
+	}
 
 	gw, err := s.deps.Gateway.Snapshot(ctx)
 	if err != nil {
@@ -267,15 +319,29 @@ func (s *Service) Enable(ctx context.Context) (Snapshot, error) {
 	if trafficValidationErr != nil {
 		return s.backout(ctx, txID, prepared, backup, gw, final, state, CauseFinalValidation, safeError(KindRecoveryRequired, "final traffic ownership could not be verified", true))
 	}
-	if err := s.deps.Backup.Remove(ctx, backup); err != nil {
-		// Retaining a backup is safe and does not invalidate a successful enable.
-	}
 	s.mu.Lock()
 	s.ownerID = txID
 	s.lastGateway = gw
 	s.lastGeneration = validatedFinal.Generation
 	s.mu.Unlock()
-	return snapshotFrom(validatedFinal, gw, PhaseCompleted, true), nil
+	var cleanupPending *CleanupPending
+	cleanupPending = &CleanupPending{TransactionID: txID, BackupID: backup.ID, RouteMutationResult: "applied", Status: "pending"}
+	if err := s.deps.Recovery.SetCleanupPending(ctx, *cleanupPending); err != nil {
+		cleanupPending.Status = "persistence_failed"
+		return Snapshot{Operation: OperationEnable, Phase: PhaseCompleted, IntegrationActive: true, CleanupPending: cleanupPending}, safeError(KindRecoveryRequired, "backup cleanup state could not be persisted", true)
+	}
+	if err := s.deps.Backup.Remove(ctx, backup); err != nil {
+		cleanupPending.Status = "delete_failed"
+		return Snapshot{Operation: OperationEnable, Phase: PhaseCompleted, IntegrationActive: true, CleanupPending: cleanupPending}, err
+	}
+	if err := s.deps.Recovery.ClearCleanupPending(ctx, txID, backup.ID); err != nil {
+		cleanupPending.Status = "clear_failed"
+		return Snapshot{Operation: OperationEnable, Phase: PhaseCompleted, IntegrationActive: true, CleanupPending: cleanupPending}, err
+	}
+	cleanupPending = nil
+	snapshot := snapshotFrom(validatedFinal, gw, PhaseCompleted, true)
+	snapshot.CleanupPending = cleanupPending
+	return snapshot, nil
 }
 
 // Disable stops Desktop ownership and restores only the managed Codex root

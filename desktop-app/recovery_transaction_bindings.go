@@ -314,6 +314,20 @@ func (a *App) discardRecovery(ctx context.Context, input DiscardRecoveryInput) (
 	if traffic.Mode == trafficanalysis.ModeDesktop || traffic.ListeningAddress != "" || traffic.Mode == trafficanalysis.ModeRecovery {
 		return nil, errRecoveryUnsafe
 	}
+	if state.CleanupPending != nil {
+		err := a.recovery.Update(ctx, func(current *recovery.State) error {
+			if !sameRecoveryState(current, state) || current.CleanupPending == nil {
+				return errRecoveryStateChanged
+			}
+			current.IntegrationActive = false
+			current.Phase = recovery.PhaseInactive
+			return nil
+		})
+		if err != nil {
+			return nil, errRecoveryUnsafe
+		}
+		return a.desktopSnapshot(ctx)
+	}
 	deleted, err := a.recovery.DeleteIf(ctx, func(current *recovery.State) (bool, error) {
 		return sameRecoveryState(current, state), nil
 	})

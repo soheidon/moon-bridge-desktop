@@ -366,6 +366,36 @@ func (r trafficRecoveryWriter) Current(ctx context.Context) (traffictransaction.
 	return checkpointFromRecovery(st), nil
 }
 
+func (r trafficRecoveryWriter) SetCleanupPending(ctx context.Context, pending traffictransaction.CleanupPending) error {
+	return r.store.UpdateOrCreate(ctx, func(current *recovery.State) error {
+		current.CleanupPending = &recovery.CleanupPending{
+			TransactionID:       pending.TransactionID,
+			BackupID:            pending.BackupID,
+			RouteMutationResult: pending.RouteMutationResult,
+			Status:              pending.Status,
+		}
+		return nil
+	})
+}
+
+func (r trafficRecoveryWriter) GetCleanupPending(ctx context.Context) (*traffictransaction.CleanupPending, error) {
+	st, err := r.store.Load(ctx)
+	if err != nil || st == nil || st.CleanupPending == nil {
+		return nil, err
+	}
+	return &traffictransaction.CleanupPending{
+		TransactionID:       st.CleanupPending.TransactionID,
+		BackupID:            st.CleanupPending.BackupID,
+		RouteMutationResult: st.CleanupPending.RouteMutationResult,
+		Status:              st.CleanupPending.Status,
+	}, nil
+}
+
+func (r trafficRecoveryWriter) ClearCleanupPending(ctx context.Context, transactionID, backupID string) error {
+	_, err := r.store.ClearCleanupPending(ctx, transactionID, backupID)
+	return err
+}
+
 func (r trafficRecoveryWriter) Checkpoint(ctx context.Context, cp traffictransaction.Checkpoint) error {
 	err := r.store.UpdateOrCreate(ctx, func(current *recovery.State) error {
 		fp, err := recovery.CodexHomeFingerprint(r.configHome)
@@ -737,6 +767,16 @@ func trafficBindingError(operation string, err error) DesktopCommandResult {
 	return result
 }
 
+func routeMutationResult(snap traffictransaction.Snapshot) string {
+	if snap.CleanupPending != nil && snap.CleanupPending.RouteMutationResult != "" {
+		return snap.CleanupPending.RouteMutationResult
+	}
+	if snap.IntegrationActive || snap.Phase == traffictransaction.PhaseCompleted {
+		return "applied"
+	}
+	return "unchanged"
+}
+
 func (a *App) executeTrafficCommand(operation string, fn func(context.Context, *traffictransaction.Service) (traffictransaction.Snapshot, error)) (result DesktopCommandResult) {
 	if !a.trafficMutationAllowed(operation) {
 		return errDesktop(operation, "lifecycle", "desktop_app_not_ready", "desktop app is not ready", true)
@@ -756,6 +796,23 @@ func (a *App) executeTrafficCommand(operation string, fn func(context.Context, *
 	}
 	snap, err := fn(ctx, tx)
 	if err != nil {
+		if snap.IntegrationActive || snap.Phase == traffictransaction.PhaseCompleted || snap.CleanupPending != nil {
+			result = trafficBindingError(operation, err)
+			value, snapshotErr := a.desktopSnapshot(ctx)
+			if snapshotErr != nil {
+				return errDesktop(operation, "snapshot", "desktop_snapshot_unavailable", "desktop snapshot is unavailable", true)
+			}
+			value.RouteMutationResult = routeMutationResult(snap)
+			value.CleanupPending = snap.CleanupPending != nil
+			if snap.CleanupPending != nil {
+				value.CleanupStatus = snap.CleanupPending.Status
+			}
+			result.Value = value
+			if result.Error != nil {
+				result.Error.Details = map[string]any{"routeMutationResult": value.RouteMutationResult, "cleanupStatus": value.CleanupStatus, "cleanupPending": value.CleanupPending}
+			}
+			return result
+		}
 		return trafficBindingError(operation, err)
 	}
 	value, err := a.desktopSnapshot(ctx)

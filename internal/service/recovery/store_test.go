@@ -83,6 +83,44 @@ func TestStoreRoundTrip(t *testing.T) {
 	}
 }
 
+func TestStoreLoadUnsafeURLPreservesRecoveryFile(t *testing.T) {
+	ctx := context.Background()
+	s, dir := testStore(t)
+	path := s.Path()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	unsafe := `{"schemaVersion":2,"phase":"integration_applied","previousOpenaiBaseUrlPresent":true,"previousOpenaiBaseUrl":"https://user:password@example.com","appliedOpenaiBaseUrl":"http://127.0.0.1:38441","configPath":"config.toml"}`
+	if err := os.WriteFile(path, []byte(unsafe), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeHash := HashBytes(before)
+	beforeSize := len(before)
+	configPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(configPath, []byte("model = \"gpt\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configBefore, _ := os.ReadFile(configPath)
+	if _, err := s.Load(ctx); err == nil {
+		t.Fatal("unsafe recovery URL must be rejected")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if HashBytes(after) != beforeHash || len(after) != beforeSize {
+		t.Fatal("recovery file changed")
+	}
+	configAfter, _ := os.ReadFile(configPath)
+	if HashBytes(configAfter) != HashBytes(configBefore) {
+		t.Fatal("config changed")
+	}
+}
+
 func TestStoreLoadMissingIsNil(t *testing.T) {
 	ctx := context.Background()
 	s, _ := testStore(t)
@@ -206,6 +244,67 @@ func TestStoreUpdateCallbackErrorPreservesOldState(t *testing.T) {
 	after, _ := os.ReadFile(s.Path())
 	if string(before) != string(after) {
 		t.Fatal("callback error must not persist partial changes")
+	}
+}
+
+func TestClearCleanupPendingDeletesOnlyPendingState(t *testing.T) {
+	ctx := context.Background()
+	s, _ := testStore(t)
+	pending := &CleanupPending{TransactionID: "tx", BackupID: "20260805T103040123Z-config.toml", RouteMutationResult: "applied", Status: "pending"}
+	st := New()
+	st.Phase = PhaseInactive
+	st.CleanupPending = pending
+	if err := s.Write(ctx, st); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClearCleanupPending(ctx, "wrong", pending.BackupID); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.Load(ctx); got == nil || got.CleanupPending == nil {
+		t.Fatal("mismatched clear changed state")
+	}
+	if _, err := s.ClearCleanupPending(ctx, pending.TransactionID, pending.BackupID); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.Load(ctx); got != nil {
+		t.Fatalf("pending-only state remains: %#v", got)
+	}
+}
+
+func TestCleanupPendingOnlySurvivesStoreRecreation(t *testing.T) {
+	ctx := context.Background()
+	s, dir := testStore(t)
+	pending := &CleanupPending{TransactionID: "tx-restart", BackupID: "20260805T103040123Z-config.toml", RouteMutationResult: "applied", Status: "pending"}
+	st := stateWithPhase(t, s, PhaseInactive)
+	st.CleanupPending = pending
+	if err := s.Write(ctx, st); err != nil {
+		t.Fatal(err)
+	}
+	recreated, err := NewStore(&Paths{RecoveryDir: filepath.Join(dir, "recovery"), CodexHome: dir}, s.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := recreated.Load(ctx)
+	if err != nil || got == nil || got.CleanupPending == nil || *got.CleanupPending != *pending {
+		t.Fatalf("recreated pending = %#v, %v", got, err)
+	}
+}
+
+func TestClearCleanupPendingKeepsRegularRecovery(t *testing.T) {
+	ctx := context.Background()
+	s, _ := testStore(t)
+	st := stateWithPhase(t, s, PhaseIntegrationApplied)
+	st.OperationID = "op"
+	st.CleanupPending = &CleanupPending{TransactionID: "tx", BackupID: "20260805T103040123Z-config.toml", RouteMutationResult: "applied", Status: "pending"}
+	if err := s.Write(ctx, st); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClearCleanupPending(ctx, "tx", st.CleanupPending.BackupID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Load(ctx)
+	if err != nil || got == nil || got.CleanupPending != nil {
+		t.Fatalf("regular state after clear = %#v, %v", got, err)
 	}
 }
 

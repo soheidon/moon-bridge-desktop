@@ -84,6 +84,14 @@ type RecoveryMigrationState struct {
 	MigratedAt          string `json:"migratedAt"`
 }
 
+// CleanupPending records a backup cleanup that is independent from route recovery.
+type CleanupPending struct {
+	TransactionID       string `json:"transactionId"`
+	BackupID            string `json:"backupId"`
+	RouteMutationResult string `json:"routeMutationResult"`
+	Status              string `json:"status"`
+}
+
 // State is the persisted crash-recovery record. JSON keys are camelCase and
 // match the Rust RecoveryState; startup uses SchemaVersion to reject unsupported
 // versions and ignores unknown fields.
@@ -113,7 +121,8 @@ type State struct {
 	UnsavedObservationsMayRemain bool `json:"unsavedObservationsMayRemain"`
 	UnsavedDiscardConfirmed      bool `json:"unsavedDiscardConfirmed"`
 
-	Migration *RecoveryMigrationState `json:"migration,omitempty"`
+	Migration      *RecoveryMigrationState `json:"migration,omitempty"`
+	CleanupPending *CleanupPending         `json:"cleanupPending,omitempty"`
 
 	CaptureStateLastKnown string `json:"captureStateLastKnown,omitempty"`
 	RelayActiveLastKnown  bool   `json:"relayActiveLastKnown"`

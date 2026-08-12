@@ -13,6 +13,37 @@ import (
 	"moonbridge/internal/service/trafficanalysis"
 )
 
+func TestTrafficSnapshotCleanupDetailsAreSecretSafe(t *testing.T) {
+	cases := []struct{ name, route, status string }{
+		{"applied_pending", "applied", "pending"},
+		{"restored_persistence", "restored", "persistence_failed"},
+		{"unchanged_delete", "unchanged", "delete_failed"},
+		{"applied_clear", "applied", "clear_failed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			value := &DesktopSnapshot{RouteMutationResult: tc.route, CleanupStatus: tc.status, CleanupPending: true}
+			result := DesktopCommandResult{OK: false, Value: value, Error: &CommandError{Code: "cleanup_failed"}}
+			if result.Value == nil {
+				t.Fatal("error result lost Value")
+			}
+			data, err := json.Marshal(result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw := string(data)
+			if !strings.Contains(raw, tc.route) || !strings.Contains(raw, tc.status) {
+				t.Fatal("safe cleanup details missing")
+			}
+			for _, secret := range []string{"BackupID", "password", "Authorization", "api_key", "prompt", "raw body", "SENTINEL"} {
+				if strings.Contains(raw, secret) {
+					t.Fatalf("secret marker leaked: %q", secret)
+				}
+			}
+		})
+	}
+}
+
 func TestTrafficBindingUsesSafeEnvelopeAndRejectsWithoutGateway(t *testing.T) {
 	app := NewApp(AppOptions{})
 	result := app.StartTrafficAnalysis()

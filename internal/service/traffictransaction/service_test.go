@@ -180,6 +180,9 @@ func (f *fakeBackup) Remove(context.Context, BackupRef) error {
 }
 
 type fakeRecovery struct {
+	cleanup             *CleanupPending
+	cleanupErr          error
+	clearErr            error
 	mu                  sync.Mutex
 	unresolved          bool
 	failPhase           Phase
@@ -216,6 +219,31 @@ func (f *fakeRecovery) Checkpoint(_ context.Context, cp Checkpoint) error {
 	f.checkpoints = append(f.checkpoints, cp)
 	if f.onCheckpointSuccess != nil {
 		f.onCheckpointSuccess(cp)
+	}
+	return nil
+}
+
+func (f *fakeRecovery) SetCleanupPending(_ context.Context, pending CleanupPending) error {
+	if f.cleanupErr != nil {
+		return f.cleanupErr
+	}
+	f.cleanup = &pending
+	return nil
+}
+
+func (f *fakeRecovery) GetCleanupPending(context.Context) (*CleanupPending, error) {
+	if f.cleanupErr != nil {
+		return nil, f.cleanupErr
+	}
+	return f.cleanup, nil
+}
+
+func (f *fakeRecovery) ClearCleanupPending(_ context.Context, transactionID, backupID string) error {
+	if f.clearErr != nil {
+		return f.clearErr
+	}
+	if f.cleanup != nil && f.cleanup.TransactionID == transactionID && f.cleanup.BackupID == backupID {
+		f.cleanup = nil
 	}
 	return nil
 }

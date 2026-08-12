@@ -11,6 +11,33 @@ import (
 
 func stringPtr(value string) *string { return &value }
 
+func TestReadRootURLRejectsUnsafeExistingURL(t *testing.T) {
+	cases := []struct {
+		name   string
+		config string
+	}{
+		{name: "userinfo", config: "openai_base_url = \"https://user:password@example.com\"\n"},
+		{name: "query", config: "openai_base_url = \"https://example.com/?token=secret\"\n"},
+		{name: "fragment", config: "openai_base_url = \"https://example.com/#secret\"\n"},
+		{name: "control_character", config: "openai_base_url = \"https://example.com/\\u0001\"\n"},
+		{name: "encoded_line_feed", config: "openai_base_url = \"https://example.com/%0a\"\n"},
+		{name: "encoded_delete", config: "openai_base_url = \"https://example.com/%7f\"\n"},
+		{name: "opaque", config: "openai_base_url = \"http:opaque\"\n"},
+		{name: "missing_host", config: "openai_base_url = \"http:///path\"\n"},
+		{name: "invalid_scheme", config: "openai_base_url = \"ftp://example.com\"\n"},
+		{name: "malformed", config: "openai_base_url = \"http://[::1\"\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, home, _ := newTestService(t)
+			writeFile(t, filepath.Join(home, "config.toml"), tc.config)
+			if _, err := svc.ReadRootURL(context.Background()); kindOf(t, err) != KindValidationFailed {
+				t.Fatalf("expected validation failure, got %v", err)
+			}
+		})
+	}
+}
+
 func TestReadRootURLIgnoresCommentsStringsAndTables(t *testing.T) {
 	svc, home, _ := newTestService(t)
 	config := "# openai_base_url = \"http://comment.invalid\"\n" +

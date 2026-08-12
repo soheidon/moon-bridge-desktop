@@ -76,6 +76,7 @@ func TestReconcilePendingRestore(t *testing.T) {
 	}
 	cfg := []byte(`[model_provider]` + "\nmodel = \"x\"\n")
 	cfgHash := HashBytes(cfg)
+	previousURL := "http://127.0.0.1:38441/"
 	seedState(t, s, &State{
 		SchemaVersion:                SchemaVersion,
 		IntegrationActive:            true,
@@ -86,6 +87,7 @@ func TestReconcilePendingRestore(t *testing.T) {
 		ConfigHashAfterApply:         cfgHash,
 		AppliedOpenaiBaseURL:         "http://127.0.0.1:38441/",
 		PreviousOpenaiBaseURLPresent: true,
+		PreviousOpenaiBaseURL:        &previousURL,
 	})
 	res, st := runReconcile(t, s, cfg, nil)
 	if res.Status != StatusPendingRestore {

@@ -167,6 +167,14 @@ func (s *Store) decode(data []byte) (*State, error) {
 	if err := s.validatePaths(&st); err != nil {
 		return nil, err
 	}
+	if st.PreviousOpenaiBaseURLPresent {
+		if st.PreviousOpenaiBaseURL == nil || codexconfig.ValidateTrafficURL(*st.PreviousOpenaiBaseURL) != nil {
+			return nil, &Error{Kind: KindRestoreFailed, Message: "recovery original route is invalid"}
+		}
+	}
+	if st.AppliedOpenaiBaseURL != "" && codexconfig.ValidateTrafficURL(st.AppliedOpenaiBaseURL) != nil {
+		return nil, &Error{Kind: KindRestoreFailed, Message: "recovery applied route is invalid"}
+	}
 	return &st, nil
 }
 
@@ -303,6 +311,38 @@ func (s *Store) DeleteIf(ctx context.Context, predicate func(*State) (bool, erro
 	return true, nil
 }
 
+// ClearCleanupPending atomically clears a matching cleanup record. If no
+// regular recovery evidence remains, it removes the state file as part of the
+// same store-serialized operation.
+func (s *Store) ClearCleanupPending(ctx context.Context, transactionID, backupID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, err := s.loadUnlocked(ctx)
+	if err != nil || current == nil || current.CleanupPending == nil {
+		return false, err
+	}
+	if current.CleanupPending.TransactionID != transactionID || current.CleanupPending.BackupID != backupID {
+		return false, nil
+	}
+	current.CleanupPending = nil
+	if !hasRegularRecovery(current) {
+		if err := os.Remove(s.path); err != nil && !os.IsNotExist(err) {
+			return false, &Error{Kind: KindStateParseFailed, Message: "remove recovery state failed"}
+		}
+		return true, nil
+	}
+	return true, s.writeLocked(ctx, current)
+}
+
+func hasRegularRecovery(st *State) bool {
+	if st == nil || st.CleanupPending != nil {
+		return false
+	}
+	return st.IntegrationActive || st.OperationID != "" || st.ConfigPath != "" ||
+		st.ConfigHashBeforeApply != "" || st.ConfigHashAfterApply != "" ||
+		st.UnsavedObservationsMayRemain || st.Phase != PhaseInactive && st.Phase != PhaseReconciledRestored
+}
+
 // errChangesSkipped is returned by Update callbacks that decide nothing should
 // be persisted (e.g. a reconciliation that found no work). Update treats it as
 // a successful no-op, not an error.
@@ -382,6 +422,19 @@ func (s *Store) normalizeForWrite(st *State) (*State, error) {
 	out.UpdatedAt = &now
 
 	var err error
+	if out.PreviousOpenaiBaseURLPresent {
+		if out.PreviousOpenaiBaseURL == nil {
+			return nil, &Error{Kind: KindRestoreFailed, Message: "recovery original route is invalid"}
+		}
+		if err := codexconfig.ValidateTrafficURL(*out.PreviousOpenaiBaseURL); err != nil {
+			return nil, &Error{Kind: KindRestoreFailed, Message: "recovery original route is invalid"}
+		}
+	}
+	if out.AppliedOpenaiBaseURL != "" {
+		if err := codexconfig.ValidateTrafficURL(out.AppliedOpenaiBaseURL); err != nil {
+			return nil, &Error{Kind: KindRestoreFailed, Message: "recovery applied route is invalid"}
+		}
+	}
 	if out.ConfigPath != "" {
 		out.ConfigPath, err = s.normalizePath(out.ConfigPath, s.paths.CodexHome)
 		if err != nil {
@@ -497,6 +550,10 @@ func cloneState(st *State) *State {
 		m := *st.Migration
 		out.Migration = &m
 	}
+	if st.CleanupPending != nil {
+		c := *st.CleanupPending
+		out.CleanupPending = &c
+	}
 	return &out
 }
 
@@ -552,6 +609,20 @@ func (s *Store) validateNormalizedState(st *State) error {
 	if st.Migration != nil && st.Migration.SourcePath != "" {
 		if !validMigrationSource(st.Migration.SourcePath) {
 			return &Error{Kind: KindStateParseFailed, Message: "recovery migration.sourcePath is not a valid logical id"}
+		}
+	}
+	if st.CleanupPending != nil {
+		if st.CleanupPending.TransactionID == "" || st.CleanupPending.BackupID == "" {
+			return &Error{Kind: KindRestoreFailed, Message: "invalid cleanup pending record"}
+		}
+		if filepath.Base(st.CleanupPending.BackupID) != st.CleanupPending.BackupID || strings.ContainsAny(st.CleanupPending.BackupID, `/\\`) {
+			return &Error{Kind: KindRestoreFailed, Message: "invalid cleanup pending record"}
+		}
+		if st.CleanupPending.RouteMutationResult != "applied" && st.CleanupPending.RouteMutationResult != "restored" && st.CleanupPending.RouteMutationResult != "unchanged" {
+			return &Error{Kind: KindRestoreFailed, Message: "invalid cleanup pending record"}
+		}
+		if st.CleanupPending.Status != "pending" && st.CleanupPending.Status != "persistence_failed" && st.CleanupPending.Status != "delete_failed" && st.CleanupPending.Status != "clear_failed" {
+			return &Error{Kind: KindRestoreFailed, Message: "invalid cleanup pending record"}
 		}
 	}
 	return nil
@@ -795,12 +866,20 @@ func assertClassificationOnly(before, after *State) error {
 		before.UnsavedObservationsMayRemain != after.UnsavedObservationsMayRemain ||
 		before.UnsavedDiscardConfirmed != after.UnsavedDiscardConfirmed ||
 		!migrationEq(before.Migration, after.Migration) ||
+		!cleanupPendingEq(before.CleanupPending, after.CleanupPending) ||
 		before.CaptureStateLastKnown != after.CaptureStateLastKnown ||
 		before.RelayActiveLastKnown != after.RelayActiveLastKnown ||
 		before.RestartAttempted != after.RestartAttempted {
 		return newError(KindReconcileFailed, "reconcile must not modify recovery evidence fields")
 	}
 	return nil
+}
+
+func cleanupPendingEq(a, b *CleanupPending) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 func strPtrEq(a, b *string) bool {

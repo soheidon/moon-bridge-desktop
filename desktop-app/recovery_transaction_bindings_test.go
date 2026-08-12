@@ -141,6 +141,50 @@ func TestRestoreRecoveryConflictRequiresConfirmationAndLocalConfirmationPreserve
 	}
 }
 
+func TestCleanupPendingSurvivesDiscardAndClearsStateAtomically(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	home := filepath.Join(root, "codex")
+	recoveryDir := filepath.Join(root, "recovery")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte("model = \"gpt-test\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := recovery.NewStore(&recovery.Paths{RecoveryDir: recoveryDir, CodexHome: home}, filepath.Join(recoveryDir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Write(ctx, &recovery.State{SchemaVersion: recovery.SchemaVersion, Phase: recovery.PhaseReconciledRestored, StartedAt: "2026-08-07T00:00:00Z", CleanupPending: &recovery.CleanupPending{TransactionID: "tx", BackupID: "20260805T103040123Z-config.toml", RouteMutationResult: "applied", Status: "pending"}}); err != nil {
+		t.Fatal(err)
+	}
+	app := NewApp(AppOptions{CodexConfig: codexconfig.New(codexconfig.Options{Home: home}), Recovery: store, RecoveryHome: home, EmitEvents: noopEmit})
+	result := app.DiscardRecovery(DiscardRecoveryInput{Confirm: true})
+	if !result.OK {
+		t.Fatalf("discard = %#v", result)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state == nil || state.CleanupPending == nil {
+		t.Fatalf("pending not preserved: %#v", state)
+	}
+	if _, err := store.ClearCleanupPending(ctx, "wrong", state.CleanupPending.BackupID); err != nil {
+		t.Fatal(err)
+	}
+	if state2, _ := store.Load(ctx); state2 == nil || state2.CleanupPending == nil {
+		t.Fatal("mismatched clear changed pending")
+	}
+	if _, err := store.ClearCleanupPending(ctx, "tx", "20260805T103040123Z-config.toml"); err != nil {
+		t.Fatal(err)
+	}
+	if state3, _ := store.Load(ctx); state3 != nil {
+		t.Fatalf("state remains after atomic clear: %#v", state3)
+	}
+}
+
 func TestDiscardRecoveryRequiresConfirmationAndDeletesOnlyMatchingResolvedState(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

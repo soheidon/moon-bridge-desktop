@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
@@ -268,6 +269,9 @@ func readRootURL(data []byte) (RootURLSnapshot, error) {
 		if !ok {
 			return RootURLSnapshot{}, parseFailed("traffic URL value is not a string")
 		}
+		if err := ValidateTrafficURL(text); err != nil {
+			return RootURLSnapshot{}, err
+		}
 		found.value = text
 	}
 	result := RootURLSnapshot{ConfigHash: hashBytes(data)}
@@ -375,13 +379,35 @@ func deleteRootURL(data []byte) ([]byte, bool, error) {
 	return []byte(strings.Join(out, eol)), true, nil
 }
 
-func validateTrafficURL(value string) error {
+// ValidateTrafficURL accepts only absolute HTTP(S) URLs without credential or
+// request-specific components. The same boundary is used for config reads,
+// writes, and recovery persistence.
+func ValidateTrafficURL(value string) error {
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return &Error{Kind: KindValidationFailed, Message: "traffic URL contains control characters"}
+		}
+	}
 	u, err := url.Parse(value)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+	if err != nil || !u.IsAbs() || u.Opaque != "" || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return &Error{Kind: KindValidationFailed, Message: "traffic URL must be an absolute HTTP(S) URL without credentials or query data"}
+	}
+	decodedPath, err := url.PathUnescape(u.EscapedPath())
+	if err != nil {
+		return &Error{Kind: KindValidationFailed, Message: "traffic URL path is invalid"}
+	}
+	for _, r := range decodedPath {
+		if unicode.IsControl(r) {
+			return &Error{Kind: KindValidationFailed, Message: "traffic URL contains control characters"}
+		}
+	}
+	if u.Host == "" {
 		return &Error{Kind: KindValidationFailed, Message: "traffic URL must be an absolute HTTP(S) URL without credentials or query data"}
 	}
 	return nil
 }
+
+func validateTrafficURL(value string) error { return ValidateTrafficURL(value) }
 
 func decodeTOML(data []byte) (map[string]any, error) {
 	var decoded map[string]any

@@ -23,6 +23,9 @@ type DesktopCommandResult struct {
 }
 
 type DesktopSnapshot struct {
+	RouteMutationResult string                   `json:"routeMutationResult,omitempty"`
+	CleanupStatus       string                   `json:"cleanupStatus,omitempty"`
+	CleanupPending      bool                     `json:"cleanupPending,omitempty"`
 	Gateway             *SafeGatewaySnapshot     `json:"gateway,omitempty"`
 	Codex               *CodexState              `json:"codex,omitempty"`
 	Config              *CodexConfigSnapshot     `json:"config,omitempty"`
