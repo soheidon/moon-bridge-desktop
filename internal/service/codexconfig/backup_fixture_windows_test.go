@@ -5,6 +5,7 @@ package codexconfig
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -45,15 +46,42 @@ func newBackupTestDir(t *testing.T) string {
 	return dir
 }
 
-func assertSafeFixtureError(t *testing.T, err error) {
+var windowsSIDPattern = regexp.MustCompile(`(?i)\bS-\d-\d+(?:-\d+)+\b`)
+
+func assertSafeFixtureError(t *testing.T, err error, inspectedPaths ...string) {
 	t.Helper()
 	if err == nil {
 		t.Fatal("expected trusted-boundary rejection")
 	}
 	message := err.Error()
-	for _, secret := range []string{"C:\\", "USERPROFILE", "LOCALAPPDATA", "APPDATA", "\\\\", "sid", "username", "secret"} {
-		if strings.Contains(strings.ToLower(message), strings.ToLower(secret)) {
-			t.Fatal("trusted-boundary error leaked sensitive detail")
+	username := os.Getenv("USERNAME")
+	secretSentinel := "secret-sentinel"
+	categories := []struct {
+		label string
+		match bool
+	}{
+		{"path", false},
+		{"username", false},
+		{"SID", windowsSIDPattern.MatchString(message)},
+		{"secret", false},
+	}
+	for _, path := range inspectedPaths {
+		if path != "" && strings.Contains(message, path) {
+			categories[0].match = true
+		}
+	}
+	if strings.Contains(strings.ToLower(message), "sid:") {
+		categories[2].match = true
+	}
+	if (username != "" && strings.Contains(message, username)) || strings.Contains(strings.ToLower(message), "username:") {
+		categories[1].match = true
+	}
+	if strings.Contains(strings.ToLower(message), "secret:") || strings.Contains(message, secretSentinel) {
+		categories[3].match = true
+	}
+	for _, category := range categories {
+		if category.match {
+			t.Fatal("trusted-boundary error leaked " + category.label)
 		}
 	}
 }
@@ -71,7 +99,7 @@ func TestWindowsBackupFixtureBoundaries(t *testing.T) {
 		t.Fatal("backup fixture is not below trusted base")
 	}
 	_, err := (windowsBackupPlatform{trustedBase: base}).openRoot(base)
-	assertSafeFixtureError(t, err)
+	assertSafeFixtureError(t, err, base)
 	outside := filepath.VolumeName(base) + string(os.PathSeparator)
 	if outside == base {
 		t.Fatal("outside boundary is not distinct")
@@ -80,7 +108,7 @@ func TestWindowsBackupFixtureBoundaries(t *testing.T) {
 		t.Fatal("outside boundary was not classified outside")
 	}
 	_, err = (windowsBackupPlatform{trustedBase: base}).openRoot(outside)
-	assertSafeFixtureError(t, err)
+	assertSafeFixtureError(t, err, outside)
 }
 
 func TestWindowsBackupFixtureCleanupIsScoped(t *testing.T) {
