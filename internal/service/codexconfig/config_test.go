@@ -11,7 +11,7 @@ import (
 func newTestService(t *testing.T) (*Service, string, string) {
 	t.Helper()
 	home := t.TempDir()
-	backupDir := filepath.Join(t.TempDir(), "backups")
+	backupDir := newBackupTestDir(t)
 	svc := New(Options{Home: home, BackupDir: backupDir, Env: func(string) string { return "" }})
 	return svc, home, backupDir
 }

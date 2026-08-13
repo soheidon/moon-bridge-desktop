@@ -69,7 +69,7 @@ func writeBackupFile(t *testing.T, dir, name string, data []byte) {
 }
 
 func TestCreateBackupWritesContent(t *testing.T) {
-	dir := t.TempDir()
+	dir := newBackupTestDir(t)
 	content := []byte("model = \"a\"\n")
 	path, err := CreateBackup(dir, content)
 	if err != nil {
@@ -88,7 +88,7 @@ func TestCreateBackupWritesContent(t *testing.T) {
 }
 
 func TestCreateBackupCreatesAnotherNotOverwrite(t *testing.T) {
-	dir := t.TempDir()
+	dir := newBackupTestDir(t)
 	if _, err := CreateBackup(dir, []byte("a")); err != nil {
 		t.Fatal(err)
 	}
@@ -539,7 +539,7 @@ func TestCreateBackupWithPartialWriteFailsSafely(t *testing.T) {
 }
 
 func TestCreateBackupDoesNotOverwriteOrMutateExisting(t *testing.T) {
-	dir := t.TempDir()
+	dir := newBackupTestDir(t)
 	existing := backupName(backupTimes[0])
 	existingContent := []byte("existing-backup-content")
 	writeBackupFile(t, dir, existing, existingContent)
