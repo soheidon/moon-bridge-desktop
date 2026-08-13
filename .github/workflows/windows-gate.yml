@@ -1,0 +1,66 @@
+name: Windows Gate
+
+# Windows専用の最終確認ゲート。通常の開発試行では使わず、push直前に
+# 必要最小限の確認を1回行うためのもの（CLAUDE.md §7）。手動起動
+# (workflow_dispatch) とmainへのpush/PRで発火する。
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go tests (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Run Go tests
+        env:
+          CGO_ENABLED: "0"
+        run: go test ./...
+
+  frontend:
+    name: Desktop frontend (Windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check and build
+        run: npm run build:web
+
+      - name: Run frontend tests
+        run: npm run test:web
