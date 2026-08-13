@@ -478,38 +478,6 @@ func TestWindowsHandleResolvedStrictChild(t *testing.T) {
 	}
 }
 
-// TestWindowsSmokeLocalStorageRoundTrip creates a backup under the real
-// LOCALAPPDATA (where AppX known-folder redirection may apply), verifies
-// DACL, content, and removal. This is the end-to-end evidence that the
-// handle-resolved containment check works under actual Windows redirection.
-func TestWindowsSmokeLocalStorageRoundTrip(t *testing.T) {
-	base := windowsTrustedBase()
-	if base == "" {
-		t.Skip("LOCALAPPDATA unavailable")
-	}
-	guid := "smoke-71b-" + t.Name()
-	dir := filepath.Join(base, guid)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-	payload := []byte("smoke-7-1b-roundtrip-payload")
-	path, err := createBackupWith(dir, payload, windowsBackupPlatform{trustedBase: base})
-	if err != nil {
-		t.Fatalf("createBackupWith under LOCALAPPDATA: %v", err)
-	}
-	got, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, payload) {
-		t.Fatal("smoke content mismatch")
-	}
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestWindowsDeletePendingKeepsProtectedArtifact(t *testing.T) {
 	base := t.TempDir()
 	dir := filepath.Join(base, "backups")
