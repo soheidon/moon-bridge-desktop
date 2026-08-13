@@ -56,11 +56,12 @@ type windowsBackupPlatform struct {
 }
 
 type windowsBackupRoot struct {
-	handle       windows.Handle
-	dir          string
-	trustedBase  string
-	identity     fileIDInfo
-	basePhysical string // handle-resolved final path of the trusted base
+	handle           windows.Handle
+	dir              string
+	trustedBase      string
+	identity         fileIDInfo
+	basePhysical     string // handle-resolved final path of the trusted base
+	baseVolumeSerial uint64 // volume serial from trusted base handle identity
 }
 
 type windowsBackupFile struct {
@@ -133,7 +134,7 @@ func (p windowsBackupPlatform) openRoot(dir string) (backupRoot, error) {
 	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
 		return nil, errBackupDirOutsideTrusted
 	}
-	base, basePhysical, err := openTrustedAnchor(p.trustedBase)
+	base, basePhysical, baseID, err := openTrustedAnchor(p.trustedBase)
 	if err != nil {
 		return nil, err
 	}
@@ -176,7 +177,7 @@ func (p windowsBackupPlatform) openRoot(dir string) (backupRoot, error) {
 		return nil, errIdentityFailed()
 	}
 	ok = true
-	return &windowsBackupRoot{handle: current, dir: dir, trustedBase: p.trustedBase, identity: identity, basePhysical: basePhysical}, nil
+	return &windowsBackupRoot{handle: current, dir: dir, trustedBase: p.trustedBase, identity: identity, basePhysical: basePhysical, baseVolumeSerial: baseID.VolumeSerialNumber}, nil
 }
 
 func sameVolume(a, b string) bool {
@@ -184,8 +185,9 @@ func sameVolume(a, b string) bool {
 }
 
 // verifyRoot pins the backup root handle: directory, non-reparse, FILE_ID_INFO
-// obtainable, and the handle-resolved final path is a strict child of the
-// trusted base's handle-resolved final path on the same volume.
+// obtainable, handle-resolved final path is a strict child of the trusted
+// base's handle-resolved final path, and the handle-derived volume serial
+// numbers match.
 func (windowsBackupPlatform) verifyRoot(r backupRoot) error {
 	root := r.(*windowsBackupRoot)
 	info, err := getFileInformation(root.handle)
@@ -198,8 +200,12 @@ func (windowsBackupPlatform) verifyRoot(r backupRoot) error {
 	if isReparsePoint(info.FileAttributes) {
 		return errRootReparse
 	}
-	if _, err := fileIdentity(root.handle); err != nil {
+	rootID, err := fileIdentity(root.handle)
+	if err != nil {
 		return errIdentityFailed()
+	}
+	if rootID.VolumeSerialNumber != root.baseVolumeSerial {
+		return errRootPathMismatch
 	}
 	got, err := finalPathByHandle(root.handle)
 	if err != nil {
@@ -390,20 +396,20 @@ func errWriteFailed() error    { return errors.New(backupWriteFailed) }
 
 // openTrustedAnchor opens the trusted base and verifies the anchor conditions
 // before it may be used as the root of handle-relative descent: directory,
-// non-reparse, FILE_ID_INFO obtainable. The handle-resolved final path is
-// returned so the caller can perform handle-based containment checks after
-// descent.
-func openTrustedAnchor(base string) (windows.Handle, string, error) {
+// non-reparse, FILE_ID_INFO obtainable. The handle-resolved final path and
+// file identity are returned so the caller can perform handle-based containment
+// and volume-identity checks after descent.
+func openTrustedAnchor(base string) (windows.Handle, string, fileIDInfo, error) {
 	p, err := windows.UTF16PtrFromString(base)
 	if err != nil {
-		return 0, "", err
+		return 0, "", fileIDInfo{}, err
 	}
 	h, err := windows.CreateFile(p, dirAccess,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
 		nil, windows.OPEN_EXISTING,
 		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
 	if err != nil {
-		return 0, "", err
+		return 0, "", fileIDInfo{}, err
 	}
 	ok := false
 	defer func() {
@@ -413,23 +419,24 @@ func openTrustedAnchor(base string) (windows.Handle, string, error) {
 	}()
 	info, err := getFileInformation(h)
 	if err != nil {
-		return 0, "", err
+		return 0, "", fileIDInfo{}, err
 	}
 	if info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
-		return 0, "", errTrustedBaseNotDirectory
+		return 0, "", fileIDInfo{}, errTrustedBaseNotDirectory
 	}
 	if isReparsePoint(info.FileAttributes) {
-		return 0, "", errTrustedBaseReparse
+		return 0, "", fileIDInfo{}, errTrustedBaseReparse
 	}
 	got, err := finalPathByHandle(h)
 	if err != nil {
-		return 0, "", err
+		return 0, "", fileIDInfo{}, err
 	}
-	if _, err := fileIdentity(h); err != nil {
-		return 0, "", err
+	baseID, err := fileIdentity(h)
+	if err != nil {
+		return 0, "", fileIDInfo{}, err
 	}
 	ok = true
-	return h, got, nil
+	return h, got, baseID, nil
 }
 
 // openDirComponent opens (creating if needed) one bare-name component relative

@@ -478,6 +478,40 @@ func TestWindowsHandleResolvedStrictChild(t *testing.T) {
 	}
 }
 
+// TestWindowsVerifyRootVolumeSerialRejection verifies that verifyRoot rejects
+// a root whose handle-derived VolumeSerialNumber does not match the trusted
+// base's. Because openRoot always sets baseVolumeSerial from the real anchor,
+// we mutate the field after openRoot to simulate a volume mismatch. This
+// confirms production compares serials directly — not merely drive-letter
+// strings.
+func TestWindowsVerifyRootVolumeSerialRejection(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "vol-child")
+	p := windowsBackupPlatform{trustedBase: base}
+	rootAny, err := p.openRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := rootAny.(*windowsBackupRoot)
+	defer p.close(root, nil)
+	// verifyRoot succeeds with the real serial.
+	if err := p.verifyRoot(root); err != nil {
+		t.Fatalf("verifyRoot failed with real serial: %v", err)
+	}
+	// Mutate to a different serial to verify the serial check fires.
+	original := root.baseVolumeSerial
+	root.baseVolumeSerial = original + 1
+	err = p.verifyRoot(root)
+	if err == nil {
+		t.Fatal("verifyRoot accepted mismatched volume serial")
+	}
+	// Restore and confirm success again.
+	root.baseVolumeSerial = original
+	if err := p.verifyRoot(root); err != nil {
+		t.Fatalf("verifyRoot failed after restoring serial: %v", err)
+	}
+}
+
 func TestWindowsDeletePendingKeepsProtectedArtifact(t *testing.T) {
 	base := t.TempDir()
 	dir := filepath.Join(base, "backups")
