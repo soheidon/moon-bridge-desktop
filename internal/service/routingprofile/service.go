@@ -742,12 +742,8 @@ func normalizeSlotMode(mode string, reasoning *string) (string, error) {
 	if mode != ModeNormal && mode != ModeThinking {
 		return "", fmt.Errorf("mode must be normal or thinking")
 	}
-	if mode == ModeNormal && reasoning != nil {
-		return "", fmt.Errorf("normal mode must not have reasoning")
-	}
-	if mode == ModeThinking && reasoning == nil {
-		return "", fmt.Errorf("thinking mode requires reasoning")
-	}
+	// Thinking + nil reasoning（Default）を許可
+	// Normal + reasoningも許可（ユーザー選択を上書きしない）
 	return mode, nil
 }
 
@@ -865,10 +861,8 @@ func providerDisplayLabel(providerID string) string {
 
 func reasoningAllowed(model, effort string) bool {
 	effort = deepseek.NormalizeReasoningEffort(effort)
-	allowed := deepseek.AllowedReasoningEfforts(model)
-	if len(allowed) == 0 {
-		allowed = []string{deepseek.ReasoningLow, deepseek.ReasoningHigh, deepseek.ReasoningMax}
-	}
+	// すべてのモデルでlow/high/maxを許可（スロット・モデルによる制約なし）
+	allowed := []string{deepseek.ReasoningLow, deepseek.ReasoningHigh, deepseek.ReasoningMax}
 	return contains(allowed, effort)
 }
 

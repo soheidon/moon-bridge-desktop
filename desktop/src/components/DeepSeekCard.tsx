@@ -31,7 +31,6 @@ export function DeepSeekCard({ snapshot, deepseek, routing }: { snapshot: Gatewa
       setEnvSavePending(false);
       return;
     }
-    if (!running) return; // held until the Gateway starts
     if (deepseek.saving) return;
     if (!status.apiKeySet) {
       // First-time setup needs the key, which only the save button can send.
@@ -42,10 +41,9 @@ export function DeepSeekCard({ snapshot, deepseek, routing }: { snapshot: Gatewa
     const ok = await deepseek.configure("", apiKeyEnv);
     setEnvSavePending(false);
     if (ok) setApiKeyEnvDirty(false);
-  }, [status, apiKeyEnvDirty, running, deepseek.saving, apiKeyEnv, deepseek.configure]);
+  }, [status, apiKeyEnvDirty, deepseek.saving, apiKeyEnv, deepseek.configure]);
 
-  // A committed env save is drained when the Gateway is running and no other
-  // save is in flight; it stays pending while stopped or saving.
+  // A committed env save is drained when no other save is in flight.
   useEffect(() => {
     if (!envSavePending) return;
     if (!status) return;
@@ -53,13 +51,13 @@ export function DeepSeekCard({ snapshot, deepseek, routing }: { snapshot: Gatewa
       setEnvSavePending(false);
       return;
     }
-    if (!running || deepseek.saving) return;
+    if (deepseek.saving) return;
     void saveEnv();
-  }, [envSavePending, status, apiKeyEnvDirty, running, deepseek.saving, saveEnv]);
+  }, [envSavePending, status, apiKeyEnvDirty, deepseek.saving, saveEnv]);
 
   const saveKey = useCallback(async () => {
     if (!status) return;
-    if (!running || deepseek.saving) return;
+    if (deepseek.saving) return;
     const key = apiKey.trim();
     if (key === "") return;
     const ok = await deepseek.configure(key, apiKeyEnvDirty ? apiKeyEnv : undefined);
@@ -67,7 +65,7 @@ export function DeepSeekCard({ snapshot, deepseek, routing }: { snapshot: Gatewa
       setApiKey("");
       setApiKeyEnvDirty(false);
     }
-  }, [status, running, deepseek.saving, apiKey, apiKeyEnv, apiKeyEnvDirty, deepseek.configure]);
+  }, [status, deepseek.saving, apiKey, apiKeyEnv, apiKeyEnvDirty, deepseek.configure]);
 
   function requestEnvSave() {
     setEnvSavePending(true);
@@ -114,7 +112,6 @@ export function DeepSeekCard({ snapshot, deepseek, routing }: { snapshot: Gatewa
         <div id={contentId} className="deepseek-provider-content">
           {running && !status && !deepseek.error && <p className="deepseek-hint">設定を読み込んでいます。</p>}
           {running && status && !status.apiKeySet && !apiKey.trim() && <p className="deepseek-hint">初回設定ではAPI keyを入力してください。</p>}
-          {envSavePending && apiKeyEnvDirty && !running && <p className="deepseek-hint">Gateway開始後に保存されます。</p>}
           {deepseek.error && <p className="error-text">{deepseek.error}</p>}
           {deepseek.commandError?.gatewayLeftRunning && <p className="error-text">設定保存に失敗しました。確認のためGatewayは実行したままです。</p>}
           {deepseek.progress && <p className="deepseek-hint">{deepseek.progress.message}</p>}
@@ -147,7 +144,7 @@ export function DeepSeekCard({ snapshot, deepseek, routing }: { snapshot: Gatewa
                 <button
                   type="button"
                   className="btn btn-primary btn-small"
-                  disabled={!running || deepseek.saving || apiKey.trim() === ""}
+                  disabled={deepseek.saving || apiKey.trim() === ""}
                   onClick={() => void saveKey()}
                 >
                   キーを保存

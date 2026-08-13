@@ -294,7 +294,11 @@ func (a *App) SaveRoutingProfile(input routingprofile.Input) DesktopCommandResul
 	}
 	session, ok := a.ensureActiveSession()
 	if !ok {
-		return routingProfileGatewayNotRunning("SaveRoutingProfile")
+		snap, err := a.saveRoutingProfileToStore(input)
+		if err != nil {
+			return routingProfileError("SaveRoutingProfile", "save", "routing_profile_save_failed", err)
+		}
+		return okDesktop(&DesktopSnapshot{RoutingProfiles: desktopRoutingProfiles(snap)})
 	}
 	ctrl := a.newRoutingProfile("http://"+session.Address, session.ControlToken)
 	snap, err := ctrl.Save(a.appCtx, input)
@@ -327,4 +331,93 @@ func (a *App) SaveRoutingProfile(input routingprofile.Input) DesktopCommandResul
 		a.routingProfileRefresh(cfg)
 	}
 	return okDesktop(&DesktopSnapshot{RoutingProfiles: desktopRoutingProfiles(snap)})
+}
+
+// saveRoutingProfileToStore persists a routing profile edit to the SQLite store
+// without a live gateway session. When no persisted store exists or it is
+// unseeded, it seeds from the YAML config first then applies the edit.
+func (a *App) saveRoutingProfileToStore(input routingprofile.Input) (*routingprofile.Snapshot, error) {
+	dbPath, hasStore, err := a.resolveSQLiteDBPath()
+	if err != nil {
+		return nil, err
+	}
+	if !hasStore {
+		return nil, errors.New("no persisted store configured")
+	}
+	needSeed := false
+	if _, serr := os.Stat(dbPath); errors.Is(serr, os.ErrNotExist) {
+		needSeed = true
+	}
+	cs, closeStore, err := openPersistedConfigStore(dbPath, app.BuiltinExtensions().ConfigSpecs())
+	if err != nil {
+		return nil, err
+	}
+	defer closeStore()
+	if needSeed {
+		if err := a.seedStoreFromYAML(cs); err != nil {
+			return nil, err
+		}
+	}
+	dbCfg, err := cs.LoadAll()
+	if err != nil {
+		if !errors.Is(err, store.ErrConfigNotSeeded) {
+			return nil, err
+		}
+		if err := a.seedStoreFromYAML(cs); err != nil {
+			return nil, err
+		}
+		reload, rerr := cs.LoadAll()
+		if rerr != nil {
+			return nil, rerr
+		}
+		dbCfg = reload
+	}
+	// routing_profiles extensionの更新
+	ext, ok := dbCfg.Extensions["routing_profiles"]
+	if !ok {
+		ext = config.ExtensionSettings{}
+	}
+	if ext.RawConfig == nil {
+		ext.RawConfig = map[string]any{}
+	}
+	tableRaw, _ := ext.RawConfig["table"].(map[string]any)
+	if tableRaw == nil {
+		tableRaw = map[string]any{}
+	}
+	profileRaw, _ := tableRaw[input.Profile.ID].(map[string]any)
+	if profileRaw == nil {
+		profileRaw = map[string]any{}
+	}
+	profileRaw["display_name"] = input.Profile.DisplayName
+	slotsRaw, _ := profileRaw["slots"].(map[string]any)
+	if slotsRaw == nil {
+		slotsRaw = map[string]any{}
+	}
+	for slotID, slotInput := range input.Profile.Slots {
+		slotRaw, _ := slotsRaw[slotID].(map[string]any)
+		if slotRaw == nil {
+			slotRaw = map[string]any{}
+		}
+		slotRaw["provider"] = slotInput.Provider
+		slotRaw["upstream_model"] = slotInput.UpstreamModel
+		slotRaw["mode"] = slotInput.Mode
+		if slotInput.Reasoning != nil {
+			slotRaw["reasoning"] = *slotInput.Reasoning
+		}
+		slotsRaw[slotID] = slotRaw
+	}
+	profileRaw["slots"] = slotsRaw
+	tableRaw[input.Profile.ID] = profileRaw
+	ext.RawConfig["table"] = tableRaw
+	dbCfg.Extensions["routing_profiles"] = ext
+	if _, err := cs.SaveConfig(context.Background(), dbCfg); err != nil {
+		return nil, err
+	}
+	reloaded, err := cs.LoadAll()
+	if err != nil {
+		return nil, err
+	}
+	graph := configgraph.BuildGraph(*reloaded, "")
+	snap := routingprofile.SnapshotFromGraph(graph, false)
+	return &snap, nil
 }

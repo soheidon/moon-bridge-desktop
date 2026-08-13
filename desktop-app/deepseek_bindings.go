@@ -135,7 +135,11 @@ func (a *App) SaveDeepSeekSettings(input deepseek.Input) DesktopCommandResult {
 	}
 	session, ok := a.ensureActiveSession()
 	if !ok {
-		return deepSeekGatewayNotRunning("SaveDeepSeekSettings")
+		snap, err := a.saveDeepSeekToStore(input)
+		if err != nil {
+			return deepSeekError("SaveDeepSeekSettings", "save", "deepseek_save_failed", err)
+		}
+		return okDesktop(&DesktopSnapshot{DeepSeek: desktopDeepSeek(snap)})
 	}
 	ctrl := a.newDeepSeek("http://"+session.Address, session.ControlToken)
 	snap, err := ctrl.Save(a.appCtx, input)
@@ -218,6 +222,97 @@ func (a *App) ClearDeepSeekKey(operationId string) DesktopCommandResult {
 	session.Config = cfg
 	session.ConfigValid = true
 	return okDesktop(&DesktopSnapshot{DeepSeek: desktopDeepSeek(snap)})
+}
+
+// saveDeepSeekToStore persists the DeepSeek provider settings (API key and/or
+// api_key_env) to the SQLite store without a live gateway session. When no
+// persisted store exists or it is unseeded, it seeds from the YAML config first
+// then applies the edit. YAML fallback that returns success without saving is
+// not used here—this function always persists when a store path is configured.
+func (a *App) saveDeepSeekToStore(input deepseek.Input) (*deepseek.Snapshot, error) {
+	normalized := input.Normalized()
+	dbPath, hasStore, err := a.resolveSQLiteDBPath()
+	if err != nil {
+		return nil, err
+	}
+	if !hasStore {
+		return nil, errors.New("no persisted store configured")
+	}
+	// DB未作成の初回起動前：YAMLからseedしてから保存する
+	needSeed := false
+	if _, serr := os.Stat(dbPath); errors.Is(serr, os.ErrNotExist) {
+		needSeed = true
+	}
+	cs, closeStore, err := openPersistedConfigStore(dbPath, app.BuiltinExtensions().ConfigSpecs())
+	if err != nil {
+		return nil, err
+	}
+	defer closeStore()
+	if needSeed {
+		if err := a.seedStoreFromYAML(cs); err != nil {
+			return nil, err
+		}
+	}
+	dbCfg, err := cs.LoadAll()
+	if err != nil {
+		if !errors.Is(err, store.ErrConfigNotSeeded) {
+			return nil, err
+		}
+		// 未seed：YAMLからseedしてから再読み込み
+		if err := a.seedStoreFromYAML(cs); err != nil {
+			return nil, err
+		}
+		reload, rerr := cs.LoadAll()
+		if rerr != nil {
+			return nil, rerr
+		}
+		dbCfg = reload
+	}
+	provider, ok := dbCfg.ProviderDefs[deepseek.ProviderID]
+	if !ok {
+		provider = config.ProviderDef{}
+	}
+	// APIキーは空でない場合のみ更新（空=既存キー維持。キー削除はClearDeepSeekKeyが担当）
+	if normalized.APIKey != "" {
+		provider.APIKey = normalized.APIKey
+	}
+	// APIKeyEnvはnilでない場合のみ更新（nil=変更なし、空文字=環境変数名を削除、非空=設定）
+	if normalized.APIKeyEnv != nil {
+		provider.APIKeyEnv = *normalized.APIKeyEnv
+	}
+	dbCfg.ProviderDefs[deepseek.ProviderID] = provider
+	if _, err := cs.SaveConfig(context.Background(), dbCfg); err != nil {
+		return nil, err
+	}
+	reloaded, err := cs.LoadAll()
+	if err != nil {
+		return nil, err
+	}
+	graph := configgraph.BuildGraph(*reloaded, "")
+	snap := deepseek.SnapshotFromGraph(graph, false)
+	if sqlStore, ok := cs.(*store.SQLiteConfigStore); ok {
+		deepseek.ApplyMigrationIssues(&snap, sqlStore.LastMigrationIssues())
+	}
+	return &snap, nil
+}
+
+// seedStoreFromYAML loads the YAML config file and seeds the SQLite store with
+// it. This is used when saveDeepSeekToStore encounters an unseeded store.
+func (a *App) seedStoreFromYAML(cs store.ConfigStore) error {
+	path, err := a.resolveConfigPath("")
+	if err != nil {
+		return err
+	}
+	loadOpts := config.LoadOptions{ExtensionSpecs: app.BuiltinExtensions().ConfigSpecs()}
+	cfg, err := config.LoadFromFileWithOptions(path, loadOpts)
+	if err != nil {
+		return err
+	}
+	sqlStore, ok := cs.(*store.SQLiteConfigStore)
+	if !ok {
+		return errors.New("store does not support seeding")
+	}
+	return sqlStore.SeedFromConfig(&cfg)
 }
 
 // clearDeepSeekFromStore removes the persisted DeepSeek api_key from the SQLite

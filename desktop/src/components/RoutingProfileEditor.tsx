@@ -17,17 +17,6 @@ function capabilityFor(capabilities: RoutingModelCapability[] | undefined, model
   return capabilities?.find((capability) => capability.modelId === model) ?? { modelId: model, supportedReasoning: [] };
 }
 
-function reasoningOptionsFor(capability: RoutingModelCapability): { value: RoutingReasoning; label: string }[] {
-  return capability.supportedReasoning.filter((value): value is RoutingReasoning => value === "low" || value === "high" || value === "max").map((value) => ({ value, label: value[0].toUpperCase() + value.slice(1) }));
-}
-
-function defaultReasoningFor(capability: RoutingModelCapability): string {
-  const supported = reasoningOptionsFor(capability).map((option) => option.value);
-  if (capability.defaultReasoning && supported.includes(capability.defaultReasoning)) return capability.defaultReasoning;
-  if (supported.includes("high")) return "high";
-  return supported[0] ?? "";
-}
-
 const SLOT_IDS: RoutingSlotId[] = ["sol", "terra", "luna"];
 
 // UI-facing model catalog. Labels are human-readable; values are the existing
@@ -199,7 +188,6 @@ export function RoutingProfileEditor({ routing, capabilities = [], embedded = fa
   // Fail-closed: never allow saving a profile whose snapshot can't provide a
   // provider for every slot (would otherwise persist empty provider ids).
   const missingProvider = selectedProfile ? SLOT_IDS.some((slotId) => providerForSlot(selectedProfile, slotId) === "") : false;
-  const selectedCapabilities = selected ? Object.fromEntries(SLOT_IDS.map((slotId) => [slotId, capabilityFor(availableCapabilities, selected.slots[slotId].upstreamModel)])) as Record<RoutingSlotId, RoutingModelCapability> : null;
   const serialized = selected ? JSON.stringify(selected.slots) : "";
   const hasPending = selected !== undefined && lastSavedRef.current[selectedId] !== undefined && serialized !== lastSavedRef.current[selectedId];
   // The retry button shows only when the current content is exactly what the
@@ -236,7 +224,7 @@ export function RoutingProfileEditor({ routing, capabilities = [], embedded = fa
       lastAttemptedRef.current[selectedId] = serialized;
       return;
     }
-    if (!running || missingProvider || routing.saving) return;
+    if (missingProvider || routing.saving) return;
     if (serialized === lastSavedRef.current[selectedId]) return;
     if (serialized === lastAttemptedRef.current[selectedId]) return;
     lastAttemptedRef.current[selectedId] = serialized;
@@ -251,21 +239,8 @@ export function RoutingProfileEditor({ routing, capabilities = [], embedded = fa
       if (routing.saveProfileDetailed) {
         const result = await routing.saveProfileDetailed(input);
         if (result.ok && result.snapshot) {
-          const profile = result.snapshot.profiles.find((p) => p.id === selectedId);
-          const canonical = profile ? fromProfile(profile) : null;
-          if (canonical) {
-            lastSavedRef.current[selectedId] = JSON.stringify(canonical.slots);
-            // Rebase the draft onto the canonical snapshot only when it was not
-            // edited while the save was in flight; a newer edit stays dirty.
-            setDrafts((current) => {
-              if (JSON.stringify(current[selectedId]?.slots ?? "") !== serialized) return current;
-              return { ...current, [selectedId]: canonical };
-            });
-            setSaveFailedId(null);
-          } else {
-            lastSavedRef.current[selectedId] = serialized;
-            setSaveFailedId(null);
-          }
+          lastSavedRef.current[selectedId] = serialized;
+          setSaveFailedId(null);
         } else {
           setSaveFailedId(selectedId);
         }
@@ -297,7 +272,7 @@ export function RoutingProfileEditor({ routing, capabilities = [], embedded = fa
             selected && <span className="panel-subtitle">{selected.displayName}</span>
           )}
         </div>
-        <span className="provider-selector-subtitle">{running ? "Gateway接続中" : "Gateway開始後に保存できます"}</span>
+        <span className="provider-selector-subtitle">{running ? "Gateway接続中" : "Gateway停止中"}</span>
       </div>}
 
       {embedded && profiles.length > 1 && (
@@ -309,7 +284,6 @@ export function RoutingProfileEditor({ routing, capabilities = [], embedded = fa
         </label>
       )}
 
-      {!running && !embedded && <p className="deepseek-hint">ゲートウェイ停止中です。設定値は編集できますが、保存には先にGatewayを開始してください。</p>}
       {routing.error && <p className="error-text">{routing.error}</p>}
       {routing.commandError?.gatewayLeftRunning && <p className="error-text">設定保存に失敗しました。確認のためGatewayは実行したままです。</p>}
 
@@ -340,12 +314,21 @@ export function RoutingProfileEditor({ routing, capabilities = [], embedded = fa
                       value={slot.mode}
                       onChange={(event) => {
                         const mode = event.target.value as RoutingMode;
-                        const capability = selectedCapabilities?.[slotId] ?? { modelId: slot.upstreamModel, supportedReasoning: [] };
-                        updateSlot(slotId, "mode", mode);
-                        if (mode === "normal") updateSlot(slotId, "reasoning", "");
-                        else if (slot.reasoning === "") updateSlot(slotId, "reasoning", defaultReasoningFor(capability));
+                        // Modeのみ変更、reasoningは触れない
+                        setDrafts((current) => {
+                          const currentSlot = current[selectedId].slots[slotId];
+                          return {
+                            ...current,
+                            [selectedId]: {
+                              ...current[selectedId],
+                              slots: {
+                                ...current[selectedId].slots,
+                                [slotId]: { ...currentSlot, mode },
+                              },
+                            },
+                          };
+                        });
                       }}
-                      disabled={reasoningOptionsFor(selectedCapabilities?.[slotId] ?? { modelId: slot.upstreamModel, supportedReasoning: [] }).length === 0}
                     >
                       <option value="normal">通常</option>
                       <option value="thinking">Thinking</option>
@@ -358,7 +341,7 @@ export function RoutingProfileEditor({ routing, capabilities = [], embedded = fa
                         value={slot.reasoning}
                         onChange={(event) => updateSlot(slotId, "reasoning", event.target.value)}
                       >
-                        {reasoningOptionsFor(selectedCapabilities?.[slotId] ?? { modelId: slot.upstreamModel, supportedReasoning: [] }).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                        {REASONING_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
                       </select>
                     </>}
                   </div>
@@ -371,7 +354,6 @@ export function RoutingProfileEditor({ routing, capabilities = [], embedded = fa
 
           <div className="deepseek-actions">
             {routing.saving && <span className="deepseek-hint">保存中…</span>}
-            {hasPending && !running && <span className="deepseek-hint">Gateway開始後に保存されます。</span>}
             {saveFailed && (
               <button type="button" className="routing-editor-retry" onClick={handleRetry}>保存を再試行</button>
             )}
