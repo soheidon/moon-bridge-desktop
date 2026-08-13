@@ -602,6 +602,45 @@ func TestEnableStartsClaimsCommitsAndCheckpoints(t *testing.T) {
 	}
 }
 
+func TestSuccessfulEnableDisableEmitsSafeLifecycleEventsInOrder(t *testing.T) {
+	service, _, _, _, _ := newFixture()
+	service.ids = &sequenceIDs{values: []string{"enable-1", "disable-1"}}
+	var events []Event
+	service.deps.Events = func(event Event) {
+		events = append(events, event)
+	}
+
+	if _, err := service.Enable(context.Background()); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	if _, err := service.Disable(context.Background()); err != nil {
+		t.Fatalf("Disable() error = %v", err)
+	}
+
+	want := []EventCode{
+		EventBackupCreated,
+		EventRouteApplied,
+		EventAnalysisStarted,
+		EventBackupRemoved,
+		EventRouteRestored,
+		EventAnalysisStopped,
+	}
+	if len(events) != len(want) {
+		t.Fatalf("event count = %d, want %d", len(events), len(want))
+	}
+	for i, event := range events {
+		if event.Code != want[i] {
+			t.Fatalf("event %d code = %q, want %q", i, event.Code, want[i])
+		}
+		if event.Timestamp == "" {
+			t.Fatalf("event %d timestamp is empty", i)
+		}
+		if event.Severity != EventSeverityInfo && event.Severity != EventSeveritySuccess {
+			t.Fatalf("event %d has unexpected severity %q", i, event.Severity)
+		}
+	}
+}
+
 func TestEnableRegistersExactModelMappingBeforeConfigCommit(t *testing.T) {
 	service, traffic, cfg, _, _ := newFixture()
 	if _, err := service.Enable(context.Background()); err != nil {

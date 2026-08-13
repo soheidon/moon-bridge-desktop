@@ -11,6 +11,7 @@ import (
 	"moonbridge/internal/service/codexlauncher"
 	"moonbridge/internal/service/gateway"
 	"moonbridge/internal/service/trafficanalysis"
+	"moonbridge/internal/service/traffictransaction"
 )
 
 func TestTrafficSnapshotCleanupDetailsAreSecretSafe(t *testing.T) {
@@ -41,6 +42,33 @@ func TestTrafficSnapshotCleanupDetailsAreSecretSafe(t *testing.T) {
 				}
 			}
 		})
+	}
+
+	eventData, err := json.Marshal(traffictransaction.Event{
+		Timestamp: "2026-08-13T00:00:00Z",
+		Code:      traffictransaction.EventBackupCreated,
+		Severity:  traffictransaction.EventSeverityInfo,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(eventData, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if len(fields) != 3 {
+		t.Fatalf("event field count = %d, want 3", len(fields))
+	}
+	for _, field := range []string{"timestamp", "code", "severity"} {
+		if _, ok := fields[field]; !ok {
+			t.Fatalf("event field %q is missing", field)
+		}
+	}
+	rawEvent := string(eventData)
+	for _, sentinel := range []string{"BackupID", "backup-file.toml", "C:\\secret", "https://secret.example", "Authorization", "SENTINEL"} {
+		if strings.Contains(rawEvent, sentinel) {
+			t.Fatalf("event leaked prohibited category %q", sentinel)
+		}
 	}
 }
 

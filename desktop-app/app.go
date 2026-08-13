@@ -28,6 +28,7 @@ const (
 	roundTripEvent     = "desktop:roundtrip"
 	gatewayStatusEvent = "gateway-status"
 	gatewayLogEvent    = "gateway-log"
+	trafficEvent       = "traffic-transaction-event"
 )
 
 type CommandError struct {
@@ -102,13 +103,13 @@ type gatewayController interface {
 // bindings derive from. The secrets (ControlToken / ServerToken) never leave
 // this struct.
 type gatewaySession struct {
-	InstanceID             string        // matches svc.Status().InstanceID; guards against stale sessions
-	Address                string        // management API base / codex base URL source
-	ControlToken           string        // DeepSeek management API bearer. Secret.
-	ServerToken            string        // codex auth.json token. Secret.
-	ConfigPath             string        // config the session started from / reloads after saves
-	Config                 config.Config // codex config generation source (loaded at start)
-	ConfigValid            bool          // Config matches the current on-disk config
+	InstanceID   string        // matches svc.Status().InstanceID; guards against stale sessions
+	Address      string        // management API base / codex base URL source
+	ControlToken string        // DeepSeek management API bearer. Secret.
+	ServerToken  string        // codex auth.json token. Secret.
+	ConfigPath   string        // config the session started from / reloads after saves
+	Config       config.Config // codex config generation source (loaded at start)
+	ConfigValid  bool          // Config matches the current on-disk config
 }
 
 // codexController is the codex terminal-session controller the App drives. It
@@ -267,17 +268,17 @@ func NewApp(opts AppOptions) *App {
 	}
 	appCtx, cancel := context.WithCancel(context.Background())
 	a := &App{
-		appCtx:            appCtx,
-		cancel:            cancel,
-		svc:               opts.Service,
-		traffic:           traffic,
-		configuredPath:    opts.ConfigPath,
-		newIdentity:       newIdentity,
-		emitEvents:        opts.EmitEvents,
-		trafficTx:         opts.TrafficTransaction,
-		recovery:          opts.Recovery,
-		recoveryHome:      opts.RecoveryHome,
-		trafficBackupDir:  opts.BackupDir,
+		appCtx:                appCtx,
+		cancel:                cancel,
+		svc:                   opts.Service,
+		traffic:               traffic,
+		configuredPath:        opts.ConfigPath,
+		newIdentity:           newIdentity,
+		emitEvents:            opts.EmitEvents,
+		trafficTx:             opts.TrafficTransaction,
+		recovery:              opts.Recovery,
+		recoveryHome:          opts.RecoveryHome,
+		trafficBackupDir:      opts.BackupDir,
 		codexConfig:           codexConfig,
 		newDeepSeek:           newDeepSeek,
 		newRoutingProfile:     newRoutingProfile,

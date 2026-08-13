@@ -160,6 +160,7 @@ type Dependencies struct {
 	Backup   BackupManager
 	Recovery RecoveryWriter
 	IDs      IDGenerator
+	Events   EventSink
 }
 
 type Snapshot struct {

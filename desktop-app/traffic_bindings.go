@@ -616,6 +616,9 @@ func (a *App) ensureTrafficTransaction() (*traffictransaction.Service, error) {
 		Config:   configEditor,
 		Backup:   trafficBackupManager{configPath: configPath, backupDir: backupDir},
 		Recovery: trafficRecoveryWriter{store: store, configHome: configHome, backupDir: backupDir},
+		Events: func(event traffictransaction.Event) {
+			a.safeEmit(trafficEvent, event)
+		},
 	})
 	a.trafficConfigPath = configPath
 	return a.trafficTx, nil

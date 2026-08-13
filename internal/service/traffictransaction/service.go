@@ -87,9 +87,11 @@ func (s *Service) RetryBackupCleanup(ctx context.Context, transactionID string) 
 		return false, err
 	}
 	if err := s.deps.Backup.Remove(ctx, BackupRef{ID: pending.BackupID}); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		s.emitEvent(EventCleanupPending, EventSeverityWarning)
 		return false, err
 	}
 	if err := writer.ClearCleanupPending(ctx, transactionID, pending.BackupID); err != nil {
+		s.emitEvent(EventCleanupPending, EventSeverityWarning)
 		return false, err
 	}
 	return true, nil
@@ -197,8 +199,10 @@ func (s *Service) Enable(ctx context.Context) (Snapshot, error) {
 	}
 	backup, err := s.createBackup(ctx)
 	if err != nil {
+		s.emitEvent(EventBackupCreateFailed, EventSeverityError)
 		return Snapshot{}, safeError(KindBackupFailed, "codex configuration backup failed", true)
 	}
+	s.emitEvent(EventBackupCreated, EventSeverityInfo)
 
 	state := FailureState{Phase: PhasePrepared, AdoptedCapture: adopted}
 	if err := s.deps.Recovery.Checkpoint(ctx, checkpointFor(txID, PhasePrepared, prepared, backup, gw, traffic.Generation, false)); err != nil {
@@ -295,6 +299,7 @@ func (s *Service) Enable(ctx context.Context) (Snapshot, error) {
 	if err != nil || !verified.Present || verified.Value != captureURL || verified.ConfigHash != prepared.AfterHash {
 		return s.backout(ctx, txID, prepared, backup, gw, claimed, state, CauseConfigVerify, safeError(KindConfigVerifyFailed, "codex configuration verification failed", true))
 	}
+	s.emitEvent(EventRouteApplied, EventSeverityInfo)
 	if err := s.verifyGateway(ctx, gw); err != nil {
 		return s.backout(ctx, txID, prepared, backup, gw, claimed, state, CauseGatewayLost, safeError(KindGatewayNotRunning, "gateway changed after configuration write", true))
 	}
@@ -324,21 +329,26 @@ func (s *Service) Enable(ctx context.Context) (Snapshot, error) {
 	s.lastGateway = gw
 	s.lastGeneration = validatedFinal.Generation
 	s.mu.Unlock()
+	s.emitEvent(EventAnalysisStarted, EventSeveritySuccess)
 	var cleanupPending *CleanupPending
 	cleanupPending = &CleanupPending{TransactionID: txID, BackupID: backup.ID, RouteMutationResult: "applied", Status: "pending"}
 	if err := s.deps.Recovery.SetCleanupPending(ctx, *cleanupPending); err != nil {
 		cleanupPending.Status = "persistence_failed"
+		s.emitEvent(EventRecoveryRequired, EventSeverityError)
 		return Snapshot{Operation: OperationEnable, Phase: PhaseCompleted, IntegrationActive: true, CleanupPending: cleanupPending}, safeError(KindRecoveryRequired, "backup cleanup state could not be persisted", true)
 	}
 	if err := s.deps.Backup.Remove(ctx, backup); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		cleanupPending.Status = "delete_failed"
+		s.emitEvent(EventCleanupPending, EventSeverityWarning)
 		return Snapshot{Operation: OperationEnable, Phase: PhaseCompleted, IntegrationActive: true, CleanupPending: cleanupPending}, err
 	}
 	if err := s.deps.Recovery.ClearCleanupPending(ctx, txID, backup.ID); err != nil {
 		cleanupPending.Status = "clear_failed"
+		s.emitEvent(EventCleanupPending, EventSeverityWarning)
 		return Snapshot{Operation: OperationEnable, Phase: PhaseCompleted, IntegrationActive: true, CleanupPending: cleanupPending}, err
 	}
 	cleanupPending = nil
+	s.emitEvent(EventBackupRemoved, EventSeverityInfo)
 	snapshot := snapshotFrom(validatedFinal, gw, PhaseCompleted, true)
 	snapshot.CleanupPending = cleanupPending
 	return snapshot, nil
@@ -422,6 +432,7 @@ func (s *Service) Disable(ctx context.Context) (Snapshot, error) {
 		cp := checkpointForDisable(txID, ownerID, PhaseDisableStarted, DurableReconciliationRequired, journal, traffic.Generation, true)
 		cp.ReconciliationStatus = ReconciliationStatusConfigConflict
 		_ = s.deps.Recovery.Checkpoint(ctx, cp)
+		s.emitEvent(EventRestoreFailed, EventSeverityError)
 		return Snapshot{}, safeError(KindRestoreConflict, "codex configuration changed after integration", false)
 	}
 
@@ -431,21 +442,22 @@ func (s *Service) Disable(ctx context.Context) (Snapshot, error) {
 	}
 	restore, err := s.deps.Config.PrepareRootURLChange(ctx, desired, journal.AfterHash)
 	if err != nil {
-		return s.disableRecovery(ctx, txID, ownerID, journal, traffic.Generation, true)
+		return s.disableRestoreFailure(ctx, txID, ownerID, journal, traffic.Generation, true)
 	}
 	if err := s.deps.Config.CommitPreparedRootURLChange(ctx, restore); err != nil {
-		return s.disableRecovery(ctx, txID, ownerID, journal, traffic.Generation, true)
+		return s.disableRestoreFailure(ctx, txID, ownerID, journal, traffic.Generation, true)
 	}
 	verified, err := s.deps.Config.ReadRootURL(ctx)
 	if err != nil || verified.ConfigHash != restore.AfterHash || !matchesPreviousRootURL(verified, journal) {
-		return s.disableRecovery(ctx, txID, ownerID, journal, traffic.Generation, true)
+		return s.disableRestoreFailure(ctx, txID, ownerID, journal, traffic.Generation, true)
 	}
+	s.emitEvent(EventRouteRestored, EventSeverityInfo)
 
 	if err := s.deps.Recovery.Checkpoint(ctx, checkpointForDisable(txID, ownerID, PhaseConfigRestored, DurableRecovered, journal, traffic.Generation, false)); err != nil {
-		return s.disableRecovery(ctx, txID, ownerID, journal, traffic.Generation, false)
+		return s.disableRestoreFailure(ctx, txID, ownerID, journal, traffic.Generation, false)
 	}
 	if _, err := s.deps.Traffic.ValidateDesktopPassthroughExpected(traffic.Generation, journal.GatewayInstance, journal.GatewayAddress, ownerID, CaptureListenAddress); err != nil {
-		return s.disableRecovery(ctx, txID, ownerID, journal, traffic.Generation, false)
+		return s.disableRestoreFailure(ctx, txID, ownerID, journal, traffic.Generation, false)
 	}
 
 	released, err := s.deps.Traffic.ReleaseDesktopExpected(traffic.Generation, ownerID)
@@ -474,6 +486,7 @@ func (s *Service) Disable(ctx context.Context) (Snapshot, error) {
 	if err != nil || finalJournal.DurablePhase != DurableInactive || finalJournal.IntegrationActive || finalJournal.OperationID != txID {
 		return s.disableRecovery(ctx, txID, ownerID, journal, traffic.Generation, false)
 	}
+	s.emitEvent(EventAnalysisStopped, EventSeveritySuccess)
 	return Snapshot{Operation: OperationDisable, Phase: PhaseDisableCompleted, CaptureState: final.CaptureState, TrafficMode: final.Mode, CaptureGeneration: final.Generation, GatewayMatches: true, IntegrationActive: false}, nil
 }
 
@@ -598,7 +611,13 @@ func finishCheckpoint(id string, phase Phase, source Checkpoint, generation uint
 
 func (s *Service) disableRecovery(ctx context.Context, txID, ownerID string, journal Checkpoint, generation uint64, integrationActive bool) (Snapshot, error) {
 	_ = s.deps.Recovery.Checkpoint(ctx, checkpointForDisable(txID, ownerID, PhaseRecoveryRequired, DurableReconciliationRequired, journal, generation, integrationActive))
+	s.emitEvent(EventRecoveryRequired, EventSeverityError)
 	return Snapshot{}, safeError(KindRecoveryRequired, "traffic disable requires recovery", true)
+}
+
+func (s *Service) disableRestoreFailure(ctx context.Context, txID, ownerID string, journal Checkpoint, generation uint64, integrationActive bool) (Snapshot, error) {
+	s.emitEvent(EventRestoreFailed, EventSeverityError)
+	return s.disableRecovery(ctx, txID, ownerID, journal, generation, integrationActive)
 }
 
 func (s *Service) backout(ctx context.Context, txID string, prepared *codexconfig.PreparedRootURLChange, backup BackupRef, gw GatewaySnapshot, traffic trafficanalysis.State, state FailureState, cause FailureCause, primary *Error) (Snapshot, error) {
@@ -645,6 +664,7 @@ func (s *Service) backout(ctx context.Context, txID string, prepared *codexconfi
 		if pendingErr := s.deps.Recovery.SetCleanupPending(ctx, *pending); pendingErr != nil {
 			return Snapshot{}, primary
 		}
+		s.emitEvent(EventCleanupPending, EventSeverityWarning)
 		return Snapshot{Operation: OperationEnable, Phase: PhaseAborted, CleanupPending: pending}, primary
 	}
 	return Snapshot{}, primary
@@ -652,6 +672,7 @@ func (s *Service) backout(ctx context.Context, txID string, prepared *codexconfi
 
 func (s *Service) requireRecovery(ctx context.Context, txID string, prepared *codexconfig.PreparedRootURLChange, backup BackupRef, gw GatewaySnapshot, generation uint64) (Snapshot, error) {
 	_ = s.deps.Recovery.Checkpoint(ctx, checkpointFor(txID, PhaseRecoveryRequired, prepared, backup, gw, generation, true))
+	s.emitEvent(EventRecoveryRequired, EventSeverityError)
 	return Snapshot{}, safeError(KindRecoveryRequired, "transaction backout is uncertain; recovery is required", true)
 }
 
