@@ -104,8 +104,8 @@ func TestWindowsBackupFixtureBoundaries(t *testing.T) {
 	if outside == base {
 		t.Fatal("outside boundary is not distinct")
 	}
-	if rel, err := filepath.Rel(base, outside); err != nil || rel != ".." {
-		t.Fatal("outside boundary was not classified outside")
+	if rel, err := filepath.Rel(base, outside); err != nil || rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))) {
+		t.Fatal("outside boundary was not structurally outside")
 	}
 	_, err = (windowsBackupPlatform{trustedBase: base}).openRoot(outside)
 	assertSafeFixtureError(t, err, outside)
