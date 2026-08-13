@@ -161,9 +161,16 @@ func (f *fakeConfig) CommitPreparedRootURLChange(_ context.Context, p *codexconf
 }
 
 type fakeBackup struct {
-	created int
-	removed int
-	err     error
+	created         int
+	removed         int
+	err             error
+	unrelatedExists bool
+	unrelatedSize   int64
+	unrelatedHash   string
+}
+
+func (f *fakeBackup) unrelatedFingerprint() (bool, int64, string) {
+	return f.unrelatedExists, f.unrelatedSize, f.unrelatedHash
 }
 
 func (f *fakeBackup) Create(context.Context) (BackupRef, error) {
@@ -528,6 +535,50 @@ func TestClassifyFailureIsPureAndDistinguishesUncertainCheckpoint(t *testing.T) 
 	uncertain := ClassifyFailure(FailureState{Phase: PhaseConfigCommitted, StartedCapture: true, OwnershipClaimed: true, ConfigCommitted: true, CheckpointUncertain: true}, CauseCheckpoint)
 	if !uncertain.RecoveryRequired || uncertain.ReleaseOwnership || uncertain.RestoreConfig || uncertain.CloseNewCapture {
 		t.Fatalf("uncertain plan = %#v", uncertain)
+	}
+}
+
+func TestEnableBackupFailureHasNoMutationOrSecretLeakage(t *testing.T) {
+	stages := []string{
+		"root open", "root reparse verification", "root identity verification",
+		"root ACL application", "root ACL verification", "file create",
+		"file reparse verification", "file identity verification", "file ACL application",
+		"file ACL verification", "write", "sync", "close", "failure cleanup",
+	}
+	for _, stage := range stages {
+		t.Run(stage, func(t *testing.T) {
+			service, traffic, cfg, backup, recovery, gateway := newFixtureWithGateway()
+			backup.err = errors.New("backup_cleanup_failed")
+			cfgBefore := *cfg
+			beforeExists, beforeSize, beforeHash := backup.unrelatedFingerprint()
+			_, err := service.Enable(context.Background())
+			requireKind(t, err, KindBackupFailed)
+			if strings.Contains(err.Error(), "secret-sentinel") || strings.Contains(err.Error(), "config.toml") || strings.Contains(err.Error(), "backup-1") {
+				t.Fatalf("unsafe backup error: %v", err)
+			}
+			if strings.Contains(err.Error(), cfgBefore.value) {
+				t.Fatalf("config value leaked into backup error: %v", err)
+			}
+			if cfg.commitCalls != 0 || cfg.value != cfgBefore.value || cfg.currentHash != cfgBefore.currentHash || cfg.present != cfgBefore.present {
+				t.Fatalf("config mutated: commits=%d value=%q hash=%q present=%v", cfg.commitCalls, cfg.value, cfg.currentHash, cfg.present)
+			}
+			if len(recovery.checkpoints) != 0 || recovery.cleanup != nil {
+				t.Fatalf("recovery mutated: checkpoints=%d cleanup=%#v", len(recovery.checkpoints), recovery.cleanup)
+			}
+			if traffic.startCalls != 0 || traffic.claimCalls != 0 || traffic.closeCalls != 0 || traffic.releaseCalls != 0 {
+				t.Fatalf("capture mutated: start=%d claim=%d close=%d release=%d", traffic.startCalls, traffic.claimCalls, traffic.closeCalls, traffic.releaseCalls)
+			}
+			if gateway.calls != 1 {
+				t.Fatalf("gateway calls=%d, want status snapshot only", gateway.calls)
+			}
+			if backup.created != 1 || backup.removed != 0 {
+				t.Fatalf("backup calls=%d/%d", backup.created, backup.removed)
+			}
+			afterExists, afterSize, afterHash := backup.unrelatedFingerprint()
+			if beforeExists != afterExists || beforeSize != afterSize || beforeHash != afterHash {
+				t.Fatalf("unrelated backup changed")
+			}
+		})
 	}
 }
 

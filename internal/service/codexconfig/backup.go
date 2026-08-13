@@ -38,42 +38,151 @@ func backupName(now time.Time) string {
 		now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute(), now.Second(), now.Nanosecond()/int(time.Millisecond))
 }
 
+// errBackupExists is returned by backupPlatformOps.createFile when the chosen
+// bare name already exists; the orchestration retries with a fresh timestamp.
+var errBackupExists = errors.New("backup exists")
+
+// Safe error codes surfaced to callers. They never embed paths, Backup IDs,
+// SIDs, usernames, or secret material.
+const (
+	backupSecurityFailed = "backup_security_failed"
+	backupIdentityFailed = "backup_identity_failed"
+	backupWriteFailed    = "backup_write_failed"
+	backupCleanupFailed  = "backup_cleanup_failed"
+)
+
+// backupRoot and backupFile are opaque handle wrappers. Their concrete
+// definitions are platform-specific (backup_other.go / backup_windows.go) so
+// the common orchestration never touches platform handle types directly.
+type backupRoot interface{}
+type backupFile interface{}
+
+// backupPlatformOps isolates the security-sensitive create sequence per
+// platform. On Windows it performs a handle-based root open, protected DACL
+// apply+verify, and root-handle-relative create-new so a directory swap cannot
+// redirect the secret payload. Elsewhere it preserves the original
+// os.OpenFile(O_CREATE|O_EXCL|O_WRONLY, 0600) behavior.
+type backupPlatformOps interface {
+	// openRoot opens dir as a directory, creating it as needed, and returns an
+	// opaque root handle. On Windows the directory chain is created relative to
+	// a trusted base handle and must not be created by absolute-path MkdirAll.
+	openRoot(dir string) (backupRoot, error)
+	// verifyRoot confirms the opened root is a non-reparse directory and pins
+	// its identity (FILE_ID_INFO on Windows).
+	verifyRoot(r backupRoot) error
+	applyRootSecurity(r backupRoot) error
+	verifyRootSecurity(r backupRoot) error
+	// createFile creates a new file named name under root. It returns
+	// errBackupExists when the bare name is already taken.
+	createFile(r backupRoot, name string) (backupFile, error)
+	// verifyFile confirms f is a regular, non-reparse file created under root
+	// with the given bare name.
+	verifyFile(f backupFile, r backupRoot, name string) error
+	applyFileSecurity(f backupFile) error
+	verifyFileSecurity(f backupFile) error
+	// write writes all of data. A partial write is an error.
+	write(f backupFile, data []byte) error
+	sync(f backupFile) error
+	// deleteOnClose marks f for deletion on close (identity-safe). It is only
+	// called while the handle is still valid; there is no post-close path
+	// re-resolution fallback.
+	deleteOnClose(f backupFile) error
+	// retain performs the existing retention policy while r remains the verified
+	// root owner. Implementations must refuse retention if root identity changed.
+	retain(r backupRoot, dir, protected string) error
+	// close closes the file (if any) and the root handle exactly once.
+	close(r backupRoot, f backupFile) error
+}
+
 // CreateBackup writes data to a fresh create_new backup (never overwrites),
 // trims the directory to the newest maxBackups, and returns the full path.
 func CreateBackup(dir string, data []byte) (string, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	return createBackupWith(dir, data, createBackupPlatform())
+}
+
+// createBackupWith runs the platform ops in the fixed order required for a
+// secret-safe backup: root open -> reparse/identity verify -> root security
+// apply+verify -> create-new -> file verify -> file security apply+verify ->
+// write -> sync -> close. The payload is never written before the file handle
+// is fully verified.
+func createBackupWith(dir string, data []byte, p backupPlatformOps) (path string, retErr error) {
+	root, err := p.openRoot(dir)
+	if err != nil {
 		return "", err
 	}
-	var path string
-	var err error
+	var currentFile backupFile
+	closed := false
+	closeOnce := func() error {
+		if closed {
+			return nil
+		}
+		closed = true
+		return p.close(root, currentFile)
+	}
+	defer func() {
+		if err := closeOnce(); err != nil {
+			path = ""
+			retErr = errors.New(backupCleanupFailed)
+		}
+	}()
+	if err := p.verifyRoot(root); err != nil {
+		return "", err
+	}
+	if err := p.applyRootSecurity(root); err != nil {
+		return "", err
+	}
+	if err := p.verifyRootSecurity(root); err != nil {
+		return "", err
+	}
+	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		path = filepath.Join(dir, backupName(time.Now()))
-		var f *os.File
-		f, err = os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-		if err == nil {
-			if _, werr := f.Write(data); werr != nil {
-				err = werr
-			} else {
-				err = f.Sync()
-			}
-			if cerr := f.Close(); err == nil {
-				err = cerr
-			}
-			if err != nil {
-				os.Remove(path)
+		name := backupName(time.Now())
+		f, err := p.createFile(root, name)
+		if err != nil {
+			if !errors.Is(err, errBackupExists) {
 				return "", err
 			}
-			retainConfigBackups(dir, path)
-			return path, nil
+			// Same-millisecond collision with an existing backup: let the clock
+			// tick on so the retry produces a fresh name.
+			lastErr = err
+			time.Sleep(time.Millisecond)
+			continue
 		}
-		if !os.IsExist(err) {
-			return "", err
+		currentFile = f
+		path := filepath.Join(dir, name)
+		fail := func(cause error) (string, error) {
+			deleteErr := p.deleteOnClose(f)
+			closeErr := closeOnce()
+			if deleteErr != nil || closeErr != nil {
+				return "", errors.New(backupCleanupFailed)
+			}
+			return "", cause
 		}
-		// Same-millisecond collision with an existing backup: let the clock tick
-		// on so the retry produces a fresh name.
-		time.Sleep(time.Millisecond)
+		if err := p.verifyFile(f, root, name); err != nil {
+			return fail(err)
+		}
+		if err := p.applyFileSecurity(f); err != nil {
+			return fail(err)
+		}
+		if err := p.verifyFileSecurity(f); err != nil {
+			return fail(err)
+		}
+		if err := p.write(f, data); err != nil {
+			return fail(err)
+		}
+		if err := p.sync(f); err != nil {
+			return fail(err)
+		}
+		if err := p.retain(root, dir, path); err != nil {
+			_ = closeOnce()
+			return "", errors.New(backupCleanupFailed)
+		}
+		if err := closeOnce(); err != nil {
+			return "", errors.New(backupCleanupFailed)
+		}
+		return path, nil
 	}
-	return "", err
+	return "", lastErr
 }
 
 // ListBackups returns valid codex-config backups newest-first. A missing
