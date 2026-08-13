@@ -56,10 +56,11 @@ type windowsBackupPlatform struct {
 }
 
 type windowsBackupRoot struct {
-	handle      windows.Handle
-	dir         string
-	trustedBase string
-	identity    fileIDInfo
+	handle       windows.Handle
+	dir          string
+	trustedBase  string
+	identity     fileIDInfo
+	basePhysical string // handle-resolved final path of the trusted base
 }
 
 type windowsBackupFile struct {
@@ -88,7 +89,6 @@ var (
 	errTrustedBaseUnavailable    = errors.New("trusted base is unavailable")
 	errTrustedBaseNotDirectory   = errors.New("trusted base is not a directory")
 	errTrustedBaseReparse        = errors.New("trusted base is a reparse point")
-	errTrustedBasePathMismatch   = errors.New("trusted base path mismatch")
 	errRootNotDirectory          = errors.New("backup root is not a directory")
 	errRootReparse               = errors.New("backup root is a reparse point")
 	errRootPathMismatch          = errors.New("backup root path mismatch")
@@ -133,7 +133,7 @@ func (p windowsBackupPlatform) openRoot(dir string) (backupRoot, error) {
 	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
 		return nil, errBackupDirOutsideTrusted
 	}
-	base, err := openTrustedAnchor(p.trustedBase)
+	base, basePhysical, err := openTrustedAnchor(p.trustedBase)
 	if err != nil {
 		return nil, err
 	}
@@ -176,7 +176,7 @@ func (p windowsBackupPlatform) openRoot(dir string) (backupRoot, error) {
 		return nil, errIdentityFailed()
 	}
 	ok = true
-	return &windowsBackupRoot{handle: current, dir: dir, trustedBase: p.trustedBase, identity: identity}, nil
+	return &windowsBackupRoot{handle: current, dir: dir, trustedBase: p.trustedBase, identity: identity, basePhysical: basePhysical}, nil
 }
 
 func sameVolume(a, b string) bool {
@@ -184,7 +184,8 @@ func sameVolume(a, b string) bool {
 }
 
 // verifyRoot pins the backup root handle: directory, non-reparse, FILE_ID_INFO
-// obtainable, and (diagnostic) the final path equals the canonical caller path.
+// obtainable, and the handle-resolved final path is a strict child of the
+// trusted base's handle-resolved final path on the same volume.
 func (windowsBackupPlatform) verifyRoot(r backupRoot) error {
 	root := r.(*windowsBackupRoot)
 	info, err := getFileInformation(root.handle)
@@ -204,7 +205,7 @@ func (windowsBackupPlatform) verifyRoot(r backupRoot) error {
 	if err != nil {
 		return errIdentityFailed()
 	}
-	if got != canonicalPath(root.dir) {
+	if !handleResolvedStrictChild(root.basePhysical, got) {
 		return errRootPathMismatch
 	}
 	return nil
@@ -387,22 +388,22 @@ func errIdentityFailed() error { return errors.New(backupIdentityFailed) }
 func errSecurityFailed() error { return errors.New(backupSecurityFailed) }
 func errWriteFailed() error    { return errors.New(backupWriteFailed) }
 
-// openTrustedAnchor opens the trusted base and verifies the six anchor
-// conditions before it may be used as the root of handle-relative descent:
-// directory, non-reparse, final-path match with canonical(base) (ancestor
-// reparse detection), FILE_ID_INFO obtainable, and the handle is kept open for
-// the descent.
-func openTrustedAnchor(base string) (windows.Handle, error) {
+// openTrustedAnchor opens the trusted base and verifies the anchor conditions
+// before it may be used as the root of handle-relative descent: directory,
+// non-reparse, FILE_ID_INFO obtainable. The handle-resolved final path is
+// returned so the caller can perform handle-based containment checks after
+// descent.
+func openTrustedAnchor(base string) (windows.Handle, string, error) {
 	p, err := windows.UTF16PtrFromString(base)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	h, err := windows.CreateFile(p, dirAccess,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
 		nil, windows.OPEN_EXISTING,
 		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	ok := false
 	defer func() {
@@ -412,26 +413,23 @@ func openTrustedAnchor(base string) (windows.Handle, error) {
 	}()
 	info, err := getFileInformation(h)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	if info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
-		return 0, errTrustedBaseNotDirectory
+		return 0, "", errTrustedBaseNotDirectory
 	}
 	if isReparsePoint(info.FileAttributes) {
-		return 0, errTrustedBaseReparse
+		return 0, "", errTrustedBaseReparse
 	}
 	got, err := finalPathByHandle(h)
 	if err != nil {
-		return 0, err
-	}
-	if got != canonicalPath(base) {
-		return 0, errTrustedBasePathMismatch
+		return 0, "", err
 	}
 	if _, err := fileIdentity(h); err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	ok = true
-	return h, nil
+	return h, got, nil
 }
 
 // openDirComponent opens (creating if needed) one bare-name component relative
@@ -681,6 +679,43 @@ func canonicalPath(p string) string {
 		return `\\?\` + vol + `\` // drive root keeps its trailing separator
 	}
 	return `\\?\` + vol + rest
+}
+
+// handleResolvedStrictChild reports whether finalRoot is a strict child path
+// of finalBase, where both are handle-resolved final paths (lowercased,
+// extended-length, no trailing separator except drive roots). The volume
+// portion must match case-insensitively.
+func handleResolvedStrictChild(finalBase, finalRoot string) bool {
+	if len(finalRoot) <= len(finalBase) {
+		return false
+	}
+	volBase := filepath.VolumeName(finalBase)
+	volRoot := filepath.VolumeName(finalRoot)
+	if !strings.EqualFold(volBase, volRoot) {
+		return false
+	}
+	// Both paths are lowercased by finalPathByHandle, so case-sensitive prefix
+	// check is sufficient. The base must be a strict prefix and the next char
+	// must be a separator (prevents C:\safe matching C:\safe2).
+	if !strings.HasPrefix(finalRoot, finalBase) {
+		return false
+	}
+	after := finalRoot[len(finalBase):]
+	if after == "" {
+		return false
+	}
+	// The base may end with a trailing separator (drive root) or not.
+	if after[0] == '\\' {
+		return true
+	}
+	// If the base does not end with \, then after[0] != \ means no separator
+	// boundary — false positive (e.g. C:\safe matching C:\safe2).
+	// If the base ends without \, the base path itself already excluded the
+	// trailing char, so we need to check the last char of finalBase.
+	if finalBase[len(finalBase)-1] == '\\' {
+		return true
+	}
+	return false
 }
 
 // validBareName rejects any component that cannot be a single path element:
