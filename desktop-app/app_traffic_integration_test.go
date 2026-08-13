@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +19,26 @@ import (
 	"moonbridge/internal/service/recovery"
 	"moonbridge/internal/service/trafficanalysis"
 )
+
+// setupTrafficIntegrationRoot creates a disposable gateway/Codex/backup root.
+// On Windows it sets LOCALAPPDATA so any backup-related platform helper that
+// resolves the trusted base uses the temp tree instead of the real profile.
+func setupTrafficIntegrationRoot(t *testing.T) (root, codexHome, backupDir, recoveryDir string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		if os.Getenv("LOCALAPPDATA") == "" {
+			t.Setenv("LOCALAPPDATA", t.TempDir())
+		}
+	}
+	root = t.TempDir()
+	codexHome = filepath.Join(root, "codex")
+	backupDir = filepath.Join(root, "backups")
+	recoveryDir = filepath.Join(root, "recovery")
+	if err := os.MkdirAll(codexHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return root, codexHome, backupDir, recoveryDir
+}
 
 // TestRealTrafficBindingLifecycle exercises the Wails-facing bindings against
 // the real in-process Gateway and Capture services. It uses isolated gateway,
@@ -29,13 +50,7 @@ func TestRealTrafficBindingLifecycle(t *testing.T) {
 		_ = listener.Close()
 	}
 
-	root := t.TempDir()
-	codexHome := filepath.Join(root, "codex")
-	backupDir := filepath.Join(root, "backups")
-	recoveryDir := filepath.Join(root, "recovery")
-	if err := os.MkdirAll(codexHome, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	root, codexHome, backupDir, recoveryDir := setupTrafficIntegrationRoot(t)
 	codexPath := filepath.Join(codexHome, "config.toml")
 	if err := os.WriteFile(codexPath, []byte("model = \"gpt-test\"\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -170,13 +185,7 @@ func TestLiveRestoreConflictResolutionFlow(t *testing.T) {
 		_ = listener.Close()
 	}
 
-	root := t.TempDir()
-	codexHome := filepath.Join(root, "codex")
-	backupDir := filepath.Join(root, "backups")
-	recoveryDir := filepath.Join(root, "recovery")
-	if err := os.MkdirAll(codexHome, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	root, codexHome, backupDir, recoveryDir := setupTrafficIntegrationRoot(t)
 	original := "model = \"gpt-test\"\n"
 	codexPath := filepath.Join(codexHome, "config.toml")
 	if err := os.WriteFile(codexPath, []byte(original), 0o600); err != nil {
