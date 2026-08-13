@@ -195,7 +195,7 @@ func (s *Service) Enable(ctx context.Context) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, mapConfigError(err, KindPrepareFailed)
 	}
-	backup, err := s.deps.Backup.Create(ctx)
+	backup, err := s.createBackup(ctx)
 	if err != nil {
 		return Snapshot{}, safeError(KindBackupFailed, "codex configuration backup failed", true)
 	}
@@ -330,7 +330,7 @@ func (s *Service) Enable(ctx context.Context) (Snapshot, error) {
 		cleanupPending.Status = "persistence_failed"
 		return Snapshot{Operation: OperationEnable, Phase: PhaseCompleted, IntegrationActive: true, CleanupPending: cleanupPending}, safeError(KindRecoveryRequired, "backup cleanup state could not be persisted", true)
 	}
-	if err := s.deps.Backup.Remove(ctx, backup); err != nil {
+	if err := s.deps.Backup.Remove(ctx, backup); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		cleanupPending.Status = "delete_failed"
 		return Snapshot{Operation: OperationEnable, Phase: PhaseCompleted, IntegrationActive: true, CleanupPending: cleanupPending}, err
 	}
@@ -637,7 +637,16 @@ func (s *Service) backout(ctx context.Context, txID string, prepared *codexconfi
 	if err := s.deps.Recovery.Checkpoint(ctx, checkpointFor(txID, PhaseAborted, prepared, backup, gw, traffic.Generation, false)); err != nil {
 		return s.requireRecovery(ctx, txID, prepared, backup, gw, traffic.Generation)
 	}
-	s.bestEffortRemove(ctx, backup)
+	if err := s.deps.Backup.Remove(ctx, backup); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		pending := &CleanupPending{
+			TransactionID: txID, BackupID: backup.ID,
+			RouteMutationResult: "unchanged", Status: "delete_failed",
+		}
+		if pendingErr := s.deps.Recovery.SetCleanupPending(ctx, *pending); pendingErr != nil {
+			return Snapshot{}, primary
+		}
+		return Snapshot{Operation: OperationEnable, Phase: PhaseAborted, CleanupPending: pending}, primary
+	}
 	return Snapshot{}, primary
 }
 
@@ -674,6 +683,20 @@ func (s *Service) verifyGateway(ctx context.Context, expected GatewaySnapshot) e
 
 func (s *Service) bestEffortRemove(ctx context.Context, backup BackupRef) {
 	_ = s.deps.Backup.Remove(ctx, backup)
+}
+
+func (s *Service) createBackup(ctx context.Context) (BackupRef, error) {
+	protected := make([]string, 0, 2)
+	if journal, err := s.deps.Recovery.Current(ctx); err == nil && journal.BackupID != "" {
+		protected = append(protected, journal.BackupID)
+	}
+	if pending, err := s.deps.Recovery.GetCleanupPending(ctx); err == nil && pending != nil && pending.BackupID != "" {
+		protected = append(protected, pending.BackupID)
+	}
+	if manager, ok := s.deps.Backup.(ProtectedBackupManager); ok {
+		return manager.CreateProtected(ctx, protected)
+	}
+	return s.deps.Backup.Create(ctx)
 }
 
 func snapshotFrom(st trafficanalysis.State, gw GatewaySnapshot, phase Phase, integration bool) Snapshot {

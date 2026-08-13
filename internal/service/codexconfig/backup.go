@@ -89,7 +89,7 @@ type backupPlatformOps interface {
 	deleteOnClose(f backupFile) error
 	// retain performs the existing retention policy while r remains the verified
 	// root owner. Implementations must refuse retention if root identity changed.
-	retain(r backupRoot, dir, protected string) error
+	retain(r backupRoot, dir string, protected []string) error
 	// close closes the file (if any) and the root handle exactly once.
 	close(r backupRoot, f backupFile) error
 }
@@ -97,7 +97,16 @@ type backupPlatformOps interface {
 // CreateBackup writes data to a fresh create_new backup (never overwrites),
 // trims the directory to the newest maxBackups, and returns the full path.
 func CreateBackup(dir string, data []byte) (string, error) {
-	return createBackupWith(dir, data, createBackupPlatform())
+	return CreateBackupWithProtected(dir, data, nil)
+}
+
+// CreateBackupWithProtected creates a backup and retains the supplied bare
+// backup IDs in addition to the newly-created backup. Protected IDs are
+// validated before they can influence retention; callers use this for
+// transaction/recovery ownership without making codexconfig depend on those
+// packages.
+func CreateBackupWithProtected(dir string, data []byte, protected []string) (string, error) {
+	return createBackupWith(dir, data, createBackupPlatform(), protected)
 }
 
 // createBackupWith runs the platform ops in the fixed order required for a
@@ -105,7 +114,11 @@ func CreateBackup(dir string, data []byte) (string, error) {
 // apply+verify -> create-new -> file verify -> file security apply+verify ->
 // write -> sync -> close. The payload is never written before the file handle
 // is fully verified.
-func createBackupWith(dir string, data []byte, p backupPlatformOps) (path string, retErr error) {
+func createBackupWith(dir string, data []byte, p backupPlatformOps, protectedOpt ...[]string) (path string, retErr error) {
+	var protected []string
+	if len(protectedOpt) > 0 {
+		protected = protectedOpt[0]
+	}
 	root, err := p.openRoot(dir)
 	if err != nil {
 		return "", err
@@ -173,7 +186,7 @@ func createBackupWith(dir string, data []byte, p backupPlatformOps) (path string
 		if err := p.sync(f); err != nil {
 			return fail(err)
 		}
-		if err := p.retain(root, dir, path); err != nil {
+		if err := p.retain(root, dir, append(protected, filepath.Base(path))); err != nil {
 			_ = closeOnce()
 			return "", errors.New(backupCleanupFailed)
 		}
@@ -252,7 +265,7 @@ func pathWithin(dir, p string) bool {
 
 // retainConfigBackups deletes the oldest backups beyond maxBackups, never the
 // just-created one.
-func retainConfigBackups(dir, protected string) {
+func retainConfigBackups(dir string, protected ...string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
@@ -277,9 +290,18 @@ func retainConfigBackups(dir, protected string) {
 		list = append(list, entry{filepath.Join(dir, e.Name()), t})
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].time.After(list[j].time) })
+	// The final ID is the newly-created backup and remains subject to the
+	// ordinary five-backup limit. Earlier IDs are active external ownership
+	// references and may remain in addition to that limit.
+	protectedIDs := make(map[string]struct{}, len(protected))
+	for _, id := range protected[:max(0, len(protected)-1)] {
+		if _, ok := configBackupStem(id); ok && id == filepath.Base(id) {
+			protectedIDs[id] = struct{}{}
+		}
+	}
 	kept := 0
 	for _, e := range list {
-		if e.path == protected {
+		if _, ok := protectedIDs[filepath.Base(e.path)]; ok {
 			continue
 		}
 		kept++

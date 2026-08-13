@@ -305,6 +305,14 @@ type trafficBackupManager struct {
 }
 
 func (b trafficBackupManager) Create(ctx context.Context) (traffictransaction.BackupRef, error) {
+	return b.create(ctx, nil)
+}
+
+func (b trafficBackupManager) CreateProtected(ctx context.Context, protected []string) (traffictransaction.BackupRef, error) {
+	return b.create(ctx, protected)
+}
+
+func (b trafficBackupManager) create(ctx context.Context, protected []string) (traffictransaction.BackupRef, error) {
 	if err := ctx.Err(); err != nil {
 		return traffictransaction.BackupRef{}, err
 	}
@@ -312,7 +320,7 @@ func (b trafficBackupManager) Create(ctx context.Context) (traffictransaction.Ba
 	if err != nil {
 		return traffictransaction.BackupRef{}, err
 	}
-	path, err := codexconfig.CreateBackup(b.backupDir, data)
+	path, err := codexconfig.CreateBackupWithProtected(b.backupDir, data, protected)
 	if err != nil {
 		return traffictransaction.BackupRef{}, err
 	}
@@ -599,6 +607,7 @@ func (a *App) ensureTrafficTransaction() (*traffictransaction.Service, error) {
 		}
 		backupDir = filepath.Join(base, "backups", "codex-config")
 	}
+	a.trafficBackupDir = backupDir
 	store := a.recovery
 	configEditor := codexconfig.New(codexconfig.Options{Home: configHome, BackupDir: backupDir})
 	a.trafficTx = traffictransaction.New(traffictransaction.Dependencies{

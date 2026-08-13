@@ -597,7 +597,7 @@ func TestEnableStartsClaimsCommitsAndCheckpoints(t *testing.T) {
 	if traffic.lastStart.ListenAddr != CaptureListenAddress || traffic.lastStart.UpstreamBase != "http://127.0.0.1:38440" {
 		t.Fatalf("start options = %#v", traffic.lastStart)
 	}
-	if backup.created != 1 || len(recovery.checkpoints) != 3 || recovery.checkpoints[0].Phase != PhasePrepared || recovery.checkpoints[2].IntegrationActive != true {
+	if backup.created != 1 || backup.removed != 1 || len(recovery.checkpoints) != 3 || recovery.checkpoints[0].Phase != PhasePrepared || recovery.checkpoints[2].IntegrationActive != true {
 		t.Fatalf("backup/checkpoints = %d/%#v", backup.created, recovery.checkpoints)
 	}
 }

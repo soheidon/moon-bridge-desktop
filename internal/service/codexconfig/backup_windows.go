@@ -342,7 +342,7 @@ func (windowsBackupPlatform) deleteOnClose(f backupFile) error {
 	return nil
 }
 
-func (windowsBackupPlatform) retain(r backupRoot, dir, protected string) error {
+func (windowsBackupPlatform) retain(r backupRoot, dir string, protected []string) error {
 	root := r.(*windowsBackupRoot)
 	current, err := fileIdentity(root.handle)
 	if err != nil || current != root.identity {
@@ -361,7 +361,7 @@ func (windowsBackupPlatform) retain(r backupRoot, dir, protected string) error {
 	if candidateID != root.identity {
 		return errIdentityFailed()
 	}
-	retainConfigBackups(dir, protected)
+	retainConfigBackups(dir, protected...)
 	return nil
 }
 
