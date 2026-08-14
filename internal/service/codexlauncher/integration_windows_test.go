@@ -181,7 +181,15 @@ func TestWindowsIntegrationWorkingDirectoryAndShimExecution(t *testing.T) {
 	for time.Now().Before(deadline) {
 		if data, rerr := os.ReadFile(marker); rerr == nil && len(data) > 0 {
 			got := strings.TrimSpace(string(data))
-			if !strings.EqualFold(got, filepath.Clean(proj)) {
+			gotPhysical, err := filepath.EvalSymlinks(got)
+			if err != nil {
+				t.Fatalf("resolve terminal cwd: %v", err)
+			}
+			wantPhysical, err := filepath.EvalSymlinks(proj)
+			if err != nil {
+				t.Fatalf("resolve project cwd: %v", err)
+			}
+			if !strings.EqualFold(filepath.Clean(gotPhysical), filepath.Clean(wantPhysical)) {
 				t.Fatalf("terminal cwd = %q, want %q", got, filepath.Clean(proj))
 			}
 			if _, err := l.Stop(context.Background(), StopReasonShutdown); err != nil {

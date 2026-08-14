@@ -25,12 +25,13 @@ import (
 // resolves the trusted base uses the temp tree instead of the real profile.
 func setupTrafficIntegrationRoot(t *testing.T) (root, codexHome, backupDir, recoveryDir string) {
 	t.Helper()
-	if runtime.GOOS == "windows" {
-		if os.Getenv("LOCALAPPDATA") == "" {
-			t.Setenv("LOCALAPPDATA", t.TempDir())
-		}
-	}
 	root = t.TempDir()
+	if runtime.GOOS == "windows" {
+		// The Windows backup implementation anchors BackupDir beneath
+		// LOCALAPPDATA. Keep the fixture self-contained and avoid comparing a
+		// hosted runner's RUNNER~1 temp spelling with its long profile spelling.
+		t.Setenv("LOCALAPPDATA", root)
+	}
 	codexHome = filepath.Join(root, "codex")
 	backupDir = filepath.Join(root, "backups")
 	recoveryDir = filepath.Join(root, "recovery")

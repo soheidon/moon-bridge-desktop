@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -205,6 +206,11 @@ func TestRoutingObservabilityProductionEquivalentSmoke(t *testing.T) {
 	defer upstream.Close()
 
 	root := t.TempDir()
+	if runtime.GOOS == "windows" {
+		// BackupDir is intentionally isolated under this test root. Make that
+		// root the Windows trusted base as well, independent of 8.3 temp aliases.
+		t.Setenv("LOCALAPPDATA", root)
+	}
 	codexHome := filepath.Join(root, "codex")
 	backupDir := filepath.Join(root, "backups")
 	recoveryDir := filepath.Join(root, "recovery")
