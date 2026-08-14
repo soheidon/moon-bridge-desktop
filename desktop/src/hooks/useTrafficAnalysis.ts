@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { command, onEvent } from "../platform/desktop";
-import type { ExitConfirmationPayload, TrafficAnalysisStatus, TrafficCommandError, TrafficObservation, TrafficOperation, TrafficProgress } from "../types/trafficAnalysis";
+import { parseTrafficRuntimeEvent, type ExitConfirmationPayload, type TrafficAnalysisStatus, type TrafficCommandError, type TrafficObservation, type TrafficOperation, type TrafficProgress, type TrafficRuntimeEvent } from "../types/trafficAnalysis";
 
 type WailsDesktopSnapshot = {
   trafficAnalysis?: {
@@ -49,6 +49,11 @@ export function shouldFinishRelay(payload: ExitConfirmationPayload | null | unde
   return payload?.reason === "traffic_active" || payload?.trafficActive === true;
 }
 
+function appendRuntimeEvent(current: TrafficRuntimeEvent[], next: TrafficRuntimeEvent, cap = 500): TrafficRuntimeEvent[] {
+  if (cap <= 0) return [];
+  return [...current.slice(-(cap - 1)), next];
+}
+
 export function toTrafficStatus(snapshot: WailsDesktopSnapshot): TrafficAnalysisStatus {
   const traffic = snapshot.trafficAnalysis;
   const captureState = traffic?.captureState ?? "stopped";
@@ -91,6 +96,7 @@ export function useTrafficAnalysis() {
   const [operationId, setOperationId] = useState<string | null>(null);
   const [pending, setPending] = useState<Partial<Record<TrafficOperation, boolean>>>({});
   const [exitPrompt, setExitPrompt] = useState<ExitConfirmationPayload | null>(null);
+  const [runtimeEvents, setRuntimeEvents] = useState<TrafficRuntimeEvent[]>([]);
   const lastSequence = useRef(0);
   const operationIds = useRef<Partial<Record<TrafficOperation, string>>>({});
   const pendingRef = useRef<Partial<Record<TrafficOperation, boolean>>>(pending);
@@ -141,6 +147,18 @@ export function useTrafficAnalysis() {
     let disposed = false;
     const unlisten = onEvent<ExitConfirmationPayload>("desktop-exit-confirmation-requested", (payload) => {
       if (!disposed) setExitPrompt(toExitPrompt(payload));
+    });
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    const unlisten = onEvent<unknown>("traffic-transaction-event", (payload) => {
+      const event = parseTrafficRuntimeEvent(payload);
+      if (!disposed && event) setRuntimeEvents((current) => appendRuntimeEvent(current, event));
     });
     return () => {
       disposed = true;
@@ -271,7 +289,7 @@ export function useTrafficAnalysis() {
     setExitPrompt(null);
   }, [exitPrompt, finishRelay, restore, status?.integrationActive, status?.recoveryAvailable, status?.reconciliationStatus, stop]);
 
-  return { status, observations, progress, error, operationId, pending, start, restartCapture, stop, finishRelay, finishRelayResolvingConflict, clear, openLogFolder, openLogFile, restore, refresh, exitPrompt, cancelExit, confirmExit };
+  return { status, observations, progress, error, operationId, pending, runtimeEvents, start, restartCapture, stop, finishRelay, finishRelayResolvingConflict, clear, openLogFolder, openLogFile, restore, refresh, exitPrompt, cancelExit, confirmExit };
 }
 
 function asTrafficError(reason: unknown, operation: string): TrafficCommandError {

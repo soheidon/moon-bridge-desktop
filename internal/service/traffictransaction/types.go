@@ -106,6 +106,14 @@ type BackupManager interface {
 	Remove(context.Context, BackupRef) error
 }
 
+// ProtectedBackupManager is implemented by adapters that can preserve active
+// recovery-owned backup IDs during ordinary retention. The optional interface
+// keeps existing in-memory BackupManager fakes and non-transaction callers
+// unchanged.
+type ProtectedBackupManager interface {
+	CreateProtected(context.Context, []string) (BackupRef, error)
+}
+
 type Checkpoint struct {
 	OperationID string
 	// OwnerID is process-local evidence for the Traffic Service adapter. It is
@@ -152,6 +160,7 @@ type Dependencies struct {
 	Backup   BackupManager
 	Recovery RecoveryWriter
 	IDs      IDGenerator
+	Events   EventSink
 }
 
 type Snapshot struct {

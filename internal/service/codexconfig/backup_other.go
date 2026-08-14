@@ -74,8 +74,8 @@ func (otherBackupPlatform) deleteOnClose(f backupFile) error {
 	return os.Remove(b.path)
 }
 
-func (otherBackupPlatform) retain(_ backupRoot, dir, protected string) error {
-	retainConfigBackups(dir, protected)
+func (otherBackupPlatform) retain(_ backupRoot, dir string, protected []string) error {
+	retainConfigBackups(dir, protected...)
 	return nil
 }
 

@@ -100,7 +100,13 @@ type State struct {
 	IntegrationActive bool  `json:"integrationActive"`
 	Phase             Phase `json:"phase"`
 
-	OperationID          string `json:"operationId"`
+	OperationID string `json:"operationId"`
+	// TransitionID is the route epoch. It is intentionally separate from
+	// OperationID, which belongs to an individual Traffic transaction.
+	TransitionID         string `json:"transitionId,omitempty"`
+	RoutePhase           string `json:"routePhase,omitempty"`
+	DesiredRoute         string `json:"desiredRoute,omitempty"`
+	RouteEvidence        string `json:"routeEvidence,omitempty"`
 	ConfigPath           string `json:"configPath"`                     // CODEX_HOME 相対
 	CodexHomeFingerprint string `json:"codexHomeFingerprint,omitempty"` // 開始時 CODEX_HOME 正規化値の SHA-256（相対 configPath の root 照合）
 

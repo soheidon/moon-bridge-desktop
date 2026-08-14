@@ -1,6 +1,43 @@
 export type CaptureState = "stopped" | "starting" | "capturing" | "passthrough" | "draining" | "failed";
 export type TrafficOperation = "starting" | "restarting" | "stopping" | "clearing" | "restoring" | "openingFolder" | "openingFile" | "finalizing";
 
+export const trafficEventCodes = [
+  "traffic_backup_created",
+  "traffic_route_applied",
+  "traffic_analysis_started",
+  "traffic_backup_removed",
+  "traffic_route_restored",
+  "traffic_analysis_stopped",
+  "traffic_backup_create_failed",
+  "traffic_restore_failed",
+  "traffic_cleanup_pending",
+  "traffic_recovery_required",
+] as const;
+
+export type TrafficEventCode = typeof trafficEventCodes[number];
+export type TrafficEventSeverity = "info" | "success" | "warning" | "error";
+
+export interface TrafficRuntimeEvent {
+  timestamp: string;
+  code: TrafficEventCode;
+  severity: TrafficEventSeverity;
+}
+
+export function parseTrafficRuntimeEvent(value: unknown): TrafficRuntimeEvent | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  if (keys.length !== 3 || keys[0] !== "code" || keys[1] !== "severity" || keys[2] !== "timestamp") return null;
+  if (typeof record.timestamp !== "string" || Number.isNaN(Date.parse(record.timestamp))) return null;
+  if (typeof record.code !== "string" || !trafficEventCodes.includes(record.code as TrafficEventCode)) return null;
+  if (record.severity !== "info" && record.severity !== "success" && record.severity !== "warning" && record.severity !== "error") return null;
+  return {
+    timestamp: record.timestamp,
+    code: record.code as TrafficEventCode,
+    severity: record.severity,
+  };
+}
+
 export interface CaptureStatus {
   state: CaptureState;
   sessionId: string | null;

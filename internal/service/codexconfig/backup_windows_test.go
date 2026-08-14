@@ -442,6 +442,76 @@ func TestWindowsDirectorySwapCannotRedirectCreateOrWrite(t *testing.T) {
 // TestCreateBackupWithDeleteFailureKeepsArtifactAndIsCleanupSafe via the fake
 // seam; together they form the synthetic evidence for G.80, because a real-API
 // delete failure cannot be induced in-process (bidirectional sharing rule).
+func TestWindowsHandleResolvedStrictChild(t *testing.T) {
+	for _, tc := range []struct {
+		label    string
+		base     string
+		root     string
+		wantPass bool
+	}{
+		{"strict child (base without trailing sep)", `\\?\c:\users\sohei\appdata\local`, `\\?\c:\users\sohei\appdata\local\moon bridge`, true},
+		{"strict child (base with trailing sep)", `\\?\c:\`, `\\?\c:\safe`, true},
+		{"exact match", `\\?\c:\users\sohei\appdata\local`, `\\?\c:\users\sohei\appdata\local`, false},
+		{"root shorter", `\\?\c:\users\sohei\appdata\local`, `\\?\c:\users\sohei\appdata`, false},
+		{"prefix false match (no separator boundary)", `\\?\c:\safe`, `\\?\c:\safe2`, false},
+		{"different volume", `\\?\c:\safe`, `\\?\d:\safe\child`, false},
+		{"redirected: base=packages, root=packages child",
+			`\\?\c:\users\sohei\appdata\local\packages\claude_pzs8sxrjxfjjc\localcache\local`,
+			`\\?\c:\users\sohei\appdata\local\packages\claude_pzs8sxrjxfjjc\localcache\local\moon bridge`,
+			true},
+		{"redirected mismatch: base=logical, root=packages child",
+			`\\?\c:\users\sohei\appdata\local`,
+			`\\?\c:\users\sohei\appdata\local\packages\claude_pzs8sxrjxfjjc\localcache\local\moon bridge`,
+			true},
+		{"redirected escape: root not under base",
+			`\\?\c:\users\sohei\appdata\local\packages\claude_pzs8sxrjxfjjc\localcache\local`,
+			`\\?\c:\users\sohei\appdata\local\moon bridge`,
+			false},
+	} {
+		t.Run(tc.label, func(t *testing.T) {
+			got := handleResolvedStrictChild(tc.base, tc.root)
+			if got != tc.wantPass {
+				t.Fatalf("handleResolvedStrictChild(%q, %q) = %v, want %v",
+					tc.base, tc.root, got, tc.wantPass)
+			}
+		})
+	}
+}
+
+// TestWindowsVerifyRootVolumeSerialRejection verifies that verifyRoot rejects
+// a root whose handle-derived VolumeSerialNumber does not match the trusted
+// base's. Because openRoot always sets baseVolumeSerial from the real anchor,
+// we mutate the field after openRoot to simulate a volume mismatch. This
+// confirms production compares serials directly — not merely drive-letter
+// strings.
+func TestWindowsVerifyRootVolumeSerialRejection(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "vol-child")
+	p := windowsBackupPlatform{trustedBase: base}
+	rootAny, err := p.openRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := rootAny.(*windowsBackupRoot)
+	defer p.close(root, nil)
+	// verifyRoot succeeds with the real serial.
+	if err := p.verifyRoot(root); err != nil {
+		t.Fatalf("verifyRoot failed with real serial: %v", err)
+	}
+	// Mutate to a different serial to verify the serial check fires.
+	original := root.baseVolumeSerial
+	root.baseVolumeSerial = original + 1
+	err = p.verifyRoot(root)
+	if err == nil {
+		t.Fatal("verifyRoot accepted mismatched volume serial")
+	}
+	// Restore and confirm success again.
+	root.baseVolumeSerial = original
+	if err := p.verifyRoot(root); err != nil {
+		t.Fatalf("verifyRoot failed after restoring serial: %v", err)
+	}
+}
+
 func TestWindowsDeletePendingKeepsProtectedArtifact(t *testing.T) {
 	base := t.TempDir()
 	dir := filepath.Join(base, "backups")

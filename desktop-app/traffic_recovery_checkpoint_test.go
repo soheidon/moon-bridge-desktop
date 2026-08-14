@@ -32,7 +32,7 @@ func seedLegacyRecovery(t *testing.T, mutate func(*recovery.State)) (*recovery.S
 			t.Fatal(err)
 		}
 	}
-	legacyLog := filepath.Join(root, "legacy-project", "logs", "traffic-analysis-20260804-071631.log")
+	legacyLog := filepath.Join(logDir, "traffic-analysis-20260804-071631.log")
 	if err := os.MkdirAll(filepath.Dir(legacyLog), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,9 @@ func TestCheckpointClearsStaleAutoLogOnAdopt(t *testing.T) {
 // stays rejected, and the evidence is retained.
 func TestCheckpointKeepsStaleAutoLogOnNonActivatingWrite(t *testing.T) {
 	ctx := context.Background()
-	store, home, backupDir := seedLegacyRecovery(t, nil)
+	store, home, backupDir := seedLegacyRecovery(t, func(st *recovery.State) {
+		st.AutoLog.Path = filepath.Join(filepath.Dir(filepath.Dir(st.ConfigPath)), "legacy-project", "traffic-analysis.log")
+	})
 	writer := trafficRecoveryWriter{store: store, configHome: home, backupDir: backupDir}
 
 	err := writer.Checkpoint(ctx, traffictransaction.Checkpoint{
@@ -196,6 +198,7 @@ func TestCheckpointDoesNotClearUnresolvedState(t *testing.T) {
 	store, home, backupDir := seedLegacyRecovery(t, func(st *recovery.State) {
 		st.Phase = recovery.PhaseReconciliationReq
 		st.ReconciliationStatus = strPtr("pending_restore")
+		st.AutoLog.Path = filepath.Join(filepath.Dir(filepath.Dir(st.ConfigPath)), "legacy-project", "traffic-analysis.log")
 	})
 	writer := trafficRecoveryWriter{store: store, configHome: home, backupDir: backupDir}
 
@@ -220,6 +223,7 @@ func TestCheckpointDoesNotClearUnsavedState(t *testing.T) {
 	ctx := context.Background()
 	store, home, backupDir := seedLegacyRecovery(t, func(st *recovery.State) {
 		st.UnsavedObservationsMayRemain = true
+		st.AutoLog.Path = filepath.Join(filepath.Dir(filepath.Dir(st.ConfigPath)), "legacy-project", "traffic-analysis.log")
 	})
 	writer := trafficRecoveryWriter{store: store, configHome: home, backupDir: backupDir}
 

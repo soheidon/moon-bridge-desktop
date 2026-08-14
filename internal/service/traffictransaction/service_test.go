@@ -597,8 +597,47 @@ func TestEnableStartsClaimsCommitsAndCheckpoints(t *testing.T) {
 	if traffic.lastStart.ListenAddr != CaptureListenAddress || traffic.lastStart.UpstreamBase != "http://127.0.0.1:38440" {
 		t.Fatalf("start options = %#v", traffic.lastStart)
 	}
-	if backup.created != 1 || len(recovery.checkpoints) != 3 || recovery.checkpoints[0].Phase != PhasePrepared || recovery.checkpoints[2].IntegrationActive != true {
+	if backup.created != 1 || backup.removed != 1 || len(recovery.checkpoints) != 3 || recovery.checkpoints[0].Phase != PhasePrepared || recovery.checkpoints[2].IntegrationActive != true {
 		t.Fatalf("backup/checkpoints = %d/%#v", backup.created, recovery.checkpoints)
+	}
+}
+
+func TestSuccessfulEnableDisableEmitsSafeLifecycleEventsInOrder(t *testing.T) {
+	service, _, _, _, _ := newFixture()
+	service.ids = &sequenceIDs{values: []string{"enable-1", "disable-1"}}
+	var events []Event
+	service.deps.Events = func(event Event) {
+		events = append(events, event)
+	}
+
+	if _, err := service.Enable(context.Background()); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	if _, err := service.Disable(context.Background()); err != nil {
+		t.Fatalf("Disable() error = %v", err)
+	}
+
+	want := []EventCode{
+		EventBackupCreated,
+		EventRouteApplied,
+		EventAnalysisStarted,
+		EventBackupRemoved,
+		EventRouteRestored,
+		EventAnalysisStopped,
+	}
+	if len(events) != len(want) {
+		t.Fatalf("event count = %d, want %d", len(events), len(want))
+	}
+	for i, event := range events {
+		if event.Code != want[i] {
+			t.Fatalf("event %d code = %q, want %q", i, event.Code, want[i])
+		}
+		if event.Timestamp == "" {
+			t.Fatalf("event %d timestamp is empty", i)
+		}
+		if event.Severity != EventSeverityInfo && event.Severity != EventSeveritySuccess {
+			t.Fatalf("event %d has unexpected severity %q", i, event.Severity)
+		}
 	}
 }
 
@@ -1035,6 +1074,113 @@ func TestDisablePreviousKeyAbsentDeletesOnlyManagedKey(t *testing.T) {
 	}
 }
 
+func TestDisablePreservesUnrelatedConfigRevisionForBothPreviousRouteStates(t *testing.T) {
+	tests := []struct {
+		name            string
+		previousPresent bool
+		previousValue   string
+	}{
+		{name: "previous route absent", previousPresent: false},
+		{name: "previous custom route", previousPresent: true, previousValue: "https://example.invalid"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			service, traffic, cfg, _, recovery := newFixture()
+			service.ids = &sequenceIDs{values: []string{"enable-1", "disable-1"}}
+			cfg.present = tt.previousPresent
+			cfg.value = tt.previousValue
+			var events []Event
+			service.deps.Events = func(event Event) { events = append(events, event) }
+
+			if _, err := service.Enable(context.Background()); err != nil {
+				t.Fatalf("Enable() error = %v", err)
+			}
+			cfg.mu.Lock()
+			cfg.currentHash = "unrelated-change"
+			cfg.mu.Unlock()
+			if _, err := service.Disable(context.Background()); err != nil {
+				t.Fatalf("Disable() error = %v", err)
+			}
+
+			cfg.mu.Lock()
+			gotPresent, gotValue, commits := cfg.present, cfg.value, cfg.commitCalls
+			cfg.mu.Unlock()
+			if gotPresent != tt.previousPresent || gotValue != tt.previousValue {
+				t.Fatalf("restored route = present %v value %q, want present %v value %q", gotPresent, gotValue, tt.previousPresent, tt.previousValue)
+			}
+			if commits != 2 {
+				t.Fatalf("config commit calls = %d, want 2", commits)
+			}
+			if traffic.releaseCalls != 1 || traffic.closeCalls != 0 || traffic.state.Mode != trafficanalysis.ModeCaptureOnly || traffic.state.CaptureState != "passthrough" {
+				t.Fatalf("traffic state/calls = %#v release=%d close=%d", traffic.state, traffic.releaseCalls, traffic.closeCalls)
+			}
+			if len(recovery.checkpoints) == 0 || recovery.checkpoints[len(recovery.checkpoints)-1].DurablePhase != DurableInactive {
+				t.Fatalf("final recovery checkpoint = %#v", recovery.checkpoints)
+			}
+			if len(events) < 2 || events[len(events)-2].Code != EventRouteRestored || events[len(events)-1].Code != EventAnalysisStopped {
+				t.Fatalf("final events = %#v", events)
+			}
+		})
+	}
+}
+
+func TestDisableManagedRouteAndCASConflictsAreSafeAndUnchanged(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*fakeConfig)
+	}{
+		{
+			name: "managed route conflict",
+			setup: func(cfg *fakeConfig) {
+				cfg.value = "https://external.invalid"
+				cfg.currentHash = "external-route"
+			},
+		},
+		{
+			name: "read-to-commit CAS conflict",
+			setup: func(cfg *fakeConfig) {
+				cfg.prepareErr = &codexconfig.Error{Kind: codexconfig.KindConflict, Message: "conflict"}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			service, traffic, cfg, _, recovery := newFixture()
+			service.ids = &sequenceIDs{values: []string{"enable-1", "disable-1"}}
+			var events []Event
+			service.deps.Events = func(event Event) { events = append(events, event) }
+			if _, err := service.Enable(context.Background()); err != nil {
+				t.Fatalf("Enable() error = %v", err)
+			}
+			cfg.mu.Lock()
+			tt.setup(cfg)
+			cfg.mu.Unlock()
+
+			_, err := service.Disable(context.Background())
+			requireKind(t, err, KindRestoreConflict)
+			cfg.mu.Lock()
+			commits := cfg.commitCalls
+			cfg.mu.Unlock()
+			if commits != 1 || traffic.releaseCalls != 0 || traffic.closeCalls != 0 || traffic.state.Mode != trafficanalysis.ModeDesktop || traffic.state.CaptureState != "passthrough" {
+				t.Fatalf("conflict side effects = commits %d release %d close %d state %#v", commits, traffic.releaseCalls, traffic.closeCalls, traffic.state)
+			}
+			recovery.mu.Lock()
+			last := recovery.checkpoints[len(recovery.checkpoints)-1]
+			recovery.mu.Unlock()
+			if last.DurablePhase != DurableReconciliationRequired || last.ReconciliationStatus != ReconciliationStatusConfigConflict || !last.IntegrationActive {
+				t.Fatalf("conflict checkpoint = %#v", last)
+			}
+			for _, event := range events {
+				if event.Code == EventRouteRestored || event.Code == EventAnalysisStopped {
+					t.Fatalf("success event emitted after conflict: %#v", event)
+				}
+			}
+		})
+	}
+}
+
 func TestDisablePauseFailureDoesNotWriteOrRelease(t *testing.T) {
 	service, traffic, cfg, _ := newEnabledFixture(t)
 	traffic.pauseErr = errors.New("pause failed")
@@ -1049,6 +1195,7 @@ func TestDisableConfigConflictDoesNotWriteOrRelease(t *testing.T) {
 	service, traffic, cfg, recovery := newEnabledFixture(t)
 	cfg.mu.Lock()
 	cfg.currentHash = "external"
+	cfg.value = "https://external.invalid"
 	cfg.mu.Unlock()
 	_, err := service.Disable(context.Background())
 	requireKind(t, err, KindRestoreConflict)

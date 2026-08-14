@@ -60,6 +60,10 @@ func TestStateJSONCamelCaseAndNoSecrets(t *testing.T) {
 	st.IntegrationActive = true
 	st.Phase = PhaseIntegrationApplied
 	st.OperationID = "op-1"
+	st.TransitionID = "550e8400-e29b-41d4-a716-446655440000"
+	st.RoutePhase = "activating_deepseek"
+	st.DesiredRoute = "deepseek"
+	st.RouteEvidence = "none"
 	st.ConfigPath = "config.toml"
 	st.CodexHomeFingerprint = strings.Repeat("a", 64)
 	st.PreviousOpenaiBaseURLPresent = true
@@ -85,7 +89,7 @@ func TestStateJSONCamelCaseAndNoSecrets(t *testing.T) {
 	raw := string(data)
 
 	for _, key := range []string{
-		"schemaVersion", "integrationActive", "phase", "operationId", "configPath",
+		"schemaVersion", "integrationActive", "phase", "operationId", "transitionId", "routePhase", "desiredRoute", "routeEvidence", "configPath",
 		"codexHomeFingerprint",
 		"previousOpenaiBaseUrlPresent", "previousOpenaiBaseUrl", "appliedOpenaiBaseUrl",
 		"configHashBeforeApply", "configHashAfterApply", "backupPath", "startedAt",

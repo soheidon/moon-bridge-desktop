@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"errors"
+	"io/fs"
+	"os"
 	"path/filepath"
 
 	"moonbridge/internal/service/codexconfig"
 	"moonbridge/internal/service/recovery"
+	"moonbridge/internal/service/routingswitch"
 	"moonbridge/internal/service/trafficanalysis"
 )
 
@@ -17,7 +20,8 @@ type RestoreRecoveryInput struct {
 }
 
 // DiscardRecoveryInput controls deletion of an already resolved Recovery
-// record. Discard never changes Codex, Gateway, Capture, or backup files.
+// record. Discard never changes Codex, Gateway, or Capture state, but it does
+// clean the transaction backup owned by the Recovery record.
 type DiscardRecoveryInput struct {
 	Confirm        bool `json:"confirm"`
 	DiscardUnsaved bool `json:"discardUnsaved"`
@@ -56,6 +60,11 @@ func (a *App) executeRecoveryMutation(operation string, fn func(context.Context)
 	if a.closed.Load() {
 		return hostClosed(operation)
 	}
+	token, err := a.operationGate().Begin(routingswitch.OperationRecovery)
+	if err != nil {
+		return errDesktop(operation, "coordination", "route_operation_busy", "another route operation is in progress", true)
+	}
+	defer func() { _ = token.Release() }()
 	ctx, cancel := context.WithTimeout(a.appCtx, trafficCommandTimeout)
 	defer cancel()
 	a.operationMu.Lock()
@@ -169,6 +178,9 @@ func (a *App) restoreRecovery(ctx context.Context, input RestoreRecoveryInput) (
 		}
 	}
 	if current.ConfigHash == state.ConfigHashBeforeApply {
+		if err := a.cleanupRecoveryBackup(state); err != nil {
+			return nil, errRecoveryUnsafe
+		}
 		if err := a.markRecoveryRestored(ctx, state); err != nil {
 			return nil, errRecoveryUnsafe
 		}
@@ -197,6 +209,9 @@ func (a *App) restoreRecovery(ctx context.Context, input RestoreRecoveryInput) (
 	}
 	verified, err := editor.ReadRootURL(ctx)
 	if err != nil || verified.ConfigHash != prepared.AfterHash || !samePreviousURL(verified, state) {
+		return nil, errRecoveryUnsafe
+	}
+	if err := a.cleanupRecoveryBackup(state); err != nil {
 		return nil, errRecoveryUnsafe
 	}
 	if err := a.markRecoveryRestored(ctx, state); err != nil {
@@ -253,6 +268,7 @@ func (a *App) markRecoveryRestored(ctx context.Context, expected *recovery.State
 		}
 		current.IntegrationActive = false
 		current.Phase = recovery.PhaseReconciledRestored
+		current.CleanupPending = nil
 		status := string(recovery.StatusAlreadyRestored)
 		current.ReconciliationStatus = &status
 		return nil
@@ -278,9 +294,19 @@ func sameRecoveryState(a, b *recovery.State) bool {
 	return a.SchemaVersion == b.SchemaVersion && a.IntegrationActive == b.IntegrationActive &&
 		a.Phase == b.Phase && a.OperationID == b.OperationID &&
 		a.ConfigHashBeforeApply == b.ConfigHashBeforeApply && a.ConfigHashAfterApply == b.ConfigHashAfterApply &&
+		stringValue(a.BackupPath) == stringValue(b.BackupPath) &&
+		cleanupPendingEqual(a.CleanupPending, b.CleanupPending) &&
 		a.UnsavedObservationsMayRemain == b.UnsavedObservationsMayRemain &&
 		a.UnsavedDiscardConfirmed == b.UnsavedDiscardConfirmed &&
 		stringValue(a.UpdatedAt) == stringValue(b.UpdatedAt)
+}
+
+func cleanupPendingEqual(a, b *recovery.CleanupPending) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.TransactionID == b.TransactionID && a.BackupID == b.BackupID &&
+		a.RouteMutationResult == b.RouteMutationResult && a.Status == b.Status
 }
 
 func stringValue(value *string) string {
@@ -315,12 +341,16 @@ func (a *App) discardRecovery(ctx context.Context, input DiscardRecoveryInput) (
 		return nil, errRecoveryUnsafe
 	}
 	if state.CleanupPending != nil {
+		if err := a.cleanupRecoveryBackup(state); err != nil {
+			return nil, errRecoveryUnsafe
+		}
 		err := a.recovery.Update(ctx, func(current *recovery.State) error {
 			if !sameRecoveryState(current, state) || current.CleanupPending == nil {
 				return errRecoveryStateChanged
 			}
 			current.IntegrationActive = false
 			current.Phase = recovery.PhaseInactive
+			current.CleanupPending = nil
 			return nil
 		})
 		if err != nil {
@@ -338,4 +368,35 @@ func (a *App) discardRecovery(ctx context.Context, input DiscardRecoveryInput) (
 		return nil, errRecoveryStateChanged
 	}
 	return a.desktopSnapshot(ctx)
+}
+
+// cleanupRecoveryBackup removes only the backup named by the current
+// transaction ownership record. A missing expected artifact is already
+// cleaned and therefore succeeds idempotently; invalid IDs and other delete
+// failures remain retryable through the unchanged Recovery state.
+func (a *App) cleanupRecoveryBackup(state *recovery.State) error {
+	if state == nil {
+		return nil
+	}
+	id := ""
+	if state.CleanupPending != nil {
+		id = state.CleanupPending.BackupID
+	}
+	if id == "" && state.BackupPath != nil {
+		id = filepath.Base(*state.BackupPath)
+	}
+	if id == "" {
+		return nil
+	}
+	if a.trafficBackupDir == "" {
+		return errRecoveryUnsafe
+	}
+	path, err := codexconfig.ResolveBackupPath(a.trafficBackupDir, id)
+	if err != nil {
+		return errRecoveryUnsafe
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return errRecoveryUnsafe
+	}
+	return nil
 }

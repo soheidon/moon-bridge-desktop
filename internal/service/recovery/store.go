@@ -339,6 +339,7 @@ func hasRegularRecovery(st *State) bool {
 		return false
 	}
 	return st.IntegrationActive || st.OperationID != "" || st.ConfigPath != "" ||
+		st.TransitionID != "" || st.RoutePhase != "" || st.DesiredRoute != "" || st.RouteEvidence != "" ||
 		st.ConfigHashBeforeApply != "" || st.ConfigHashAfterApply != "" ||
 		st.UnsavedObservationsMayRemain || st.Phase != PhaseInactive && st.Phase != PhaseReconciledRestored
 }
@@ -852,6 +853,10 @@ func assertClassificationOnly(before, after *State) error {
 		return newError(KindReconcileFailed, "reconcile must not change integrationActive except on already_restored")
 	}
 	if before.OperationID != after.OperationID ||
+		before.TransitionID != after.TransitionID ||
+		before.RoutePhase != after.RoutePhase ||
+		before.DesiredRoute != after.DesiredRoute ||
+		before.RouteEvidence != after.RouteEvidence ||
 		before.ConfigPath != after.ConfigPath ||
 		before.CodexHomeFingerprint != after.CodexHomeFingerprint ||
 		before.PreviousOpenaiBaseURLPresent != after.PreviousOpenaiBaseURLPresent ||

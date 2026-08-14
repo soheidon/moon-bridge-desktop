@@ -96,7 +96,7 @@ describe("RoutingProfileEditor", () => {
     expect(markup).toContain("deepseek-v4-pro");
     expect(markup).toContain('value="max"');
     expect(markup).toContain('value="high"');
-    expect(markup).not.toContain("Default");
+    expect(markup).toContain("Default");
     expect(markup).toContain("Thinking");
     expect(markup).toContain("通常");
     expect(markup).toContain("推論強度:");
@@ -136,7 +136,7 @@ describe("RoutingProfileEditor", () => {
     act(() => root.unmount());
   });
 
-  it("does not auto-save while the Gateway is stopped and shows a pending hint", async () => {
+  it("auto-saves while the Gateway is stopped", async () => {
     const saveProfile = saveProfileMock();
     const stopped = routingState({ saveProfile, gatewayRunning: false, routing: { ...snapshot, gatewayRunning: false } });
     const container = document.createElement("div");
@@ -151,12 +151,15 @@ describe("RoutingProfileEditor", () => {
     });
     await act(async () => {});
 
-    expect(saveProfile).not.toHaveBeenCalled();
-    expect(container.textContent).toContain("Gateway開始後に保存されます。");
+    expect(saveProfile).toHaveBeenCalledTimes(1);
+    expect(saveProfile).toHaveBeenCalledWith(expect.objectContaining({
+      slots: expect.objectContaining({ sol: expect.objectContaining({ upstreamModel: "deepseek-v4-pro" }) }),
+    }));
+    expect(container.textContent).toContain("Gateway停止中");
     act(() => root.unmount());
   });
 
-  it("auto-saves pending edits when the Gateway starts", async () => {
+  it("does not defer auto-save until the Gateway starts", async () => {
     const saveProfile = saveProfileMock();
     let current = routingState({ saveProfile, gatewayRunning: false, routing: { ...snapshot, gatewayRunning: false } });
     const container = document.createElement("div");
@@ -170,7 +173,7 @@ describe("RoutingProfileEditor", () => {
       setNativeValue(solModel!, "deepseek-v4-pro");
     });
     await act(async () => {});
-    expect(saveProfile).not.toHaveBeenCalled();
+    expect(saveProfile).toHaveBeenCalledTimes(1);
 
     current = routingState({ saveProfile });
     await act(async () => {

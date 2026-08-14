@@ -98,11 +98,12 @@ func TestSaveDeepSeekSettingsUnsupportedPlatformGuard(t *testing.T) {
 	}
 
 	// Empty key (environment path) passes the guard and falls through to the
-	// session requirement — proving the guard only blocks stored keys.
+	// stopped persistent-save path. This fixture has no persisted store, so the
+	// save failure proves the unsupported-platform guard only blocks stored keys.
 	envInput := validDeepSeekInput()
 	res = app.SaveDeepSeekSettings(envInput)
-	if res.Error == nil || res.Error.Code != "deepseek_gateway_not_running" {
-		t.Fatalf("SaveDeepSeekSettings(env) = %#v, want deepseek_gateway_not_running (guard bypassed)", res)
+	if res.Error == nil || res.Error.Code != "deepseek_save_failed" {
+		t.Fatalf("SaveDeepSeekSettings(env) = %#v, want deepseek_save_failed (guard bypassed)", res)
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	"moonbridge/internal/service/deepseek"
 	"moonbridge/internal/service/gateway"
 	"moonbridge/internal/service/recovery"
+	"moonbridge/internal/service/routingswitch"
 	"moonbridge/internal/service/trafficanalysis"
 	"moonbridge/internal/service/traffictransaction"
 )
@@ -257,12 +258,10 @@ func (a *App) safeEmit(name string, payload any) {
 type trafficGatewayProvider struct{ app *App }
 
 func (p trafficGatewayProvider) Snapshot(ctx context.Context) (traffictransaction.GatewaySnapshot, error) {
-	p.app.operationMu.Lock()
-	var session gatewaySession
-	if p.app.session != nil {
-		session = *p.app.session
+	session, ok := p.app.copySession()
+	if !ok {
+		return traffictransaction.GatewaySnapshot{}, errors.New("gateway session identity is unavailable")
 	}
-	p.app.operationMu.Unlock()
 	st := p.app.svc.Status()
 	if st.Status != gateway.StatusRunning {
 		return traffictransaction.GatewaySnapshot{}, errors.New("gateway is not running")
@@ -305,6 +304,14 @@ type trafficBackupManager struct {
 }
 
 func (b trafficBackupManager) Create(ctx context.Context) (traffictransaction.BackupRef, error) {
+	return b.create(ctx, nil)
+}
+
+func (b trafficBackupManager) CreateProtected(ctx context.Context, protected []string) (traffictransaction.BackupRef, error) {
+	return b.create(ctx, protected)
+}
+
+func (b trafficBackupManager) create(ctx context.Context, protected []string) (traffictransaction.BackupRef, error) {
 	if err := ctx.Err(); err != nil {
 		return traffictransaction.BackupRef{}, err
 	}
@@ -312,7 +319,7 @@ func (b trafficBackupManager) Create(ctx context.Context) (traffictransaction.Ba
 	if err != nil {
 		return traffictransaction.BackupRef{}, err
 	}
-	path, err := codexconfig.CreateBackup(b.backupDir, data)
+	path, err := codexconfig.CreateBackupWithProtected(b.backupDir, data, protected)
 	if err != nil {
 		return traffictransaction.BackupRef{}, err
 	}
@@ -599,6 +606,7 @@ func (a *App) ensureTrafficTransaction() (*traffictransaction.Service, error) {
 		}
 		backupDir = filepath.Join(base, "backups", "codex-config")
 	}
+	a.trafficBackupDir = backupDir
 	store := a.recovery
 	configEditor := codexconfig.New(codexconfig.Options{Home: configHome, BackupDir: backupDir})
 	a.trafficTx = traffictransaction.New(traffictransaction.Dependencies{
@@ -607,6 +615,9 @@ func (a *App) ensureTrafficTransaction() (*traffictransaction.Service, error) {
 		Config:   configEditor,
 		Backup:   trafficBackupManager{configPath: configPath, backupDir: backupDir},
 		Recovery: trafficRecoveryWriter{store: store, configHome: configHome, backupDir: backupDir},
+		Events: func(event traffictransaction.Event) {
+			a.safeEmit(trafficEvent, event)
+		},
 	})
 	a.trafficConfigPath = configPath
 	return a.trafficTx, nil
@@ -781,6 +792,11 @@ func (a *App) executeTrafficCommand(operation string, fn func(context.Context, *
 	if !a.trafficMutationAllowed(operation) {
 		return errDesktop(operation, "lifecycle", "desktop_app_not_ready", "desktop app is not ready", true)
 	}
+	token, err := a.operationGate().Begin(routingswitch.OperationTraffic)
+	if err != nil {
+		return errDesktop(operation, "coordination", "route_operation_busy", "another route operation is in progress", true)
+	}
+	defer func() { _ = token.Release() }()
 	defer func() {
 		if recover() != nil {
 			result = errDesktop(operation, "binding", "desktop_command_failed", "desktop command failed", true)

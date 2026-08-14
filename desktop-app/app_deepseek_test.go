@@ -309,7 +309,7 @@ func TestValidateDeepSeekSettingsInvalidField(t *testing.T) {
 
 // ---- Save ----
 
-func TestSaveDeepSeekSettingsGatewayNotRunning(t *testing.T) {
+func TestSaveDeepSeekSettingsWithoutPersistedStore(t *testing.T) {
 	cfg := writeCaptureAnthropicConfig(t, t.TempDir())
 	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
 	app := NewApp(AppOptions{
@@ -321,8 +321,8 @@ func TestSaveDeepSeekSettingsGatewayNotRunning(t *testing.T) {
 	defer app.shutdown(context.Background())
 
 	res := app.SaveDeepSeekSettings(validDeepSeekInput())
-	if res.OK || res.Error == nil || res.Error.Code != "deepseek_gateway_not_running" {
-		t.Fatalf("SaveDeepSeekSettings() = %#v, want deepseek_gateway_not_running", res)
+	if res.OK || res.Error == nil || res.Error.Code != "deepseek_save_failed" {
+		t.Fatalf("SaveDeepSeekSettings() = %#v, want deepseek_save_failed", res)
 	}
 }
 

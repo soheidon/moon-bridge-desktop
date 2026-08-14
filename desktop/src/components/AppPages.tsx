@@ -66,7 +66,7 @@ export function AppPages({ page, snapshot, gateway, deepseek, routing, traffic }
         <RoutingProfilePanel routing={routing} />
         <GatewayStatusPanel snapshot={snapshot} error={gateway.error} />
       </div>
-      <ProcessLogPanel logs={gateway.logs} />
+      <ProcessLogPanel logs={gateway.logs} trafficEvents={traffic.runtimeEvents} />
     </main>
   );
 }

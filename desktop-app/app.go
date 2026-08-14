@@ -20,6 +20,7 @@ import (
 	"moonbridge/internal/service/gateway"
 	"moonbridge/internal/service/recovery"
 	"moonbridge/internal/service/routingprofile"
+	"moonbridge/internal/service/routingswitch"
 	"moonbridge/internal/service/trafficanalysis"
 	"moonbridge/internal/service/traffictransaction"
 )
@@ -28,6 +29,7 @@ const (
 	roundTripEvent     = "desktop:roundtrip"
 	gatewayStatusEvent = "gateway-status"
 	gatewayLogEvent    = "gateway-log"
+	trafficEvent       = "traffic-transaction-event"
 )
 
 type CommandError struct {
@@ -102,13 +104,13 @@ type gatewayController interface {
 // bindings derive from. The secrets (ControlToken / ServerToken) never leave
 // this struct.
 type gatewaySession struct {
-	InstanceID             string        // matches svc.Status().InstanceID; guards against stale sessions
-	Address                string        // management API base / codex base URL source
-	ControlToken           string        // DeepSeek management API bearer. Secret.
-	ServerToken            string        // codex auth.json token. Secret.
-	ConfigPath             string        // config the session started from / reloads after saves
-	Config                 config.Config // codex config generation source (loaded at start)
-	ConfigValid            bool          // Config matches the current on-disk config
+	InstanceID   string        // matches svc.Status().InstanceID; guards against stale sessions
+	Address      string        // management API base / codex base URL source
+	ControlToken string        // DeepSeek management API bearer. Secret.
+	ServerToken  string        // codex auth.json token. Secret.
+	ConfigPath   string        // config the session started from / reloads after saves
+	Config       config.Config // codex config generation source (loaded at start)
+	ConfigValid  bool          // Config matches the current on-disk config
 }
 
 // codexController is the codex terminal-session controller the App drives. It
@@ -157,10 +159,14 @@ type App struct {
 	ctx              context.Context // Wails runtime ctx（startup で保存のみ）
 	appCtx           context.Context // gateway run の親 ctx（NewApp で生成）
 	cancel           context.CancelFunc
-	operationMu      sync.Mutex // Gateway lifecycle + DeepSeek 管理 API
-	codexMu          sync.Mutex // Codex terminal process
-	configMu         sync.Mutex // ユーザー実 Codex config
-	trafficMu        sync.Mutex // Desktop traffic transaction coordination
+	operationMu      sync.Mutex   // Gateway lifecycle + DeepSeek 管理 API
+	codexMu          sync.Mutex   // Codex terminal process
+	configMu         sync.Mutex   // ユーザー実 Codex config
+	trafficMu        sync.Mutex   // Desktop traffic transaction coordination
+	sessionMu        sync.RWMutex // short immutable copy of the live gateway session
+	routeGateMu      sync.Mutex
+	routeGate        *routingswitch.Gate
+	transitionGen    *routingswitch.Generator
 	lifecycleMu      sync.Mutex
 	lifecycle        appLifecycle
 	startupOnce      sync.Once
@@ -267,23 +273,25 @@ func NewApp(opts AppOptions) *App {
 	}
 	appCtx, cancel := context.WithCancel(context.Background())
 	a := &App{
-		appCtx:            appCtx,
-		cancel:            cancel,
-		svc:               opts.Service,
-		traffic:           traffic,
-		configuredPath:    opts.ConfigPath,
-		newIdentity:       newIdentity,
-		emitEvents:        opts.EmitEvents,
-		trafficTx:         opts.TrafficTransaction,
-		recovery:          opts.Recovery,
-		recoveryHome:      opts.RecoveryHome,
-		trafficBackupDir:  opts.BackupDir,
+		appCtx:                appCtx,
+		cancel:                cancel,
+		svc:                   opts.Service,
+		traffic:               traffic,
+		configuredPath:        opts.ConfigPath,
+		newIdentity:           newIdentity,
+		emitEvents:            opts.EmitEvents,
+		trafficTx:             opts.TrafficTransaction,
+		recovery:              opts.Recovery,
+		recoveryHome:          opts.RecoveryHome,
+		trafficBackupDir:      opts.BackupDir,
 		codexConfig:           codexConfig,
 		newDeepSeek:           newDeepSeek,
 		newRoutingProfile:     newRoutingProfile,
 		deriveCodex:           deriveCodex,
 		quitDesktop:           opts.Quit,
 		routingProfileRefresh: opts.RoutingProfileRefresh,
+		routeGate:             routingswitch.NewGate(),
+		transitionGen:         routingswitch.NewGenerator(),
 	}
 	if a.quitDesktop == nil {
 		a.quitDesktop = runtime.Quit
@@ -407,7 +415,7 @@ func (a *App) shutdown(context.Context) {
 	_ = a.svc.Stop(gwStopCtx) // cleanup continues even after traffic failure
 	gwCancel()
 
-	a.session = nil
+	a.clearSession()
 	a.emitStatus()
 }
 
@@ -540,6 +548,7 @@ func (a *App) startGatewayLocked(requestPath string) GatewayCommandResult {
 	// The session is built only after Start succeeds: the address materializes
 	// with the successful run, and the control token must be this run's.
 	st := a.svc.Status()
+	a.sessionMu.Lock()
 	a.session = &gatewaySession{
 		InstanceID:   st.InstanceID,
 		Address:      st.Addr,
@@ -549,6 +558,7 @@ func (a *App) startGatewayLocked(requestPath string) GatewayCommandResult {
 		Config:       cfg,
 		ConfigValid:  true,
 	}
+	a.sessionMu.Unlock()
 	a.activeConfigPath = configPath
 	a.emitStatus()
 	return GatewayCommandResult{OK: true, Value: a.snapshotPtr()}
@@ -556,7 +566,7 @@ func (a *App) startGatewayLocked(requestPath string) GatewayCommandResult {
 
 func (a *App) stopGatewayLocked() GatewayCommandResult {
 	if st := a.svc.Status().Status; st == gateway.StatusStopped || st == gateway.StatusFailed {
-		a.session = nil
+		a.clearSession()
 		return GatewayCommandResult{OK: true, Value: a.snapshotPtr()}
 	}
 	stopCtx, cancel := context.WithTimeout(a.appCtx, 10*time.Second)
@@ -564,7 +574,7 @@ func (a *App) stopGatewayLocked() GatewayCommandResult {
 	if err := a.svc.Stop(stopCtx); err != nil {
 		return a.stopError("gateway.stop", err)
 	}
-	a.session = nil
+	a.clearSession()
 	a.emitStatus()
 	return GatewayCommandResult{OK: true, Value: a.snapshotPtr()}
 }
@@ -656,12 +666,13 @@ func (a *App) emitStatus() {
 // invalidateStaleSession clears the session when the running gateway no longer
 // matches it (status, instance id, or address). Called under operationMu.
 func (a *App) invalidateStaleSession() {
-	if a.session == nil {
+	session, ok := a.copySession()
+	if !ok {
 		return
 	}
 	st := a.svc.Status()
-	if st.Status != gateway.StatusRunning || st.InstanceID != a.session.InstanceID || st.Addr != a.session.Address {
-		a.session = nil
+	if st.Status != gateway.StatusRunning || st.InstanceID != session.InstanceID || st.Addr != session.Address {
+		a.clearSession()
 	}
 }
 
@@ -669,10 +680,38 @@ func (a *App) invalidateStaleSession() {
 // session, clearing it on mismatch so a stale control token is never reused.
 func (a *App) ensureActiveSession() (*gatewaySession, bool) {
 	a.invalidateStaleSession()
+	// Existing operation bindings call this while holding operationMu and may
+	// refresh ConfigValid on the live session. The lock-free copy is reserved
+	// for trafficGatewayProvider, whose snapshot must not acquire operationMu.
 	if a.session == nil {
 		return nil, false
 	}
 	return a.session, true
+}
+
+func (a *App) copySession() (*gatewaySession, bool) {
+	a.sessionMu.RLock()
+	defer a.sessionMu.RUnlock()
+	if a.session == nil {
+		return nil, false
+	}
+	session := *a.session
+	return &session, true
+}
+
+func (a *App) clearSession() {
+	a.sessionMu.Lock()
+	a.session = nil
+	a.sessionMu.Unlock()
+}
+
+func (a *App) operationGate() *routingswitch.Gate {
+	a.routeGateMu.Lock()
+	defer a.routeGateMu.Unlock()
+	if a.routeGate == nil {
+		a.routeGate = routingswitch.NewGate()
+	}
+	return a.routeGate
 }
 
 // resolveDefaultConfigPath returns the default config path: the CLI's existing

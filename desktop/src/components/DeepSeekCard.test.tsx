@@ -213,7 +213,7 @@ describe("DeepSeekCard env var auto-save", () => {
     act(() => root.unmount());
   });
 
-  it("holds an env blur while the Gateway is stopped and shows a pending hint", async () => {
+  it("saves an env blur while the Gateway is stopped", async () => {
     const configure = vi.fn(() => Promise.resolve(true));
     const { container, root } = await renderCard(stopped, deepseekStub(configured, { configure }));
 
@@ -225,12 +225,13 @@ describe("DeepSeekCard env var auto-save", () => {
     });
     await act(async () => {});
 
-    expect(configure).not.toHaveBeenCalled();
-    expect(container.textContent).toContain("Gateway開始後に保存されます。");
+    expect(configure).toHaveBeenCalledTimes(1);
+    expect(configure).toHaveBeenCalledWith("", "HELD_ENV");
+    expect(container.textContent).not.toContain("Gateway開始後に保存されます。");
     act(() => root.unmount());
   });
 
-  it("saves a held env blur once the Gateway starts", async () => {
+  it("does not defer an env blur until the Gateway starts", async () => {
     const configure = vi.fn(() => Promise.resolve(true));
     const { container, root } = await renderCard(stopped, deepseekStub(configured, { configure }));
 
@@ -241,7 +242,8 @@ describe("DeepSeekCard env var auto-save", () => {
       blurInput(envInput(container));
     });
     await act(async () => {});
-    expect(configure).not.toHaveBeenCalled();
+    expect(configure).toHaveBeenCalledTimes(1);
+    expect(configure).toHaveBeenCalledWith("", "HELD_ENV");
 
     await act(async () => {
       root.render(<DeepSeekCard snapshot={running} deepseek={deepseekStub(configured, { configure })} routing={routingStub()} />);
@@ -249,7 +251,6 @@ describe("DeepSeekCard env var auto-save", () => {
     await act(async () => {});
 
     expect(configure).toHaveBeenCalledTimes(1);
-    expect(configure).toHaveBeenCalledWith("", "HELD_ENV");
     act(() => root.unmount());
   });
 });
@@ -305,7 +306,7 @@ describe("DeepSeekCard manual API key save", () => {
     act(() => root.unmount());
   });
 
-  it("disables the key save button while the Gateway is stopped", async () => {
+  it("saves the key while the Gateway is stopped", async () => {
     const configure = vi.fn(() => Promise.resolve(true));
     const { container, root } = await renderCard(stopped, deepseekStub(configured, { configure }));
 
@@ -318,7 +319,8 @@ describe("DeepSeekCard manual API key save", () => {
     await act(async () => {});
 
     expect(saveKeyButton(container).disabled).toBe(true);
-    expect(configure).not.toHaveBeenCalled();
+    expect(configure).toHaveBeenCalledTimes(1);
+    expect(configure).toHaveBeenCalledWith("sk-held", undefined);
     act(() => root.unmount());
   });
 

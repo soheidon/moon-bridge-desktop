@@ -157,6 +157,33 @@ func TestRetainConfigBackupsKeepsNewestFive(t *testing.T) {
 	}
 }
 
+func TestRetainConfigBackupsProtectsActiveReferenceOutsideLimit(t *testing.T) {
+	dir := t.TempDir()
+	for _, ts := range backupTimes {
+		writeBackupFile(t, dir, backupName(ts), []byte("x"))
+	}
+	oldProtected := backupName(backupTimes[len(backupTimes)-1])
+	newest := backupName(backupTimes[0])
+	retainConfigBackups(dir, oldProtected, newest)
+	remaining, err := ListBackups(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 6 {
+		t.Fatalf("expected five ordinary plus protected backup, got %d", len(remaining))
+	}
+	seen := make(map[string]bool, len(remaining))
+	for _, backup := range remaining {
+		seen[backup.ID] = true
+	}
+	if !seen[oldProtected] || !seen[newest] {
+		t.Fatalf("protected backups were trimmed: %v", seen)
+	}
+	if seen[backupName(backupTimes[len(backupTimes)-2])] {
+		t.Fatal("unprotected oldest backup was retained")
+	}
+}
+
 func TestResolveBackupPathValid(t *testing.T) {
 	dir := t.TempDir()
 	id := backupName(backupTimes[0])
@@ -360,7 +387,7 @@ func (f *backupFake) deleteOnClose(backupFile) error {
 	}
 	return nil
 }
-func (f *backupFake) retain(backupRoot, string, string) error {
+func (f *backupFake) retain(backupRoot, string, []string) error {
 	f.record("retain")
 	if f.fail == "retain" {
 		return errors.New("retain failure")
