@@ -52,7 +52,10 @@ jobs:
       - name: Run Go tests
         env:
           CGO_ENABLED: "0"
-        run: go test ./...
+        # Hosted Windows runners can starve the server/shim integration tests
+        # when every package initializes SQLite and child processes in parallel.
+        # Keep test coverage unchanged while making package scheduling stable.
+        run: go test -p 1 ./...
 
   frontend:
     name: Desktop frontend (Windows)
