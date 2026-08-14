@@ -87,10 +87,18 @@ func PrepareTargetHome(targetHome string) error {
 // a symlink/junction ancestor redirected the target to an unexpected location.
 func checkAncestorPath(clean, resolved string) error {
 	// filepath.EvalSymlinks already returns a cleaned path; we compare against
-	// the cleaned absolute input. On Windows, lowercase both (matching
-	// CanonicalizeCodexHome).
-	a := clean
-	b := resolved
+	// the cleaned absolute input. Windows may spell the same non-reparse path
+	// through an 8.3 alias (for example RUNNER~1 on hosted CI), so expand only
+	// that lexical alias before comparing. The expansion deliberately does not
+	// resolve junctions: a real redirect must remain different from resolved.
+	a, err := normalizePathForRedirectComparison(clean)
+	if err != nil {
+		return errors.New("target home ancestor path cannot be normalized")
+	}
+	b, err := normalizePathForRedirectComparison(resolved)
+	if err != nil {
+		return errors.New("resolved target home ancestor path cannot be normalized")
+	}
 	if isWindows {
 		a = filepath.Clean(toLower(a))
 		b = filepath.Clean(toLower(b))

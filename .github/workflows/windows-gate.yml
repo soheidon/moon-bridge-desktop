@@ -34,6 +34,21 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install desktop dependencies for Go embed
+        working-directory: desktop
+        run: npm ci
+
+      - name: Build Wails frontend for Go embed
+        working-directory: desktop
+        run: npm run build:wails
+
       - name: Run Go tests
         env:
           CGO_ENABLED: "0"
