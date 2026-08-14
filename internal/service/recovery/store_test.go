@@ -51,6 +51,10 @@ func TestStoreRoundTrip(t *testing.T) {
 	st := stateWithPhase(t, s, PhaseIntegrationApplied)
 	st.IntegrationActive = true
 	st.OperationID = "op-7"
+	st.TransitionID = "550e8400-e29b-41d4-a716-446655440000"
+	st.RoutePhase = "activating_deepseek"
+	st.DesiredRoute = "deepseek"
+	st.RouteEvidence = "none"
 	st.AppliedOpenaiBaseURL = "http://127.0.0.1:38441/"
 	st.ConfigHashBeforeApply = "deadbeef"
 	st.ConfigHashAfterApply = "cafebabe"
@@ -71,6 +75,9 @@ func TestStoreRoundTrip(t *testing.T) {
 	}
 	if !got.IntegrationActive || got.Phase != PhaseIntegrationApplied {
 		t.Fatalf("round-trip lost fields: %+v", got)
+	}
+	if got.TransitionID != st.TransitionID || got.RoutePhase != st.RoutePhase || got.DesiredRoute != st.DesiredRoute || got.RouteEvidence != st.RouteEvidence {
+		t.Fatalf("round-trip lost route transition fields: %+v", got)
 	}
 	if got.ConfigPath != "config.toml" || got.AppliedOpenaiBaseURL != "http://127.0.0.1:38441/" {
 		t.Fatalf("round-trip lost path/url: %+v", got)

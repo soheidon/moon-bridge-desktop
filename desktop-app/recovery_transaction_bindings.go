@@ -9,6 +9,7 @@ import (
 
 	"moonbridge/internal/service/codexconfig"
 	"moonbridge/internal/service/recovery"
+	"moonbridge/internal/service/routingswitch"
 	"moonbridge/internal/service/trafficanalysis"
 )
 
@@ -59,6 +60,11 @@ func (a *App) executeRecoveryMutation(operation string, fn func(context.Context)
 	if a.closed.Load() {
 		return hostClosed(operation)
 	}
+	token, err := a.operationGate().Begin(routingswitch.OperationRecovery)
+	if err != nil {
+		return errDesktop(operation, "coordination", "route_operation_busy", "another route operation is in progress", true)
+	}
+	defer func() { _ = token.Release() }()
 	ctx, cancel := context.WithTimeout(a.appCtx, trafficCommandTimeout)
 	defer cancel()
 	a.operationMu.Lock()

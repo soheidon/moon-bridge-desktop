@@ -428,27 +428,32 @@ func (s *Service) Disable(ctx context.Context) (Snapshot, error) {
 	}
 
 	current, err := s.deps.Config.ReadRootURL(ctx)
-	if err != nil || current.ConfigHash != journal.AfterHash {
-		cp := checkpointForDisable(txID, ownerID, PhaseDisableStarted, DurableReconciliationRequired, journal, traffic.Generation, true)
-		cp.ReconciliationStatus = ReconciliationStatusConfigConflict
-		_ = s.deps.Recovery.Checkpoint(ctx, cp)
-		s.emitEvent(EventRestoreFailed, EventSeverityError)
-		return Snapshot{}, safeError(KindRestoreConflict, "codex configuration changed after integration", false)
+	if err != nil {
+		return s.disableRestoreFailure(ctx, txID, ownerID, journal, traffic.Generation, true)
+	}
+	if !matchesAppliedRootURL(current, journal) {
+		return s.disableRestoreConflict(ctx, txID, ownerID, journal, traffic.Generation)
 	}
 
 	var desired *string
 	if journal.PreviousPresent {
 		desired = stringPtr(journal.PreviousValue)
 	}
-	restore, err := s.deps.Config.PrepareRootURLChange(ctx, desired, journal.AfterHash)
+	restore, err := s.deps.Config.PrepareRootURLChange(ctx, desired, current.ConfigHash)
 	if err != nil {
+		if isConfigConflict(err) {
+			return s.disableRestoreConflict(ctx, txID, ownerID, journal, traffic.Generation)
+		}
 		return s.disableRestoreFailure(ctx, txID, ownerID, journal, traffic.Generation, true)
 	}
 	if err := s.deps.Config.CommitPreparedRootURLChange(ctx, restore); err != nil {
+		if isConfigConflict(err) {
+			return s.disableRestoreConflict(ctx, txID, ownerID, journal, traffic.Generation)
+		}
 		return s.disableRestoreFailure(ctx, txID, ownerID, journal, traffic.Generation, true)
 	}
 	verified, err := s.deps.Config.ReadRootURL(ctx)
-	if err != nil || verified.ConfigHash != restore.AfterHash || !matchesPreviousRootURL(verified, journal) {
+	if err != nil || !matchesPreviousRootURL(verified, journal) {
 		return s.disableRestoreFailure(ctx, txID, ownerID, journal, traffic.Generation, true)
 	}
 	s.emitEvent(EventRouteRestored, EventSeverityInfo)
@@ -475,7 +480,7 @@ func (s *Service) Disable(ctx context.Context) (Snapshot, error) {
 		return s.disableRecovery(ctx, txID, ownerID, journal, traffic.Generation, false)
 	}
 	finalConfig, err := s.deps.Config.ReadRootURL(ctx)
-	if err != nil || finalConfig.ConfigHash != restore.AfterHash || !matchesPreviousRootURL(finalConfig, journal) {
+	if err != nil || !matchesPreviousRootURL(finalConfig, journal) {
 		return s.disableRecovery(ctx, txID, ownerID, journal, traffic.Generation, false)
 	}
 
@@ -613,6 +618,14 @@ func (s *Service) disableRecovery(ctx context.Context, txID, ownerID string, jou
 	_ = s.deps.Recovery.Checkpoint(ctx, checkpointForDisable(txID, ownerID, PhaseRecoveryRequired, DurableReconciliationRequired, journal, generation, integrationActive))
 	s.emitEvent(EventRecoveryRequired, EventSeverityError)
 	return Snapshot{}, safeError(KindRecoveryRequired, "traffic disable requires recovery", true)
+}
+
+func (s *Service) disableRestoreConflict(ctx context.Context, txID, ownerID string, journal Checkpoint, generation uint64) (Snapshot, error) {
+	cp := checkpointForDisable(txID, ownerID, PhaseDisableStarted, DurableReconciliationRequired, journal, generation, true)
+	cp.ReconciliationStatus = ReconciliationStatusConfigConflict
+	_ = s.deps.Recovery.Checkpoint(ctx, cp)
+	s.emitEvent(EventRestoreFailed, EventSeverityError)
+	return Snapshot{}, safeError(KindRestoreConflict, "codex configuration changed after integration", false)
 }
 
 func (s *Service) disableRestoreFailure(ctx context.Context, txID, ownerID string, journal Checkpoint, generation uint64, integrationActive bool) (Snapshot, error) {
@@ -784,6 +797,10 @@ func matchesPreviousRootURL(snapshot codexconfig.RootURLSnapshot, journal Checkp
 		return false
 	}
 	return !journal.PreviousPresent || snapshot.Value == journal.PreviousValue
+}
+
+func matchesAppliedRootURL(snapshot codexconfig.RootURLSnapshot, journal Checkpoint) bool {
+	return snapshot.Present && snapshot.Value == journal.AppliedValue
 }
 
 func captureMatches(st trafficanalysis.State, gw GatewaySnapshot) bool {
