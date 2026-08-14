@@ -1,6 +1,6 @@
 # Maintainer: Moon Bridge local package
 pkgname=moon-bridge
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=5
 pkgdesc='Protocol conversion and model routing proxy for OpenAI Responses-compatible clients'
 arch=('x86_64')
