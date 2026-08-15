@@ -576,6 +576,8 @@ func TestGatewayEventsAliasAndSanitizeWithoutRawKeys(t *testing.T) {
 	second := analyzer.RecordGatewayEvent(GatewayEventInput{Kind: ObservationProviderRequestPrepared, CorrelationKey: "opaque-request-secret", ProfileID: "profile-secret", Provider: "deepseek", Protocol: "anthropic", Model: "deepseek-v4-flash", Thinking: "disabled"})
 	third := analyzer.RecordGatewayEvent(GatewayEventInput{Kind: ObservationProviderResponseReceived, CorrelationKey: "opaque-request-secret", ProfileID: "profile-secret", Provider: "deepseek", Protocol: "anthropic", Model: "deepseek-v4-flash", StatusCode: 200, ExchangeIndex: 1})
 	diagnostic := analyzer.RecordGatewayEvent(GatewayEventInput{Kind: ObservationRoutingResolutionDiagnosed, CorrelationKey: "opaque-request-secret", Resolver: &ResolverDiagnosticInput{RequestedModel: "gpt-5.6-luna", ServerInstance: "server#7", ResolverGeneration: 4, ResolverPresent: true, InstallSource: "startup", ConfigSource: "persisted_store", ExtensionState: "valid", ActiveProfileState: "present_valid", SlotCount: 3, SolState: "ready", TerraState: "ready", LunaState: "ready", NormalResult: "slot_hit", ResolvedSlot: "luna", FallbackResult: "not_consulted", FinalStage: "exact_slot", KnownAlias: true}})
+	responseModelSentinel := analyzer.RecordGatewayEvent(GatewayEventInput{Kind: ObservationProviderResponseModel, CorrelationKey: "opaque-request-secret", ProfileID: "profile-secret", Provider: "deepseek", Protocol: "anthropic", ResponseModel: "SENTINEL RESPONSE MODEL"})
+	responseModelKnown := analyzer.RecordGatewayEvent(GatewayEventInput{Kind: ObservationProviderResponseModel, CorrelationKey: "opaque-request-secret", ProfileID: "profile-secret", Provider: "deepseek", Protocol: "anthropic", ResponseModel: "deepseek-v4-flash"})
 	if first.GatewayEvent == nil || second.GatewayEvent == nil || first.GatewayEvent.RequestAlias != second.GatewayEvent.RequestAlias {
 		t.Fatalf("event aliases = %#v / %#v, want correlated", first.GatewayEvent, second.GatewayEvent)
 	}
@@ -587,6 +589,12 @@ func TestGatewayEventsAliasAndSanitizeWithoutRawKeys(t *testing.T) {
 	}
 	if diagnostic.GatewayEvent == nil || diagnostic.GatewayEvent.Resolver == nil || diagnostic.GatewayEvent.Resolver.RequestedModel != "known_luna" || diagnostic.GatewayEvent.RequestAlias != first.GatewayEvent.RequestAlias {
 		t.Fatalf("resolver diagnostic = %#v", diagnostic.GatewayEvent)
+	}
+	if responseModelSentinel.GatewayEvent == nil || responseModelSentinel.GatewayEvent.ResponseModel != "unknown" {
+		t.Fatalf("response model sentinel not collapsed to unknown: %#v", responseModelSentinel.GatewayEvent)
+	}
+	if responseModelKnown.GatewayEvent == nil || responseModelKnown.GatewayEvent.ResponseModel != "deepseek-v4-flash" {
+		t.Fatalf("response model allowlisted value = %#v, want deepseek-v4-flash", responseModelKnown.GatewayEvent)
 	}
 	encoded, err := json.Marshal(first)
 	if err != nil {

@@ -11,9 +11,10 @@ import (
 type EventKind string
 
 const (
-	RequestDispatched EventKind = "provider_request_dispatched"
-	ResponseReceived  EventKind = "provider_response_received"
-	ResponseForwarded EventKind = "provider_response_forwarded"
+	RequestDispatched    EventKind = "provider_request_dispatched"
+	ResponseReceived     EventKind = "provider_response_received"
+	ResponseModelObserved EventKind = "provider_response_model"
+	ResponseForwarded    EventKind = "provider_response_forwarded"
 )
 
 type Event struct {
@@ -28,6 +29,7 @@ type Event struct {
 	ConfiguredEffort string    `json:"configuredEffort,omitempty"`
 	Protocol         string    `json:"protocol,omitempty"`
 	Model            string    `json:"model,omitempty"`
+	ResponseModel    string    `json:"responseModel,omitempty"`
 	Thinking         string    `json:"thinking,omitempty"`
 	EffectiveEffort  string    `json:"effectiveEffort,omitempty"`
 	CredentialState  string    `json:"credentialState,omitempty"`
@@ -79,6 +81,25 @@ func MarkForwarded(ctx context.Context) {
 	state.forwarded = true
 	event := state.meta
 	event.Kind = ResponseForwarded
+	event.ExchangeIndex = state.lastSuccess
+	event.StatusCode = state.lastStatus
+	state.recorder(event)
+}
+
+// RecordResponseModel records the model reported in the provider's response
+// body. It fires after the response body is parsed and before the gateway
+// forwards it downstream, so response-side model identity is observable
+// without logging any raw body, header, or identifier.
+func RecordResponseModel(ctx context.Context, model string) {
+	state := stateFrom(ctx)
+	if state == nil || state.recorder == nil || model == "" {
+		return
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	event := state.meta
+	event.Kind = ResponseModelObserved
+	event.ResponseModel = model
 	event.ExchangeIndex = state.lastSuccess
 	event.StatusCode = state.lastStatus
 	state.recorder(event)

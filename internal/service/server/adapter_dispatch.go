@@ -357,6 +357,9 @@ func (s *Server) handleWithAdapters(
 			writeOpenAIError(w, http.StatusBadGateway, payload)
 			return
 		}
+		if coreResp != nil {
+			egressobservation.RecordResponseModel(ctx, coreResp.Model)
+		}
 
 	case config.ProtocolOpenAIChat:
 		chatReq, ok := upstreamAny.(*chat.ChatRequest)
@@ -1613,12 +1616,21 @@ func (s *Server) handleAdapterStream(
 	var finalUsage openai.Usage
 	var finalResp *openai.Response
 	streamWriteOK := true
+	responseModelRecorded := false
 	for ev := range streamChan {
 		if ev.Event == "response.completed" {
 			if lf, ok := ev.Data.(openai.ResponseLifecycleEvent); ok {
 				finalUsage = lf.Response.Usage
 				lfResp := lf.Response
 				finalResp = &lfResp
+			}
+		}
+		// Record the reported model once, from the first lifecycle event that
+		// carries it (response.created normally, response.completed as fallback).
+		if !responseModelRecorded {
+			if lf, ok := ev.Data.(openai.ResponseLifecycleEvent); ok && lf.Response.Model != "" {
+				egressobservation.RecordResponseModel(ctx, lf.Response.Model)
+				responseModelRecorded = true
 			}
 		}
 		if err := writeSSE(w, ev); err != nil {

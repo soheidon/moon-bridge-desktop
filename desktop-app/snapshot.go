@@ -178,6 +178,7 @@ type TrafficGatewayEvent struct {
 	ConfiguredEffort string                     `json:"configuredEffort,omitempty"`
 	Protocol         string                     `json:"protocol,omitempty"`
 	Model            string                     `json:"model,omitempty"`
+	ResponseModel    string                     `json:"responseModel,omitempty"`
 	Thinking         string                     `json:"thinking,omitempty"`
 	EffectiveEffort  string                     `json:"effectiveEffort,omitempty"`
 	CredentialState  string                     `json:"credentialState,omitempty"`
@@ -643,7 +644,7 @@ func safeTrafficGatewayEvent(event *trafficanalysis.GatewayEventSummary) *Traffi
 		r := event.Resolver
 		resolver = &TrafficResolverDiagnostic{RequestedModel: r.RequestedModel, ServerInstance: r.ServerInstance, ResolverGeneration: r.ResolverGeneration, ResolverPresent: r.ResolverPresent, InstallSource: r.InstallSource, ConfigSource: r.ConfigSource, ExtensionState: r.ExtensionState, ActiveProfileState: r.ActiveProfileState, SlotCount: r.SlotCount, SolState: r.SolState, TerraState: r.TerraState, LunaState: r.LunaState, NormalResult: r.NormalResult, ResolvedSlot: r.ResolvedSlot, FallbackResult: r.FallbackResult, FinalStage: r.FinalStage, KnownAlias: r.KnownAlias}
 	}
-	return &TrafficGatewayEvent{RequestAlias: event.RequestAlias, RequestedModel: event.RequestedModel, RoutingSlot: event.RoutingSlot, ActiveProfile: event.ActiveProfile, Provider: event.Provider, UpstreamModel: event.UpstreamModel, Mode: event.Mode, ConfiguredEffort: event.ConfiguredEffort, Protocol: event.Protocol, Model: event.Model, Thinking: event.Thinking, EffectiveEffort: event.EffectiveEffort, CredentialState: event.CredentialState, Direction: string(event.Direction), StatusCode: event.StatusCode, ExchangeIndex: event.ExchangeIndex, Streaming: event.Streaming, Resolver: resolver}
+	return &TrafficGatewayEvent{RequestAlias: event.RequestAlias, RequestedModel: event.RequestedModel, RoutingSlot: event.RoutingSlot, ActiveProfile: event.ActiveProfile, Provider: event.Provider, UpstreamModel: event.UpstreamModel, Mode: event.Mode, ConfiguredEffort: event.ConfiguredEffort, Protocol: event.Protocol, Model: event.Model, ResponseModel: event.ResponseModel, Thinking: event.Thinking, EffectiveEffort: event.EffectiveEffort, CredentialState: event.CredentialState, Direction: string(event.Direction), StatusCode: event.StatusCode, ExchangeIndex: event.ExchangeIndex, Streaming: event.Streaming, Resolver: resolver}
 }
 
 // ---- error conversion ----

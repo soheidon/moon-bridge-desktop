@@ -394,6 +394,7 @@ func renderObservationLine(o TrafficObservation) string {
 		appendLogField(&b, "  configured_effort", e.ConfiguredEffort)
 		appendLogField(&b, "  protocol", e.Protocol)
 		appendLogField(&b, "  model", e.Model)
+		appendLogField(&b, "  response_model", e.ResponseModel)
 		appendLogField(&b, "  thinking", e.Thinking)
 		appendLogField(&b, "  effective_effort", e.EffectiveEffort)
 		if e.Resolver != nil {

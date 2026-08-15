@@ -84,6 +84,11 @@ export function TrafficAnalysisCard({ traffic }: { traffic: TrafficState }) {
             {traffic.status?.reconciliationStatus === "config_unreadable" && (
               <p className="error-text">Codex設定を読み込めないため、自動復元は行っていません。</p>
             )}
+            {/* A restore failure (recovery_* code) must be visible here; a Start
+                rejection (traffic_transaction_*) is already explained by this panel
+                and must not be repeated as a generic red line. */}
+            {traffic.error?.code.startsWith("recovery_") && <p className="error-text">{traffic.error.message}（{traffic.error.code}）</p>}
+            {traffic.progress && <p className="traffic-progress">{traffic.progress.message}</p>}
           </div>
         ) : (
           <>
@@ -130,6 +135,7 @@ function RequestSummaryList({ summaries }: { summaries: TrafficRequestSummary[] 
               <span>slot: {summary.resolvedSlot}</span>
               <span>provider: {summary.provider}</span>
               <span>upstream: {summary.upstreamModel}</span>
+              <span>response model: {summary.responseModel}</span>
               <span>mode: {summary.mode}</span>
               <span>thinking: {summary.thinking}</span>
               <span>credential: {summary.credentialState}</span>
@@ -184,6 +190,7 @@ function ObservationList({ traffic, observations }: { traffic: TrafficState; obs
             {item.gatewayEvent.activeProfile && <span>profile: {item.gatewayEvent.activeProfile}</span>}
             {item.gatewayEvent.provider && <span>provider: {item.gatewayEvent.provider}</span>}
             {item.gatewayEvent.upstreamModel && <span>upstream: {item.gatewayEvent.upstreamModel}</span>}
+            {item.gatewayEvent.responseModel && <span>response model: {item.gatewayEvent.responseModel}</span>}
             {item.gatewayEvent.mode && <span>mode: {item.gatewayEvent.mode}</span>}
             {item.gatewayEvent.configuredEffort && <span>configured: {item.gatewayEvent.configuredEffort}</span>}
             {item.gatewayEvent.protocol && <span>protocol: {item.gatewayEvent.protocol}</span>}

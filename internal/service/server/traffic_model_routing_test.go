@@ -370,17 +370,17 @@ func TestRoutingObservationEmitsCorrelatedSafeEvents(t *testing.T) {
 	if calls != len(models) {
 		t.Fatalf("provider calls=%d, want %d", calls, len(models))
 	}
-	if len(sink.events) != len(models)*6 {
-		t.Fatalf("events=%d, want %d events: %#v", len(sink.events), len(models)*6, sink.events)
+	if len(sink.events) != len(models)*7 {
+		t.Fatalf("events=%d, want %d events: %#v", len(sink.events), len(models)*7, sink.events)
 	}
 	if len(mapping.source) != 0 {
 		t.Fatalf("traffic fallback was consulted before exact routing slot: %#v", mapping.source)
 	}
 	seenCorrelations := map[string]bool{}
 	for i, model := range models {
-		group := sink.events[i*6 : (i+1)*6]
-		if group[0].Kind != trafficanalysis.ObservationRoutingResolutionDiagnosed || group[1].Kind != trafficanalysis.ObservationRoutingResolved || group[2].Kind != trafficanalysis.ObservationProviderRequestPrepared || group[3].Kind != trafficanalysis.ObservationProviderRequestDispatched || group[4].Kind != trafficanalysis.ObservationProviderResponseReceived || group[5].Kind != trafficanalysis.ObservationProviderResponseForwarded {
-			t.Fatalf("model=%s events=%#v, want routing/prepared/dispatch/received/forwarded sequence", model.requested, group)
+		group := sink.events[i*7 : (i+1)*7]
+		if group[0].Kind != trafficanalysis.ObservationRoutingResolutionDiagnosed || group[1].Kind != trafficanalysis.ObservationRoutingResolved || group[2].Kind != trafficanalysis.ObservationProviderRequestPrepared || group[3].Kind != trafficanalysis.ObservationProviderRequestDispatched || group[4].Kind != trafficanalysis.ObservationProviderResponseReceived || group[5].Kind != trafficanalysis.ObservationProviderResponseModel || group[6].Kind != trafficanalysis.ObservationProviderResponseForwarded {
+			t.Fatalf("model=%s events=%#v, want routing/prepared/dispatch/received/response_model/forwarded sequence", model.requested, group)
 		}
 		if group[0].Resolver == nil || group[0].Resolver.RequestedModel != model.requested {
 			t.Fatalf("model=%s diagnostic=%#v", model.requested, group[0].Resolver)
@@ -395,8 +395,11 @@ func TestRoutingObservationEmitsCorrelatedSafeEvents(t *testing.T) {
 				t.Fatalf("model=%s metadata drifted: %#v", model.requested, group)
 			}
 		}
-		if group[3].ExchangeIndex != 1 || group[4].ExchangeIndex != 1 || group[5].ExchangeIndex != 1 {
+		if group[3].ExchangeIndex != 1 || group[4].ExchangeIndex != 1 || group[5].ExchangeIndex != 1 || group[6].ExchangeIndex != 1 {
 			t.Fatalf("model=%s egress exchange index mismatch: %#v", model.requested, group)
+		}
+		if group[5].ResponseModel != "deepseek-v4-flash" {
+			t.Fatalf("model=%s response model = %q, want deepseek-v4-flash: %#v", model.requested, group[5].ResponseModel, group)
 		}
 	}
 }

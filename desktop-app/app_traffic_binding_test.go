@@ -150,6 +150,24 @@ func TestDesktopObservationsStripsSecrets(t *testing.T) {
 			UserAgentProduct:     "SENTINEL_AGENT",
 			AuthorizationPresent: true,
 		},
+	}, {
+		Sequence:        2,
+		Timestamp:       time.Date(2026, 8, 3, 0, 0, 1, 0, time.UTC),
+		Direction:       trafficanalysis.DirectionUpstreamToClient,
+		Transport:       trafficanalysis.TransportHTTP,
+		StatusCode:      200,
+		PayloadKind:     trafficanalysis.PayloadEmpty,
+		DecodingStatus:  trafficanalysis.DecodingIdentity,
+		Disposition:     trafficanalysis.DispositionRecorded,
+		GatewayEvent: &trafficanalysis.GatewayEventSummary{
+			RequestAlias:  "req#1",
+			Provider:      "deepseek",
+			UpstreamModel: "deepseek-v4-flash",
+			ResponseModel: "deepseek-v4-flash",
+			Direction:     trafficanalysis.DirectionUpstreamToClient,
+			StatusCode:    200,
+			ExchangeIndex: 1,
+		},
 	}}
 	encoded, err := json.Marshal(desktopObservations(obs))
 	if err != nil {
@@ -160,6 +178,7 @@ func TestDesktopObservationsStripsSecrets(t *testing.T) {
 		`"payloadKind":"json"`, `"contentEncoding":"zstd"`, `"rawPayloadSize":120`, `"decodedObservationSize":110`,
 		`"decodingStatus":"decoded"`, `"payloadShape"`, `"identifiers"`, `"responseIdAliases"`, `"truncated":true`, `"disposition":"recorded"`,
 		`"inputTokens":500`, `"outputTokens":100`,
+		`"responseModel":"deepseek-v4-flash"`, `"upstreamModel":"deepseek-v4-flash"`,
 	} {
 		if !strings.Contains(string(encoded), want) {
 			t.Fatalf("DTO missing safe field %s: %s", want, encoded)

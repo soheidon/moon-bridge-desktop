@@ -43,6 +43,9 @@ func (s *Server) recordProviderEgress(event egressobservation.Event) {
 	case egressobservation.ResponseReceived:
 		kind = trafficanalysis.ObservationProviderResponseReceived
 		direction = trafficanalysis.DirectionUpstreamToClient
+	case egressobservation.ResponseModelObserved:
+		kind = trafficanalysis.ObservationProviderResponseModel
+		direction = trafficanalysis.DirectionUpstreamToClient
 	case egressobservation.ResponseForwarded:
 		kind = trafficanalysis.ObservationProviderResponseForwarded
 		direction = trafficanalysis.DirectionUpstreamToClient
@@ -52,7 +55,7 @@ func (s *Server) recordProviderEgress(event egressobservation.Event) {
 		RequestedModel: event.RequestedModel, RoutingSlot: event.RoutingSlot, Mode: event.Mode,
 		Provider: event.Provider, UpstreamModel: event.UpstreamModel, ConfiguredEffort: event.ConfiguredEffort,
 		CredentialState: event.CredentialState,
-		Protocol:        event.Protocol, Model: event.Model, Thinking: event.Thinking, EffectiveEffort: event.EffectiveEffort,
+		Protocol:        event.Protocol, Model: event.Model, ResponseModel: event.ResponseModel, Thinking: event.Thinking, EffectiveEffort: event.EffectiveEffort,
 		Direction:  direction,
 		StatusCode: event.StatusCode, ExchangeIndex: event.ExchangeIndex, Streaming: event.Streaming,
 	})

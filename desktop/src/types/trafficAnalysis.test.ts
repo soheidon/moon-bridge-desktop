@@ -41,10 +41,12 @@ describe("summarizeTrafficRequests", () => {
       observation(6, "routing_resolution_diagnosed", { requestAlias: "req#14", resolver: { ...resolver, requestedModel: "unknown", finalStage: "not_found", resolvedSlot: "unknown" } }),
       observation(7, "provider_request_prepared", { requestAlias: "req#12", provider: "deepseek", upstreamModel: "deepseek-v4-pro", credentialState: "available" }),
       observation(8, "provider_response_forwarded", { requestAlias: "req#12", provider: "deepseek", upstreamModel: "deepseek-v4-pro", credentialState: "available", statusCode: 200 }),
+      observation(9, "provider_response_model", { requestAlias: "req#12", provider: "deepseek", responseModel: "deepseek-v4-pro" }),
+      observation(10, "provider_response_model", { requestAlias: "req#13", provider: "deepseek", responseModel: "untrusted-model" }),
     ]);
     expect(summaries).toHaveLength(3);
-    expect(summaries.find((item) => item.requestAlias === "req#12")).toMatchObject({ route: "exact_slot", transportOutcome: "forwarded", attemptCount: 2, multiAttempt: true, upstreamModel: "deepseek-v4-pro" });
-    expect(summaries.find((item) => item.requestAlias === "req#13")).toMatchObject({ route: "fallback", provider: "deepseek", upstreamModel: "deepseek-v4-pro", credentialState: "missing" });
+    expect(summaries.find((item) => item.requestAlias === "req#12")).toMatchObject({ route: "exact_slot", transportOutcome: "forwarded", attemptCount: 2, multiAttempt: true, upstreamModel: "deepseek-v4-pro", responseModel: "deepseek-v4-pro" });
+    expect(summaries.find((item) => item.requestAlias === "req#13")).toMatchObject({ route: "fallback", provider: "deepseek", upstreamModel: "deepseek-v4-pro", credentialState: "missing", responseModel: "unknown" });
     expect(summaries.find((item) => item.requestAlias === "req#14")).toMatchObject({ route: "not_found", transportOutcome: "not_dispatched" });
   });
 });

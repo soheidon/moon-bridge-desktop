@@ -381,6 +381,7 @@ extensions:
 			trafficanalysis.ObservationProviderRequestPrepared,
 			trafficanalysis.ObservationProviderRequestDispatched,
 			trafficanalysis.ObservationProviderResponseReceived,
+			trafficanalysis.ObservationProviderResponseModel,
 			trafficanalysis.ObservationProviderResponseForwarded,
 		}
 		if len(events) != len(wantKinds) {
@@ -439,7 +440,7 @@ extensions:
 		t.Fatal(err)
 	}
 	logText := string(logData)
-	for _, required := range []string{"request_alias: req#1", "requested_model: gpt-5.6-luna", "routing_slot: luna", "thinking: disabled", "status_code: 200"} {
+	for _, required := range []string{"request_alias: req#1", "requested_model: gpt-5.6-luna", "routing_slot: luna", "thinking: disabled", "status_code: 200", "response_model: deepseek-v4-flash"} {
 		if !strings.Contains(logText, required) {
 			t.Fatalf("autosave missing safe field %q", required)
 		}

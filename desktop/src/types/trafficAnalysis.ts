@@ -152,6 +152,7 @@ export interface TrafficObservation {
     configuredEffort?: string;
     protocol?: string;
     model?: string;
+    responseModel?: string;
     thinking?: string;
     effectiveEffort?: string;
     credentialState?: RuntimeCredentialState;
@@ -198,6 +199,7 @@ export interface TrafficRequestSummary {
   resolvedSlot: "sol" | "terra" | "luna" | "unknown";
   provider: string;
   upstreamModel: string;
+  responseModel: string;
   mode: string;
   configuredEffort: string;
   thinking: string;
@@ -287,6 +289,7 @@ export function summarizeTrafficRequests(observations: TrafficObservation[]): Tr
     let generation = 0;
     let provider = "unknown";
     let upstreamModel = "unknown";
+    let responseModel = "unknown";
     let mode = "unknown";
     let configuredEffort = "none";
     let thinking = "unknown";
@@ -310,6 +313,7 @@ export function summarizeTrafficRequests(observations: TrafficObservation[]): Tr
       if (event.routingSlot === "sol" || event.routingSlot === "terra" || event.routingSlot === "luna") resolvedSlot = event.routingSlot;
       if (event.provider) provider = safeSummaryProvider(event.provider);
       if (event.upstreamModel) upstreamModel = safeSummaryModel(event.upstreamModel);
+      if (event.responseModel) responseModel = safeSummaryModel(event.responseModel);
       if (event.mode) mode = event.mode;
       if (event.configuredEffort) configuredEffort = event.configuredEffort;
       if (event.thinking) thinking = event.thinking;
@@ -339,7 +343,7 @@ export function summarizeTrafficRequests(observations: TrafficObservation[]): Tr
     if (route === "unknown" && resolver?.finalStage === "not_found") route = "not_found";
     summaries.push({
       requestAlias, requestedModel: requested, serverInstance, resolverGeneration: generation,
-      resolverState: summaryState(resolver), route, resolvedSlot, provider, upstreamModel, mode,
+      resolverState: summaryState(resolver), route, resolvedSlot, provider, upstreamModel, responseModel, mode,
       configuredEffort, thinking, effectiveEffort, credentialState, attemptCount,
       transportOutcome: outcome, statusClass: finalStatus, multiAttempt: attemptCount > 1,
     });

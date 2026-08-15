@@ -258,6 +258,29 @@ describe("TrafficAnalysisCard layout", () => {
     expect(markup).toContain("class=\"error-text\"");
     expect(markup).toContain("recovery confirmation is required（traffic_transaction_recovery_required）");
   });
+
+  it("shows a recovery_* restore failure inside the recovery card (G1 companion)", () => {
+    const restoreError: TrafficCommandError = {
+      operation: "RestoreRecovery",
+      operationId: "",
+      stage: "recovery",
+      code: "recovery_required",
+      message: "Recovery state cannot be changed safely",
+      retryable: false,
+      configChanged: false,
+      captureRunning: false,
+      restartCodexRequired: false,
+    };
+    const markup = renderToStaticMarkup(
+      <TrafficAnalysisCard traffic={trafficState(0, true, false, "config_conflict", {}, restoreError) as never} />,
+    );
+
+    expect(markup).toContain("Codex設定に競合があります");
+    expect(markup).toContain(">競合を確認して復元</button>");
+    // A restore failure (recovery_* code) must be visible so a stuck conflict is
+    // diagnosable instead of looking like "nothing happens".
+    expect(markup).toContain("Recovery state cannot be changed safely（recovery_required）");
+  });
 });
 
 describe("TrafficAnalysisCard status cards", () => {

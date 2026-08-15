@@ -70,6 +70,7 @@ const (
 	ObservationProviderRequestPrepared    ObservationKind = "provider_request_prepared"
 	ObservationProviderRequestDispatched  ObservationKind = "provider_request_dispatched"
 	ObservationProviderResponseReceived   ObservationKind = "provider_response_received"
+	ObservationProviderResponseModel     ObservationKind = "provider_response_model"
 	ObservationProviderResponseForwarded  ObservationKind = "provider_response_forwarded"
 )
 
@@ -137,6 +138,7 @@ type GatewayEventInput struct {
 	ConfiguredEffort string                   `json:"configuredEffort,omitempty"`
 	Protocol         string                   `json:"protocol,omitempty"`
 	Model            string                   `json:"model,omitempty"`
+	ResponseModel    string                   `json:"responseModel,omitempty"`
 	Thinking         string                   `json:"thinking,omitempty"`
 	EffectiveEffort  string                   `json:"effectiveEffort,omitempty"`
 	CredentialState  string                   `json:"credentialState,omitempty"`
@@ -218,6 +220,7 @@ type GatewayEventSummary struct {
 	ConfiguredEffort string                     `json:"configuredEffort,omitempty"`
 	Protocol         string                     `json:"protocol,omitempty"`
 	Model            string                     `json:"model,omitempty"`
+	ResponseModel    string                     `json:"responseModel,omitempty"`
 	Thinking         string                     `json:"thinking,omitempty"`
 	EffectiveEffort  string                     `json:"effectiveEffort,omitempty"`
 	CredentialState  string                     `json:"credentialState,omitempty"`
@@ -417,7 +420,7 @@ func (a *Analyzer) RecordGatewayEvent(input GatewayEventInput) Observation {
 		requestedModel = ""
 	}
 	obs := Observation{Kind: kind, SessionID: a.session, Timestamp: time.Now().UTC(), Direction: direction, Transport: TransportHTTP, StatusCode: input.StatusCode, PayloadKind: PayloadEmpty, DecodingStatus: DecodingIdentity, Disposition: DispositionRecorded, RequestID: requestAlias, GatewayEvent: &GatewayEventSummary{
-		RequestAlias: requestAlias, RequestedModel: requestedModel, RoutingSlot: safeEnum(input.RoutingSlot, "sol", "terra", "luna"), ActiveProfile: profileAlias, Provider: safeIdentifier(input.Provider), UpstreamModel: safeIdentifier(input.UpstreamModel), Mode: safeEnum(input.Mode, "normal", "thinking"), ConfiguredEffort: safeEnumDefault(input.ConfiguredEffort, "none", "high", "max"), Protocol: safeEnum(input.Protocol, "anthropic", "openai-chat", "google-genai", "openai-response"), Model: safeIdentifier(input.Model), Thinking: safeEnumDefault(input.Thinking, "none", "enabled", "disabled", "not_applicable"), EffectiveEffort: safeEnumDefault(input.EffectiveEffort, "none", "high", "max"), CredentialState: safeCredentialState(input.CredentialState), Resolver: resolver,
+		RequestAlias: requestAlias, RequestedModel: requestedModel, RoutingSlot: safeEnum(input.RoutingSlot, "sol", "terra", "luna"), ActiveProfile: profileAlias, Provider: safeIdentifier(input.Provider), UpstreamModel: safeIdentifier(input.UpstreamModel), Mode: safeEnum(input.Mode, "normal", "thinking"), ConfiguredEffort: safeEnumDefault(input.ConfiguredEffort, "none", "high", "max"), Protocol: safeEnum(input.Protocol, "anthropic", "openai-chat", "google-genai", "openai-response"), Model: safeIdentifier(input.Model), ResponseModel: safeIdentifier(input.ResponseModel), Thinking: safeEnumDefault(input.Thinking, "none", "enabled", "disabled", "not_applicable"), EffectiveEffort: safeEnumDefault(input.EffectiveEffort, "none", "high", "max"), CredentialState: safeCredentialState(input.CredentialState), Resolver: resolver,
 		Direction: direction, StatusCode: input.StatusCode, ExchangeIndex: input.ExchangeIndex, Streaming: input.Streaming,
 	}}
 	return a.buffer.Append(obs)
@@ -437,7 +440,7 @@ func (a *Analyzer) aliasGatewayKey(m map[string]string, raw, prefix string, next
 }
 
 func sanitizeObservationKind(kind ObservationKind) ObservationKind {
-	if kind == ObservationRoutingResolved || kind == ObservationRoutingResolutionDiagnosed || kind == ObservationProviderRequestPrepared || kind == ObservationProviderRequestDispatched || kind == ObservationProviderResponseReceived || kind == ObservationProviderResponseForwarded {
+	if kind == ObservationRoutingResolved || kind == ObservationRoutingResolutionDiagnosed || kind == ObservationProviderRequestPrepared || kind == ObservationProviderRequestDispatched || kind == ObservationProviderResponseReceived || kind == ObservationProviderResponseModel || kind == ObservationProviderResponseForwarded {
 		return kind
 	}
 	return ""
