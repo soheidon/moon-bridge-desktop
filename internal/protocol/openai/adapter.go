@@ -430,6 +430,15 @@ func (a *OpenAIAdapter) streamLoopWithBuf(ctx context.Context, coreReq *format.C
 			continue
 		}
 
+		// Propagate the provider-reported model into the response so downstream
+		// observers (and the emitted response.* lifecycle events) carry it. The
+		// non-streaming path does this in FromCoreResponse; the streaming path
+		// must do it here because event.Model is the response-side model, not
+		// coreReq.Model (the request-side model).
+		if event.Model != "" {
+			response.Model = event.Model
+		}
+
 		switch event.Type {
 		// ==================================================================
 		// Lifecycle: created

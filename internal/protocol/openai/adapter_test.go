@@ -439,6 +439,42 @@ func TestFromCoreStream_NoDuplicateDoneForToolUse(t *testing.T) {
 	}
 }
 
+// TestFromCoreStream_PropagatesResponseModel pins the streaming conversion of the
+// provider-reported model. The response-side model (event.Model) must reach the
+// response.created lifecycle event even though it differs from the request-side
+// model (coreReq.Model).
+func TestFromCoreStream_PropagatesResponseModel(t *testing.T) {
+	adapter := openai.NewOpenAIAdapter(format.CorePluginHooks{})
+	coreReq := &format.CoreRequest{Model: "gpt-5.6-luna"}
+	evCh := make(chan format.CoreStreamEvent, 8)
+	evCh <- format.CoreStreamEvent{Type: format.CoreEventCreated, Status: "in_progress", Model: "deepseek-v4-flash"}
+	evCh <- format.CoreStreamEvent{Type: format.CoreEventCompleted, Status: "completed", Model: "deepseek-v4-flash"}
+	close(evCh)
+
+	streamAny, err := adapter.FromCoreStream(context.Background(), coreReq, evCh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stream <-chan openai.StreamEvent
+	if oaiResult, ok := streamAny.(*openai.OpenAIStreamResult); ok {
+		stream = oaiResult.Chan()
+	} else {
+		stream = streamAny.(<-chan openai.StreamEvent)
+	}
+	var createdModel string
+	for ev := range stream {
+		if ev.Event != "response.created" {
+			continue
+		}
+		if lf, ok := ev.Data.(openai.ResponseLifecycleEvent); ok {
+			createdModel = lf.Response.Model
+		}
+	}
+	if createdModel != "deepseek-v4-flash" {
+		t.Fatalf("response.created model = %q, want deepseek-v4-flash", createdModel)
+	}
+}
+
 // TestToCoreRequest_AccumulatedInputStatelessConversion pins the accumulated-input
 // conversation continuation model observed in HIST-01 (Codex Desktop 5→7→9→11→13).
 //
