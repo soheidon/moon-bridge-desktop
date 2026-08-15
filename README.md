@@ -9,7 +9,7 @@ Moon Bridge Desktop does not increase ChatGPT usage limits or convert subscripti
 External models may not behave identically to OpenAI models. The goal is to combine strong planning and review with a practical, separately billed implementation path.
 
 > [!IMPORTANT]
-> Moon Bridge Desktop v0.2.0 is a Technical Preview. The current production-supported provider scope is DeepSeek.
+> Moon Bridge Desktop v0.3.0 is a Technical Preview. The current production-supported provider scope is DeepSeek.
 
 ## Why Moon Bridge Desktop?
 
@@ -49,7 +49,7 @@ Both projects are completely independent and can be used separately.
 
 ## Current Technical Preview
 
-Version 0.2.0 implements the DeepSeek V4 routing path. It provides:
+Version 0.3.0 implements the DeepSeek V4 routing path. It provides:
 
 * A local Windows gateway for Codex in the ChatGPT desktop app
 * Three named routing slots: Sol, Terra, and Luna
@@ -57,8 +57,9 @@ Version 0.2.0 implements the DeepSeek V4 routing path. It provides:
 * Request-level routing provenance
 * Traffic Analysis and request correlation
 * Safe autosave of routing observations
+* Provider-reported response model captured from streaming responses and shown in request summaries
 
-In v0.2.0, switching is still startup-based. When the Gateway is stopped, Codex uses its normal OpenAI-backed subscription path. When the Gateway is enabled and the ChatGPT desktop app is restarted, matching Codex traffic is routed through Moon Bridge according to the active routing configuration. Restart the ChatGPT desktop app after changing the Gateway state.
+In v0.3.0, switching is still startup-based. When the Gateway is stopped, Codex uses its normal OpenAI-backed subscription path. When the Gateway is enabled and the ChatGPT desktop app is restarted, matching Codex traffic is routed through Moon Bridge according to the active routing configuration. Restart the ChatGPT desktop app after changing the Gateway state.
 
 Seamless switching for each task or work plan is a product goal for a future version.
 
@@ -74,6 +75,7 @@ Seamless switching for each task or work plan is a product goal for a future ver
 * When a DeepSeek profile is configured with reasoning disabled, the request is explicitly prepared without DeepSeek thinking and remains disabled during processing
 * Request correlation using safe local aliases
 * Traffic Analysis for resolved routing, prepared provider requests, safe lifecycle observations, and route restoration state
+* Provider-reported response model observed from streaming responses and surfaced in request summaries
 * Optional autosave of safe routing observations
 * Protection against recording API keys, authorization headers, prompts, or raw request bodies
 * Multilingual Windows installer:
@@ -95,10 +97,10 @@ If WebView2 Runtime is not already installed, the installer may require an inter
 
 1. Download the latest Windows installer from [GitHub Releases](https://github.com/soheidon/moon-bridge-desktop/releases).
 2. Optionally verify the installer using the included `SHA256SUMS.txt`.
-3. Run `Moon-Bridge-Desktop-v0.2.0-Windows-x64-Setup.exe`.
+3. Run `Moon-Bridge-Desktop-v0.3.0-Windows-x64-Setup.exe`.
 4. Select the installer language and complete the installation.
 
-The v0.2.0 installer is not digitally signed. Windows may display an **Unknown publisher** or Microsoft Defender SmartScreen warning.
+The v0.3.0 installer is not digitally signed. Windows may display an **Unknown publisher** or Microsoft Defender SmartScreen warning.
 
 The production executable and its application-level routing start/stop smoke were completed for the Plan 7 release work. This did not include installer install/uninstall smoke testing, which remains outstanding.
 
@@ -112,7 +114,7 @@ The production executable and its application-level routing start/stop smoke wer
 6. Start or restart the ChatGPT desktop app after the Gateway is running.
 7. Use Traffic Analysis when you need to inspect routing decisions and request correlation.
 
-In v0.2.0, gateway selection should be treated as startup-time configuration. When the Gateway is stopped, Codex uses its normal OpenAI-backed subscription path. When the Gateway is running and the ChatGPT desktop app has been restarted, matching Codex traffic uses the active Moon Bridge routing profile. Restart the ChatGPT desktop app after starting or stopping the Gateway.
+In v0.3.0, gateway selection should be treated as startup-time configuration. When the Gateway is stopped, Codex uses its normal OpenAI-backed subscription path. When the Gateway is running and the ChatGPT desktop app has been restarted, matching Codex traffic uses the active Moon Bridge routing profile. Restart the ChatGPT desktop app after starting or stopping the Gateway.
 
 ## Routing Slots
 
@@ -132,7 +134,7 @@ The active profile determines the actual provider, model, and reasoning behavior
 
 When a DeepSeek profile is configured with reasoning disabled, Moon Bridge explicitly prepares the request without DeepSeek thinking and preserves that setting during request processing.
 
-The v0.2.0 implementation uses the configured routing profile and slot assignments; it does not impose fixed Sol, Terra, or Luna reasoning tiers.
+The v0.3.0 implementation uses the configured routing profile and slot assignments; it does not impose fixed Sol, Terra, or Luna reasoning tiers.
 
 ## Traffic Analysis
 
@@ -144,12 +146,13 @@ Traffic Analysis records safe routing observations such as:
 * Request aliases used for correlation
 * Safe gateway lifecycle information
 * Route restoration and analysis lifecycle state
+* Provider-reported response model captured from streaming responses
 
 API keys, authorization headers, prompts, raw request bodies, and correlation headers are not intended to be written to autosave logs.
 
 ## Supported External Provider
 
-Version 0.2.0 supports DeepSeek V4 as its external model API.
+Version 0.3.0 supports DeepSeek V4 as its external model API.
 
 ## Technical Preview Limitations
 
@@ -159,7 +162,7 @@ Version 0.2.0 supports DeepSeek V4 as its external model API.
 
 ## Verification
 
-The v0.2.0 release includes:
+The v0.3.0 release includes:
 
 * Go tests, build, and vet
 * Desktop web tests and production build
@@ -189,7 +192,7 @@ The next development phase will focus on:
 
 The current release is:
 
-[Moon Bridge Desktop v0.2.0 — Technical Preview](https://github.com/soheidon/moon-bridge-desktop/releases/tag/v0.2.0)
+[Moon Bridge Desktop v0.3.0 — Technical Preview](https://github.com/soheidon/moon-bridge-desktop/releases/tag/v0.3.0)
 
 ## License
 
