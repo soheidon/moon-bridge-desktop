@@ -147,6 +147,30 @@ func NewCaptureProxy(config CaptureConfig) *CaptureProxy {
 	return p
 }
 
+// captureStartFailure classifies a proxy.Start failure with a fixed, secret-free
+// stage so the transaction binding can log the exact sub-branch. Error() returns
+// only the stage; Unwrap preserves the underlying cause (which may contain an
+// address and must never be logged).
+type captureStartFailure struct {
+	stage string
+	err   error
+}
+
+func (e *captureStartFailure) Error() string { return e.stage }
+func (e *captureStartFailure) Unwrap() error { return e.err }
+
+func startFailure(stage string, err error) error {
+	return &captureStartFailure{stage: stage, err: err}
+}
+
+func captureStartStage(err error) string {
+	var f *captureStartFailure
+	if errors.As(err, &f) {
+		return f.stage
+	}
+	return ""
+}
+
 func (p *CaptureProxy) Start() error {
 	p.mu.Lock()
 	if p.state == "capturing" || p.state == "ready" {
@@ -155,18 +179,18 @@ func (p *CaptureProxy) Start() error {
 	}
 	if p.state == "passthrough" {
 		p.mu.Unlock()
-		return errors.New("capture relay is still active")
+		return startFailure("relay_active", errors.New("capture relay is still active"))
 	}
 	if !isLoopbackCaptureAddress(p.config.ListenAddr) {
 		p.mu.Unlock()
-		return errors.New("capture listener must use a loopback address")
+		return startFailure("loopback", errors.New("capture listener must use a loopback address"))
 	}
 	listener, err := net.Listen("tcp", p.config.ListenAddr)
 	if err != nil {
 		p.state = "failed"
 		p.lastError = safeNetworkError(err)
 		p.mu.Unlock()
-		return fmt.Errorf("start capture listener: %w", err)
+		return startFailure("bind", fmt.Errorf("start capture listener: %w", err))
 	}
 	analyzer, err := NewAnalyzer(p.config.RingCapacity)
 	if err != nil {
@@ -174,7 +198,7 @@ func (p *CaptureProxy) Start() error {
 		p.state = "failed"
 		p.lastError = "analyzer_initialization_failed"
 		p.mu.Unlock()
-		return err
+		return startFailure("analyzer", err)
 	}
 	p.listener = listener
 	p.analyzer = analyzer

@@ -270,6 +270,9 @@ func (f *fakeRecovery) Current(context.Context) (Checkpoint, error) {
 type fakeTraffic struct {
 	mu                sync.Mutex
 	state             trafficanalysis.State
+	bindCalls         int
+	lastBindID        string
+	lastBindAddr      string
 	startCalls        int
 	claimCalls        int
 	releaseCalls      int
@@ -360,6 +363,17 @@ func (f *fakeTraffic) ValidateIdleExpected(expectedGeneration uint64) (traffican
 	if f.state.Mode != trafficanalysis.ModeIdle || f.state.CaptureState != "stopped" || f.state.Generation <= expectedGeneration || f.state.ListeningAddress != "" || f.state.GatewayInstanceID != "" || f.state.GatewayAddress != "" {
 		return f.state, errors.New("capture is not idle")
 	}
+	return f.state, nil
+}
+
+func (f *fakeTraffic) BindGatewayRun(id, addr string) (trafficanalysis.State, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.bindCalls++
+	f.lastBindID = id
+	f.lastBindAddr = addr
+	f.state.GatewayInstanceID = id
+	f.state.GatewayAddress = addr
 	return f.state, nil
 }
 
@@ -599,6 +613,19 @@ func TestEnableStartsClaimsCommitsAndCheckpoints(t *testing.T) {
 	}
 	if backup.created != 1 || backup.removed != 1 || len(recovery.checkpoints) != 3 || recovery.checkpoints[0].Phase != PhasePrepared || recovery.checkpoints[2].IntegrationActive != true {
 		t.Fatalf("backup/checkpoints = %d/%#v", backup.created, recovery.checkpoints)
+	}
+}
+
+func TestEnableRebindsGatewayBeforeStartCapture(t *testing.T) {
+	service, traffic, _, _, _, gw := newFixtureWithGateway()
+	if _, err := service.Enable(context.Background()); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	if traffic.bindCalls != 1 || traffic.startCalls != 1 {
+		t.Fatalf("bind/start calls = %d/%d, want 1/1", traffic.bindCalls, traffic.startCalls)
+	}
+	if traffic.lastBindID != gw.snapshot.InstanceID || traffic.lastBindAddr != gw.snapshot.Address {
+		t.Fatalf("bound identity = %q/%q, want %q/%q", traffic.lastBindID, traffic.lastBindAddr, gw.snapshot.InstanceID, gw.snapshot.Address)
 	}
 }
 

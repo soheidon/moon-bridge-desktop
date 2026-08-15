@@ -39,6 +39,10 @@ type Error struct {
 	Message              string    `json:"message"`
 	Retryable            bool      `json:"retryable"`
 	ConfirmationRequired bool      `json:"confirmationRequired,omitempty"`
+	// Stage is a fixed, secret-free classification of the failure sub-branch
+	// (a lower-level trafficanalysis.ErrorKind, or a proxy.Start stage such as
+	// "bind"/"analyzer"). It is used only for logging and never reaches the wire.
+	Stage string `json:"-"`
 }
 
 func (e *Error) Error() string { return e.Message }

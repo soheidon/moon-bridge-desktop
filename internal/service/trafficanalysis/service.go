@@ -55,12 +55,20 @@ const (
 type Error struct {
 	Kind    ErrorKind `json:"kind"`
 	Message string    `json:"message"`
+	// Stage is a fixed, secret-free classification of a failure sub-branch
+	// (e.g. "bind", "analyzer", "loopback", "relay_active") used only for
+	// logging; it never reaches the wire.
+	Stage string `json:"-"`
 }
 
 func (e *Error) Error() string { return e.Message }
 
 func newError(kind ErrorKind, message string) error {
 	return &Error{Kind: kind, Message: message}
+}
+
+func newErrorStage(kind ErrorKind, message, stage string) error {
+	return &Error{Kind: kind, Message: message, Stage: stage}
 }
 
 // State is a thread-safe external snapshot of the Service. It never carries
@@ -401,7 +409,7 @@ func (s *Service) StartCapture(opts StartOptions) (State, error) {
 			st := s.snapshotLocked()
 			s.mu.Unlock()
 			_ = proxy.Close()
-			return st, newError(KindCaptureStartFailed, "capture start failed")
+			return st, newErrorStage(KindCaptureStartFailed, "capture start failed", captureStartStage(startErr))
 		}
 		s.proxy = proxy
 		s.generation++

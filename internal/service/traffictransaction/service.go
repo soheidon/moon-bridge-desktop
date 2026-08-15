@@ -218,12 +218,19 @@ func (s *Service) Enable(ctx context.Context) (Snapshot, error) {
 		if !strings.HasPrefix(upstream, "http://") && !strings.HasPrefix(upstream, "https://") {
 			upstream = "http://" + upstream
 		}
+		if _, err := s.deps.Traffic.BindGatewayRun(gw.InstanceID, gw.Address); err != nil {
+			primary := safeError(KindCaptureStartFailed, "capture start failed", true)
+			primary.Stage = captureStartFailureStage(err)
+			return s.backout(ctx, txID, prepared, backup, gw, traffic, state, CauseCaptureStart, primary)
+		}
 		traffic, err = s.deps.Traffic.StartCapture(trafficanalysis.StartOptions{
 			UpstreamBase: upstream,
 			ListenAddr:   CaptureListenAddress,
 		})
 		if err != nil {
-			return s.backout(ctx, txID, prepared, backup, gw, traffic, state, CauseCaptureStart, safeError(KindCaptureStartFailed, "capture start failed", true))
+			primary := safeError(KindCaptureStartFailed, "capture start failed", true)
+			primary.Stage = captureStartFailureStage(err)
+			return s.backout(ctx, txID, prepared, backup, gw, traffic, state, CauseCaptureStart, primary)
 		}
 		state.StartedCapture = true
 		state.Phase = PhaseCaptureStarted
@@ -717,6 +724,21 @@ func (s *Service) verifyGateway(ctx context.Context, expected GatewaySnapshot) e
 
 func (s *Service) bestEffortRemove(ctx context.Context, backup BackupRef) {
 	_ = s.deps.Backup.Remove(ctx, backup)
+}
+
+// captureStartFailureStage returns a fixed, secret-free classification of a
+// trafficanalysis.StartCapture failure. For a proxy.Start failure it returns the
+// concrete stage (bind/analyzer/loopback/relay_active); for any other rejection
+// it returns the lower-level ErrorKind. It never surfaces error text.
+func captureStartFailureStage(err error) string {
+	var te *trafficanalysis.Error
+	if errors.As(err, &te) {
+		if te.Stage != "" {
+			return te.Stage
+		}
+		return string(te.Kind)
+	}
+	return ""
 }
 
 func (s *Service) createBackup(ctx context.Context) (BackupRef, error) {

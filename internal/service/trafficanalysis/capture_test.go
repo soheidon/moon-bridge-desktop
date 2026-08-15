@@ -706,7 +706,7 @@ func TestCapturePauseKeepsRelayButStopsObservations(t *testing.T) {
 	if err := proxy.Pause(); err != nil {
 		t.Fatalf("second pause = %v", err)
 	}
-	if err := proxy.Start(); err == nil || !strings.Contains(err.Error(), "relay is still active") {
+	if err := proxy.Start(); err == nil || captureStartStage(err) != "relay_active" {
 		t.Fatalf("start during passthrough error = %v", err)
 	}
 

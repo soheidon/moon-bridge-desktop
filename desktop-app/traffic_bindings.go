@@ -598,15 +598,10 @@ func (a *App) ensureTrafficTransaction() (*traffictransaction.Service, error) {
 	if err := a.ensureRecoveryStore(configHome); err != nil {
 		return nil, err
 	}
-	backupDir := a.trafficBackupDir
-	if backupDir == "" {
-		base, err := recovery.DefaultDir(os.Getenv)
-		if err != nil {
-			return nil, err
-		}
-		backupDir = filepath.Join(base, "backups", "codex-config")
+	if err := a.ensureTrafficBackupDir(); err != nil {
+		return nil, err
 	}
-	a.trafficBackupDir = backupDir
+	backupDir := a.trafficBackupDir
 	store := a.recovery
 	configEditor := codexconfig.New(codexconfig.Options{Home: configHome, BackupDir: backupDir})
 	a.trafficTx = traffictransaction.New(traffictransaction.Dependencies{
@@ -621,6 +616,22 @@ func (a *App) ensureTrafficTransaction() (*traffictransaction.Service, error) {
 	})
 	a.trafficConfigPath = configPath
 	return a.trafficTx, nil
+}
+
+// ensureTrafficBackupDir lazily resolves and caches the transaction backup
+// directory. The normal Wails path leaves AppOptions.BackupDir empty and uses
+// %LOCALAPPDATA%\Moon Bridge\backups\codex-config; a restore must be able to
+// resolve it even when ensureTrafficTransaction has not run.
+func (a *App) ensureTrafficBackupDir() error {
+	if a.trafficBackupDir != "" {
+		return nil
+	}
+	base, err := recovery.DefaultDir(os.Getenv)
+	if err != nil {
+		return err
+	}
+	a.trafficBackupDir = filepath.Join(base, "backups", "codex-config")
+	return nil
 }
 
 // resolveCodexConfigPath deliberately does not use activeConfigPath. That
@@ -745,7 +756,7 @@ func trafficBindingError(operation string, err error) DesktopCommandResult {
 	if !errors.As(err, &te) {
 		return errDesktop(operation, "traffic", "traffic_transaction_failed", "traffic operation failed", true)
 	}
-	log.Printf("traffic binding error: operation=%q kind=%q retryable=%t", operation, te.Kind, te.Retryable)
+	log.Printf("traffic binding error: operation=%q kind=%q retryable=%t stage=%q", operation, te.Kind, te.Retryable, te.Stage)
 	code := string(te.Kind)
 	message := "traffic operation was rejected"
 	retryable := te.Retryable

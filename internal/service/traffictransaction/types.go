@@ -76,6 +76,7 @@ type TrafficProvider interface {
 	ValidateDesktopPassthroughExpected(uint64, string, string, string, string) (trafficanalysis.State, error)
 	ValidateCaptureOnlyExpected(uint64, string, string, string) (trafficanalysis.State, error)
 	ValidateIdleExpected(uint64) (trafficanalysis.State, error)
+	BindGatewayRun(string, string) (trafficanalysis.State, error)
 	StartCapture(trafficanalysis.StartOptions) (trafficanalysis.State, error)
 	ClaimDesktopExpected(uint64, string, string, string) (trafficanalysis.State, error)
 	SetDesktopModelMappingExpected(uint64, string, string, string, string, string) error
