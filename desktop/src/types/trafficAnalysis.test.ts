@@ -49,4 +49,21 @@ describe("summarizeTrafficRequests", () => {
     expect(summaries.find((item) => item.requestAlias === "req#13")).toMatchObject({ route: "fallback", provider: "deepseek", upstreamModel: "deepseek-v4-pro", credentialState: "missing", responseModel: "unknown" });
     expect(summaries.find((item) => item.requestAlias === "req#14")).toMatchObject({ route: "not_found", transportOutcome: "not_dispatched" });
   });
+
+  it("keeps the provider_response_model value when a later forwarded event is unknown", () => {
+    const summaries = summarizeTrafficRequests([
+      observation(1, "provider_response_model", { requestAlias: "req#1", responseModel: "deepseek-v4-pro" }),
+      observation(2, "provider_response_forwarded", { requestAlias: "req#1", responseModel: "unknown" }),
+    ]);
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0].responseModel).toBe("deepseek-v4-pro");
+  });
+
+  it("defaults responseModel to unknown when no provider_response_model event exists", () => {
+    const summaries = summarizeTrafficRequests([
+      observation(1, "provider_response_forwarded", { requestAlias: "req#1", responseModel: "unknown" }),
+    ]);
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0].responseModel).toBe("unknown");
+  });
 });

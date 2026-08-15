@@ -301,7 +301,9 @@ export function summarizeTrafficRequests(observations: TrafficObservation[]): Tr
     for (const observation of group) {
       const event = observation.gatewayEvent;
       if (!event) continue;
-      if (event.resolver) {
+      // Resolver diagnostics are only authoritative on the dedicated
+      // routing_resolution_diagnosed event; no other kind carries `resolver`.
+      if (observation.kind === "routing_resolution_diagnosed" && event.resolver) {
         resolver = event.resolver;
         serverInstance = event.resolver.serverInstance ?? "unknown";
         generation = event.resolver.resolverGeneration ?? 0;
@@ -309,11 +311,17 @@ export function summarizeTrafficRequests(observations: TrafficObservation[]): Tr
         if (finalStage === "explicit_route" || finalStage === "exact_slot" || finalStage === "fallback" || finalStage === "not_found") route = finalStage;
         if (event.resolver.resolvedSlot === "sol" || event.resolver.resolvedSlot === "terra" || event.resolver.resolvedSlot === "luna") resolvedSlot = event.resolver.resolvedSlot;
       }
+      // Request-side fields below are identical across routing_resolved /
+      // prepared / dispatched / received / forwarded (all derive from the same
+      // candidate), so last-truthy-wins is safe for them.
       if (event.requestedModel) requested = requestModel(event.requestedModel);
       if (event.routingSlot === "sol" || event.routingSlot === "terra" || event.routingSlot === "luna") resolvedSlot = event.routingSlot;
       if (event.provider) provider = safeSummaryProvider(event.provider);
       if (event.upstreamModel) upstreamModel = safeSummaryModel(event.upstreamModel);
-      if (event.responseModel) responseModel = safeSummaryModel(event.responseModel);
+      // provider_response_model is the sole authority for the response-side
+      // model. received/forwarded carry safeIdentifier("") == "unknown" and
+      // must not clobber a value already captured.
+      if (observation.kind === "provider_response_model" && event.responseModel) responseModel = safeSummaryModel(event.responseModel);
       if (event.mode) mode = event.mode;
       if (event.configuredEffort) configuredEffort = event.configuredEffort;
       if (event.thinking) thinking = event.thinking;
