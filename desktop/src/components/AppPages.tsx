@@ -63,7 +63,7 @@ export function AppPages({ page, snapshot, gateway, deepseek, routing, traffic }
   return (
     <main className="app-main dashboard">
       <div className="dashboard-content">
-        <RoutingProfilePanel routing={routing} />
+        <RoutingProfilePanel routing={routing} runtime={snapshot.runtimeConfiguration} />
         <GatewayStatusPanel snapshot={snapshot} error={gateway.error} />
       </div>
       <ProcessLogPanel logs={gateway.logs} trafficEvents={traffic.runtimeEvents} />

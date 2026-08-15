@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"moonbridge/internal/config"
+	routingprofiles "moonbridge/internal/extension/routingprofiles"
 	"moonbridge/internal/secretstore"
 	"moonbridge/internal/service/provider"
 	"moonbridge/internal/service/store"
@@ -54,6 +56,25 @@ func newSQLiteStoreForTest(t *testing.T) (*store.SQLiteConfigStore, *testDBStore
 	t.Helper()
 	logger := testLogger(t)
 	c := store.NewConfigStoreConsumer(logger)
+	ts := newTestStore(t, "config_store", c.Tables())
+	if err := c.BindStore(ts); err != nil {
+		t.Fatalf("BindStore() error = %v", err)
+	}
+	s, ok := c.Store().(*store.SQLiteConfigStore)
+	if !ok {
+		t.Fatal("Store() is not *store.SQLiteConfigStore")
+	}
+	return s, ts
+}
+
+// newSQLiteStoreWithRoutingProfiles returns a concrete store whose consumer has
+// the routing_profiles extension spec registered, so LoadAll accepts a persisted
+// routing_profiles extension instead of rejecting it as unregistered.
+func newSQLiteStoreWithRoutingProfiles(t *testing.T) (*store.SQLiteConfigStore, *testDBStore) {
+	t.Helper()
+	logger := testLogger(t)
+	c := store.NewConfigStoreConsumer(logger)
+	c.SetExtensionSpecs(routingprofiles.ConfigSpecs())
 	ts := newTestStore(t, "config_store", c.Tables())
 	if err := c.BindStore(ts); err != nil {
 		t.Fatalf("BindStore() error = %v", err)
@@ -232,4 +253,134 @@ func TestSQLiteStoreWriteEncryptsPlaintextKeys(t *testing.T) {
 	if got := rawProviderAPIKey(t, ts, "anthropic"); got != again {
 		t.Fatalf("raw api_key after ciphertext save = %q, want unchanged %q", got, again)
 	}
+}
+
+// legacyRoutingProfileConfig builds a test config whose routing_profiles
+// extension RawConfig is the given map, reproducing the legacy "table" shape
+// written by the old stopped-state save path.
+func legacyRoutingProfileConfig(raw map[string]any) *config.Config {
+	cfg := buildTestConfig()
+	enabled := true
+	cfg.Extensions = map[string]config.ExtensionSettings{
+		"routing_profiles": {Enabled: &enabled, RawConfig: raw},
+	}
+	return cfg
+}
+
+func TestSQLiteStoreMigrateLegacyRoutingProfileShape(t *testing.T) {
+	legacyTable := func(profiles map[string]any) map[string]any {
+		return map[string]any{"table": profiles}
+	}
+	profileA := map[string]any{
+		"display_name": "Profile A",
+		"slots": map[string]any{
+			"sol":   map[string]any{"provider": "p", "upstream_model": "m-flash", "mode": "thinking", "reasoning": "max"},
+			"terra": map[string]any{"provider": "p", "upstream_model": "m-flash", "mode": "thinking", "reasoning": "high"},
+			"luna":  map[string]any{"provider": "p", "upstream_model": "m-flash", "mode": "normal"},
+		},
+	}
+
+	t.Run("single profile promotes and establishes active_profile", func(t *testing.T) {
+		s, _ := newSQLiteStoreWithRoutingProfiles(t)
+		if err := s.SeedFromConfig(legacyRoutingProfileConfig(legacyTable(map[string]any{"profile-a": profileA}))); err != nil {
+			t.Fatalf("SeedFromConfig() error = %v", err)
+		}
+		loaded, err := s.LoadAll()
+		if err != nil {
+			t.Fatalf("LoadAll() error = %v", err)
+		}
+		raw := loaded.Extensions["routing_profiles"].RawConfig
+		if _, ok := raw["table"]; ok {
+			t.Fatalf("RawConfig still has legacy %q key: %#v", "table", raw)
+		}
+		profiles, ok := raw["profiles"].(map[string]any)
+		if !ok {
+			t.Fatalf("RawConfig[profiles] = %#v, want map", raw["profiles"])
+		}
+		if _, ok := profiles["profile-a"]; !ok {
+			t.Fatalf("profiles = %#v, want profile-a", profiles)
+		}
+		if raw["active_profile"] != "profile-a" {
+			t.Fatalf("active_profile = %#v, want profile-a", raw["active_profile"])
+		}
+
+		// Idempotent: a second LoadAll is a no-op and returns the same canonical
+		// shape.
+		again, err := s.LoadAll()
+		if err != nil {
+			t.Fatalf("second LoadAll() error = %v", err)
+		}
+		raw2 := again.Extensions["routing_profiles"].RawConfig
+		if _, ok := raw2["table"]; ok {
+			t.Fatalf("second LoadAll left %q key: %#v", "table", raw2)
+		}
+		if raw2["active_profile"] != "profile-a" {
+			t.Fatalf("second LoadAll active_profile = %#v, want profile-a", raw2["active_profile"])
+		}
+	})
+
+	t.Run("multiple profiles promote without guessing active_profile", func(t *testing.T) {
+		s, _ := newSQLiteStoreWithRoutingProfiles(t)
+		profiles := map[string]any{
+			"profile-a": profileA,
+			"profile-b": map[string]any{"display_name": "Profile B", "slots": map[string]any{}},
+		}
+		if err := s.SeedFromConfig(legacyRoutingProfileConfig(legacyTable(profiles))); err != nil {
+			t.Fatalf("SeedFromConfig() error = %v", err)
+		}
+		loaded, err := s.LoadAll()
+		if err != nil {
+			t.Fatalf("LoadAll() error = %v", err)
+		}
+		raw := loaded.Extensions["routing_profiles"].RawConfig
+		if _, ok := raw["table"]; ok {
+			t.Fatalf("RawConfig still has legacy %q key: %#v", "table", raw)
+		}
+		got, ok := raw["profiles"].(map[string]any)
+		if !ok || len(got) != 2 {
+			t.Fatalf("RawConfig[profiles] = %#v, want 2 promoted profiles", raw["profiles"])
+		}
+		if raw["active_profile"] != nil {
+			t.Fatalf("active_profile = %#v, want unset (do not guess among multiple profiles)", raw["active_profile"])
+		}
+	})
+
+	t.Run("non-map table is left untouched", func(t *testing.T) {
+		s, _ := newSQLiteStoreWithRoutingProfiles(t)
+		cfg := legacyRoutingProfileConfig(map[string]any{"table": "not-a-map"})
+		if err := s.SeedFromConfig(cfg); err != nil {
+			t.Fatalf("SeedFromConfig() error = %v", err)
+		}
+		loaded, err := s.LoadAll()
+		if err != nil {
+			t.Fatalf("LoadAll() error = %v", err)
+		}
+		raw := loaded.Extensions["routing_profiles"].RawConfig
+		if raw["table"] != "not-a-map" {
+			t.Fatalf("RawConfig[table] = %#v, want unchanged", raw["table"])
+		}
+		if _, ok := raw["profiles"]; ok {
+			t.Fatalf("RawConfig gained profiles from a non-map table: %#v", raw)
+		}
+	})
+
+	t.Run("empty table is left untouched", func(t *testing.T) {
+		s, _ := newSQLiteStoreWithRoutingProfiles(t)
+		cfg := legacyRoutingProfileConfig(map[string]any{"table": map[string]any{}})
+		if err := s.SeedFromConfig(cfg); err != nil {
+			t.Fatalf("SeedFromConfig() error = %v", err)
+		}
+		loaded, err := s.LoadAll()
+		if err != nil {
+			t.Fatalf("LoadAll() error = %v", err)
+		}
+		raw := loaded.Extensions["routing_profiles"].RawConfig
+		table, ok := raw["table"].(map[string]any)
+		if !ok || len(table) != 0 {
+			t.Fatalf("RawConfig[table] = %#v, want unchanged empty map", raw["table"])
+		}
+		if _, ok := raw["profiles"]; ok {
+			t.Fatalf("RawConfig gained profiles from an empty table: %#v", raw)
+		}
+	})
 }

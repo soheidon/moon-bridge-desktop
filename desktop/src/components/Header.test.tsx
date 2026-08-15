@@ -48,9 +48,9 @@ describe("Header navigation", () => {
     expect(versionIndex).toBeLessThan(tabIndex);
   });
 
-  it("marks the settings button active only on the settings page", () => {
+  it("marks the settings button active and labels it 設定を閉じる on the settings page", () => {
     const markup = headerMarkup("settings");
-    expect(markup).toContain('class="btn btn-settings active" aria-current="page">設定</button>');
+    expect(markup).toContain('class="btn btn-settings active" aria-current="page">設定を閉じる</button>');
     expect(markup).toContain('class="header-nav-tab">Codex Traffic Analysis</button>');
     expect(markup).not.toContain('aria-current="page">Codex');
   });

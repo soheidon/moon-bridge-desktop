@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"moonbridge/internal/protocol/google"
 	"moonbridge/internal/protocol/openai"
 	"moonbridge/internal/service/api"
+	"moonbridge/internal/service/egressobservation"
 	"moonbridge/internal/service/provider"
 	"moonbridge/internal/service/routingprofile"
 	"moonbridge/internal/service/runtime"
@@ -45,6 +47,8 @@ type Config struct {
 	TrafficRouting         TrafficRouting
 	RoutingObservationSink RoutingObservationSink
 	RoutingProfileResolver RoutingProfileResolver
+	RoutingProfileState    routingprofile.SafeResolverState
+	RoutingConfigSource    string
 	OpenAIHTTPClient       *http.Client
 	ProxyHTTPClient        *http.Client
 	ChatClients            map[string]any
@@ -101,19 +105,79 @@ type RoutingProfileResolver interface {
 	ResolveSlot(requestModel string) (RoutingProfileSlotResult, bool)
 }
 
+type routingProfileResolverStateProvider interface {
+	SafeState() routingprofile.SafeResolverState
+}
+
+// RoutingResolverStatus is a reduced, process-local diagnostic snapshot. It
+// never contains raw profile/provider/model identifiers or connection data.
+type RoutingResolverStatus struct {
+	ServerInstance       string                           `json:"server_instance"`
+	Generation           uint64                           `json:"generation"`
+	InstallSource        string                           `json:"install_source"`
+	ConfigSource         string                           `json:"config_source"`
+	ResolverPresent      bool                             `json:"resolver_present"`
+	RoutingProfileState  routingprofile.SafeResolverState `json:"routing_profile_state"`
+	LastLoadedGeneration uint64                           `json:"last_loaded_generation"`
+	LastResolutionStage  string                           `json:"last_resolution_stage"`
+}
+
+// RuntimeConfigurationStatus is the bounded, secret-safe runtime snapshot
+// consumed by the Desktop Dashboard. It is deliberately derived from one
+// resolver holder and the current ProviderManager; it never contains profile
+// IDs, provider keys, URLs, config paths, or credentials.
+type RuntimeConfigurationStatus struct {
+	State                 string               `json:"state"`
+	ServerInstance        string               `json:"server_instance"`
+	ResolverGeneration    uint64               `json:"resolver_generation"`
+	InstallSource         string               `json:"install_source"`
+	ConfigSource          string               `json:"config_source"`
+	ResolverPresent       bool                 `json:"resolver_present"`
+	RoutingExtensionState string               `json:"routing_extension_state"`
+	ActiveProfileState    string               `json:"active_profile_state"`
+	ReadySlotCount        int                  `json:"ready_slot_count"`
+	CredentialState       string               `json:"credential_state"`
+	Slots                 RuntimeSlotStatusSet `json:"slots"`
+}
+
+type RuntimeSlotStatusSet struct {
+	Sol   RuntimeSlotStatus `json:"sol"`
+	Terra RuntimeSlotStatus `json:"terra"`
+	Luna  RuntimeSlotStatus `json:"luna"`
+}
+
+type RuntimeSlotStatus struct {
+	State            string `json:"state"`
+	Provider         string `json:"provider,omitempty"`
+	UpstreamModel    string `json:"upstream_model,omitempty"`
+	Mode             string `json:"mode,omitempty"`
+	ConfiguredEffort string `json:"configured_effort,omitempty"`
+	CredentialState  string `json:"credential_state,omitempty"`
+}
+
 // routingProfileResolverHolder wraps a RoutingProfileResolver so atomic.Pointer
 // can swap it without the concrete-type restriction of atomic.Value.
 type routingProfileResolverHolder struct {
-	resolver RoutingProfileResolver
+	resolver      RoutingProfileResolver
+	state         routingprofile.SafeResolverState
+	generation    uint64
+	installSource string
 }
 
+var serverInstanceCounter atomic.Uint64
+
 type Server struct {
+	serverInstance         string
 	adapterRegistry        *format.Registry
 	provider               provider.ProviderClient
 	providerMgr            *provider.ProviderManager
 	trafficRouting         TrafficRouting
 	routingObservationSink RoutingObservationSink
 	routingProfileResolver atomic.Pointer[routingProfileResolverHolder]
+	resolverGeneration     atomic.Uint64
+	lastLoadedGeneration   atomic.Uint64
+	lastResolutionStage    atomic.Value
+	routingConfigSource    string
 	openAIHTTP             *http.Client
 	proxyHTTP              *http.Client
 	chatClients            map[string]any
@@ -144,11 +208,272 @@ type Server struct {
 // resolver. Call this after a profile mutation so the next request uses the
 // updated profile configuration. Pass nil to clear.
 func (s *Server) SwapRoutingProfileResolver(r RoutingProfileResolver) {
+	generation := s.resolverGeneration.Add(1)
 	if r == nil {
 		s.routingProfileResolver.Store(nil)
+		s.logRoutingResolverState("profile_refresh")
 		return
 	}
-	s.routingProfileResolver.Store(&routingProfileResolverHolder{resolver: r})
+	state := routingprofile.SafeResolverState{}
+	if provider, ok := r.(routingProfileResolverStateProvider); ok {
+		state = provider.SafeState()
+	}
+	state = normalizeSafeResolverState(state)
+	s.routingProfileResolver.Store(&routingProfileResolverHolder{resolver: r, state: state, generation: generation, installSource: "profile_refresh"})
+	s.logRoutingResolverState("profile_refresh")
+}
+
+// RoutingResolverStatus returns a reduced diagnostic snapshot with no raw
+// identifiers or connection details.
+func (s *Server) RoutingResolverStatus() RoutingResolverStatus {
+	status := RoutingResolverStatus{
+		ServerInstance:       s.serverInstance,
+		ConfigSource:         s.routingConfigSource,
+		InstallSource:        "none",
+		LastLoadedGeneration: s.lastLoadedGeneration.Load(),
+		LastResolutionStage:  "none",
+	}
+	if value := s.lastResolutionStage.Load(); value != nil {
+		if stage, ok := value.(string); ok {
+			status.LastResolutionStage = stage
+		}
+	}
+	if holder := s.routingProfileResolver.Load(); holder != nil && holder.resolver != nil {
+		status.ResolverPresent = true
+		status.Generation = holder.generation
+		status.InstallSource = holder.installSource
+		status.RoutingProfileState = holder.state
+	}
+	return status
+}
+
+// RuntimeConfigurationStatus returns the effective configuration used by the
+// current request path. The resolver holder is loaded once so all slot facts
+// in the result describe the same installed generation.
+func (s *Server) RuntimeConfigurationStatus() RuntimeConfigurationStatus {
+	status := RuntimeConfigurationStatus{
+		State:                 "invalid",
+		ServerInstance:        safeServerInstanceForRuntime(s.serverInstance),
+		InstallSource:         "none",
+		ConfigSource:          s.routingConfigSource,
+		RoutingExtensionState: "unknown",
+		ActiveProfileState:    "unknown",
+		CredentialState:       "unknown",
+		Slots: RuntimeSlotStatusSet{
+			Sol:   RuntimeSlotStatus{State: "unknown"},
+			Terra: RuntimeSlotStatus{State: "unknown"},
+			Luna:  RuntimeSlotStatus{State: "unknown"},
+		},
+	}
+	if status.ConfigSource == "" {
+		status.ConfigSource = "unknown"
+	}
+	pm := s.activeProviderManager()
+	status.CredentialState = aggregateCredentialState(pm)
+	holder := s.routingProfileResolver.Load()
+	if holder == nil || holder.resolver == nil {
+		status.State = "invalid"
+		status.RoutingExtensionState = "absent"
+		return status
+	}
+	status.ResolverPresent = true
+	status.ResolverGeneration = holder.generation
+	status.InstallSource = safeRuntimeEnum(holder.installSource, "none", "startup", "profile_refresh")
+	state := holder.state
+	status.RoutingExtensionState = safeRuntimeEnum(state.ExtensionState, "unknown", "absent", "valid", "invalid")
+	status.ActiveProfileState = safeRuntimeEnum(state.ActiveProfileState, "unknown", "present_valid", "missing", "invalid", "unknown")
+	status.Slots.Sol = s.runtimeSlotStatus(holder, pm, "gpt-5.6-sol", state.SolState)
+	status.Slots.Terra = s.runtimeSlotStatus(holder, pm, "gpt-5.6-terra", state.TerraState)
+	status.Slots.Luna = s.runtimeSlotStatus(holder, pm, "gpt-5.6-luna", state.LunaState)
+	for _, slot := range []RuntimeSlotStatus{status.Slots.Sol, status.Slots.Terra, status.Slots.Luna} {
+		if slot.State == "ready" {
+			status.ReadySlotCount++
+		}
+	}
+	if status.RoutingExtensionState == "invalid" || status.ActiveProfileState != "present_valid" {
+		status.State = "invalid"
+	} else if status.ReadySlotCount == 3 {
+		status.State = "ready"
+	} else {
+		status.State = "degraded"
+	}
+	return status
+}
+
+func (s *Server) runtimeSlotStatus(holder *routingProfileResolverHolder, pm *provider.ProviderManager, modelName, safeState string) RuntimeSlotStatus {
+	result := RuntimeSlotStatus{State: safeRuntimeSlotState(safeState)}
+	if holder == nil || holder.resolver == nil {
+		return result
+	}
+	slot, ok := holder.resolver.ResolveSlot(modelName)
+	if !ok {
+		return result
+	}
+	if pm == nil {
+		result.State = "reference_unresolved"
+		return result
+	}
+	target, err := pm.ResolveModel(slot.ProviderKey + "/" + slot.UpstreamModel)
+	if err != nil || target == nil || len(target.Candidates) == 0 {
+		result.State = "reference_unresolved"
+		return result
+	}
+	result.State = "ready"
+	result.Provider = safeRuntimeProvider(slot.ProviderKey)
+	result.UpstreamModel = safeRuntimeModel(slot.UpstreamModel)
+	result.Mode = safeRuntimeMode(slot.Mode)
+	result.ConfiguredEffort = safeRuntimeEffort(slot.Reasoning)
+	result.CredentialState = credentialStateFor(pm, slot.ProviderKey)
+	return result
+}
+
+func safeRuntimeSlotState(value string) string {
+	switch value {
+	case "ready", "missing", "invalid", "reference_unresolved":
+		return value
+	default:
+		return "unknown"
+	}
+}
+
+func safeRuntimeEnum(value, fallback string, allowed ...string) string {
+	for _, item := range allowed {
+		if value == item {
+			return value
+		}
+	}
+	return fallback
+}
+
+func safeServerInstanceForRuntime(value string) string {
+	if strings.HasPrefix(value, "server#") && runtimeDigitsOnly(value[len("server#"):]) {
+		return value
+	}
+	return "unknown"
+}
+
+func runtimeDigitsOnly(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func safeRuntimeProvider(value string) string {
+	switch value {
+	case "deepseek", "minimax", "kimi", "mimo", "openrouter", "anthropic", "openai":
+		return value
+	default:
+		return "unknown"
+	}
+}
+
+func safeRuntimeModel(value string) string {
+	switch value {
+	case "deepseek-v4-flash", "deepseek-v4-pro":
+		return value
+	default:
+		return "unknown"
+	}
+}
+
+func safeRuntimeMode(value string) string {
+	switch value {
+	case string(routingprofile.ModeNormal), string(routingprofile.ModeThinking):
+		return value
+	default:
+		return "unknown"
+	}
+}
+
+func safeRuntimeEffort(value *string) string {
+	if value == nil || *value == "" {
+		return "none"
+	}
+	switch *value {
+	case "low", "high", "max":
+		return *value
+	default:
+		return "unknown"
+	}
+}
+
+func credentialStateFor(pm *provider.ProviderManager, providerKey string) string {
+	if pm == nil {
+		return "unknown"
+	}
+	for _, info := range pm.CredentialStatus() {
+		if info.ProviderID == providerKey {
+			return safeCredentialState(info.State)
+		}
+	}
+	return "unknown"
+}
+
+func aggregateCredentialState(pm *provider.ProviderManager) string {
+	if pm == nil {
+		return "unknown"
+	}
+	statuses := pm.CredentialStatus()
+	if len(statuses) == 0 {
+		return "unknown"
+	}
+	seenAvailable, seenUnverified, seenUnavailable, seenMissing := false, false, false, false
+	for _, info := range statuses {
+		switch info.State {
+		case provider.StateAvailable:
+			seenAvailable = true
+		case provider.StateUnverified:
+			seenUnverified = true
+		case provider.StateUnavailable:
+			seenUnavailable = true
+		case provider.StateMissing:
+			seenMissing = true
+		}
+	}
+	switch {
+	case seenUnavailable:
+		return "unavailable"
+	case seenAvailable:
+		return "available"
+	case seenUnverified:
+		return "unverified"
+	case seenMissing:
+		return "missing"
+	default:
+		return "unknown"
+	}
+}
+
+func safeCredentialState(value string) string {
+	switch value {
+	case provider.StateAvailable, provider.StateMissing, provider.StateUnavailable, provider.StateUnverified:
+		return value
+	default:
+		return "unknown"
+	}
+}
+
+func (s *Server) logRoutingResolverState(event string) {
+	status := s.RoutingResolverStatus()
+	logger.Info("routing resolver lifecycle",
+		"event", event,
+		"server_instance", status.ServerInstance,
+		"generation", status.Generation,
+		"install_source", status.InstallSource,
+		"config_source", status.ConfigSource,
+		"resolver_present", status.ResolverPresent,
+		"extension_state", status.RoutingProfileState.ExtensionState,
+		"active_profile_state", status.RoutingProfileState.ActiveProfileState,
+		"slot_count", status.RoutingProfileState.SlotCount,
+		"sol_state", status.RoutingProfileState.SolState,
+		"terra_state", status.RoutingProfileState.TerraState,
+		"luna_state", status.RoutingProfileState.LunaState)
 }
 
 func (s *Server) runtimeSnapshot() *runtime.ConfigSnapshot {
@@ -187,6 +512,7 @@ func (s *Server) activeChatClient(providerKey string) any {
 				BaseURL:   def.BaseURL,
 				APIKey:    def.APIKey,
 				UserAgent: def.UserAgent,
+				Client:    s.proxyHTTP,
 			})
 			s.clientCacheMu.Lock()
 			s.clientCache[providerKey] = client
@@ -215,6 +541,7 @@ func (s *Server) activeGoogleClient(providerKey string) any {
 				Location:  def.Location,
 				Version:   def.APIVersion,
 				UserAgent: def.UserAgent,
+				Client:    s.proxyHTTP,
 			})
 			s.googleCacheMu.Lock()
 			s.googleCache[providerKey] = client
@@ -230,13 +557,14 @@ func New(cfg Config) *Server {
 		cfg.SessionManager = newDefaultSessionManager(cfg)
 	}
 	s := &Server{
+		serverInstance:         fmt.Sprintf("server#%d", serverInstanceCounter.Add(1)),
 		adapterRegistry:        cfg.AdapterRegistry,
 		provider:               cfg.Provider,
 		providerMgr:            cfg.ProviderMgr,
 		trafficRouting:         cfg.TrafficRouting,
 		routingObservationSink: cfg.RoutingObservationSink,
-		openAIHTTP:             cfg.OpenAIHTTPClient,
-		proxyHTTP:              cfg.ProxyHTTPClient,
+		openAIHTTP:             egressobservation.WrapClient(cfg.OpenAIHTTPClient),
+		proxyHTTP:              egressobservation.WrapClient(cfg.ProxyHTTPClient),
 		tracer:                 cfg.Tracer,
 		traceErrors:            cfg.TraceErrors,
 		stats:                  cfg.Stats,
@@ -251,12 +579,22 @@ func New(cfg Config) *Server {
 		sessionManager:         cfg.SessionManager,
 		usageTracker:           cfg.UsageTracker,
 		traceWriter:            cfg.TraceWriter,
+		routingConfigSource:    safeConfigSource(cfg.RoutingConfigSource),
 		clientCache:            make(map[string]*chat.Client),
 		googleCache:            make(map[string]*google.Client),
 	}
+	s.lastResolutionStage.Store("none")
 	if cfg.RoutingProfileResolver != nil {
-		s.routingProfileResolver.Store(&routingProfileResolverHolder{resolver: cfg.RoutingProfileResolver})
+		state := cfg.RoutingProfileState
+		if provider, ok := cfg.RoutingProfileResolver.(routingProfileResolverStateProvider); ok {
+			state = provider.SafeState()
+		}
+		state = normalizeSafeResolverState(state)
+		generation := uint64(1)
+		s.resolverGeneration.Store(generation)
+		s.routingProfileResolver.Store(&routingProfileResolverHolder{resolver: cfg.RoutingProfileResolver, state: state, generation: generation, installSource: "startup"})
 	}
+	s.logRoutingResolverState("startup")
 	s.mux.HandleFunc("/v1/responses", s.handleResponses)
 	s.mux.HandleFunc("/responses", s.handleResponses)
 	s.mux.HandleFunc("/v1/models", s.handleModels)
@@ -268,6 +606,32 @@ func New(cfg Config) *Server {
 		s.mux.Handle("/api/v1/", http.StripPrefix("/api/v1", apiRouter))
 	}
 	return s
+}
+
+func safeConfigSource(source string) string {
+	if source == "persisted_store" {
+		return source
+	}
+	return "file_seed"
+}
+
+func normalizeSafeResolverState(state routingprofile.SafeResolverState) routingprofile.SafeResolverState {
+	if state.ExtensionState == "" {
+		state.ExtensionState = "invalid"
+	}
+	if state.ActiveProfileState == "" {
+		state.ActiveProfileState = "invalid"
+	}
+	if state.SolState == "" {
+		state.SolState = "invalid"
+	}
+	if state.TerraState == "" {
+		state.TerraState = "invalid"
+	}
+	if state.LunaState == "" {
+		state.LunaState = "invalid"
+	}
+	return state
 }
 
 func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -442,12 +806,30 @@ func checkAuth(r *http.Request, expectedToken string) bool {
 }
 
 func (s *Server) resolveModelOrFallback(modelName, relayMarker string) (*provider.ResolvedRoute, string, error) {
+	return s.resolveModelOrFallbackContext(context.Background(), modelName, relayMarker, false)
+}
+
+func (s *Server) resolveModelOrFallbackContext(ctx context.Context, modelName, relayMarker string, emitDiagnostic bool) (resolved *provider.ResolvedRoute, alias string, resolveErr error) {
+	var holder *routingProfileResolverHolder
+	holder = s.routingProfileResolver.Load()
+	diagnostic := newResolverDiagnostic(modelName, s.serverInstance, s.routingConfigSource, holder)
+	if emitDiagnostic {
+		defer func() {
+			s.recordResolverDiagnostic(ctx, diagnostic)
+		}()
+	}
 	if pm := s.activeProviderManager(); pm != nil {
 		resolved, err := pm.ResolveModel(modelName)
 		if err == nil {
+			diagnostic.NormalResult = "explicit_route"
+			diagnostic.FinalStage = "explicit_route"
+			s.lastLoadedGeneration.Store(0)
+			s.lastResolutionStage.Store("explicit_route")
 			return resolved, "", nil
 		}
 		if !isModelNotFound(err) {
+			diagnostic.NormalResult = "slot_target_unresolved"
+			diagnostic.FinalStage = "not_found"
 			return nil, "", err
 		}
 		// Routing-profile slots are exact Codex model identities and must win
@@ -455,15 +837,26 @@ func (s *Server) resolveModelOrFallback(modelName, relayMarker string) (*provide
 		// request is mapped to the moonbridge route before its slot policy is
 		// applied, which loses routing provenance and lets provider defaults
 		// re-enable thinking for Luna.
-		if h := s.routingProfileResolver.Load(); h != nil && h.resolver != nil {
-			slot, ok := h.resolver.ResolveSlot(modelName)
+		if holder == nil || holder.resolver == nil {
+			diagnostic.NormalResult = "resolver_absent"
+			s.lastLoadedGeneration.Store(0)
+			s.lastResolutionStage.Store("fallback")
+		} else {
+			diagnostic.ResolverPresent = true
+			diagnostic.ResolverGeneration = holder.generation
+			s.lastLoadedGeneration.Store(holder.generation)
+			slot, ok := holder.resolver.ResolveSlot(modelName)
 			if ok {
+				diagnostic.ResolvedSlot = slot.SlotID
 				// Build a provider/model direct ref so the ProviderManager
 				// resolves to the slot's specific provider, not an ambiguous
 				// model name that could match multiple providers.
 				targetRef := slot.ProviderKey + "/" + slot.UpstreamModel
 				mapped, mappedErr := pm.ResolveModel(targetRef)
 				if mappedErr == nil {
+					diagnostic.NormalResult = "slot_hit"
+					diagnostic.FinalStage = "exact_slot"
+					s.lastResolutionStage.Store("exact_slot")
 					mode, modeErr := routingprofile.NormalizeSlotMode(slot.Mode, slot.Reasoning)
 					if modeErr != nil {
 						return nil, "", modeErr
@@ -480,6 +873,10 @@ func (s *Server) resolveModelOrFallback(modelName, relayMarker string) (*provide
 					}
 					return mapped, slot.UpstreamModel, nil
 				}
+				diagnostic.NormalResult = "slot_target_unresolved"
+				s.lastResolutionStage.Store("provider_reference")
+			} else {
+				diagnostic.NormalResult = "alias_miss"
 			}
 		}
 		// Traffic relay fallback (existing)
@@ -493,19 +890,32 @@ func (s *Server) resolveModelOrFallback(modelName, relayMarker string) (*provide
 			}
 			targetAlias, ok := s.trafficRouting.ObservedModelFor(modelName, relayMarker)
 			if !ok || targetAlias == "" {
+				diagnostic.FallbackResult = "miss"
+				diagnostic.FinalStage = "not_found"
+				s.lastResolutionStage.Store("not_found")
 				resolveDiag(false, false, false)
 			} else {
 				mapped, mappedErr := pm.ResolveModel(targetAlias)
 				if mappedErr == nil {
+					diagnostic.FallbackResult = "hit"
+					diagnostic.FinalStage = "fallback"
+					s.lastResolutionStage.Store("fallback")
 					resolveDiag(true, true, true)
 					return mapped, targetAlias, nil
 				}
+				diagnostic.FallbackResult = "target_unresolved"
+				diagnostic.FinalStage = "not_found"
+				s.lastResolutionStage.Store("not_found")
 				resolveDiag(true, true, false)
 			}
 		}
+		s.lastResolutionStage.Store("not_found")
+		diagnostic.FinalStage = "not_found"
 		return nil, "", err
 	}
 	if s.provider != nil {
+		diagnostic.NormalResult = "explicit_route"
+		diagnostic.FinalStage = "explicit_route"
 		return &provider.ResolvedRoute{
 			Candidates: []provider.ProviderCandidate{{
 				ProviderKey:   "default",
@@ -515,7 +925,61 @@ func (s *Server) resolveModelOrFallback(modelName, relayMarker string) (*provide
 			}},
 		}, "", nil
 	}
+	diagnostic.NormalResult = "resolver_absent"
+	diagnostic.FinalStage = "not_found"
 	return nil, "", fmt.Errorf("no provider manager configured for model %q", modelName)
+}
+
+func newResolverDiagnostic(modelName, serverInstance, configSource string, holder *routingProfileResolverHolder) *trafficanalysis.ResolverDiagnosticInput {
+	result := &trafficanalysis.ResolverDiagnosticInput{
+		RequestedModel: modelName,
+		ServerInstance: serverInstance,
+		FallbackResult: "not_consulted",
+		KnownAlias:     modelName == "gpt-5.6-sol" || modelName == "gpt-5.6-terra" || modelName == "gpt-5.6-luna",
+	}
+	if holder == nil || holder.resolver == nil {
+		result.NormalResult = "resolver_absent"
+		return result
+	}
+	result.ResolverPresent = true
+	result.ResolverGeneration = holder.generation
+	result.InstallSource = "startup"
+	result.ConfigSource = configSource
+	if result.ConfigSource == "" {
+		result.ConfigSource = "unknown"
+	}
+	result.InstallSource = holder.installSource
+	if result.InstallSource == "" {
+		result.InstallSource = "none"
+	}
+	stateProvider, ok := holder.resolver.(routingProfileResolverStateProvider)
+	if !ok {
+		result.ExtensionState = "unknown"
+		result.ActiveProfileState = "unknown"
+		result.SolState = "unknown"
+		result.TerraState = "unknown"
+		result.LunaState = "unknown"
+		return result
+	}
+	state := stateProvider.SafeState()
+	result.ExtensionState = state.ExtensionState
+	result.ActiveProfileState = state.ActiveProfileState
+	result.SlotCount = state.SlotCount
+	result.SolState = state.SolState
+	result.TerraState = state.TerraState
+	result.LunaState = state.LunaState
+	return result
+}
+
+func (s *Server) recordResolverDiagnostic(ctx context.Context, diagnostic *trafficanalysis.ResolverDiagnosticInput) {
+	if s.routingObservationSink == nil || diagnostic == nil {
+		return
+	}
+	s.routingObservationSink.RecordGatewayEvent(trafficanalysis.GatewayEventInput{
+		Kind:           trafficanalysis.ObservationRoutingResolutionDiagnosed,
+		CorrelationKey: routingObservationKey(ctx),
+		Resolver:       diagnostic,
+	})
 }
 
 func isModelNotFound(err error) bool {

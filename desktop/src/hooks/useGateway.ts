@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { command, onEvent, type CommandError } from "../platform/desktop";
-import type { GatewayLog, GatewaySnapshot } from "../types/gateway";
+import type { GatewayLog, GatewaySnapshot, RuntimeConfigurationSnapshot } from "../types/gateway";
 
 // GatewayStatus/StartGateway/StopGateway resolve to a flat GatewaySnapshot,
 // not a nested { gateway: ... } wrapper. Reading value.gateway would always be
@@ -12,6 +12,7 @@ type WailsGatewayValue = {
   pid?: number | null;
   instanceId?: string | null;
   error?: string | null;
+  runtimeConfiguration?: RuntimeConfigurationSnapshot | null;
 };
 
 export function appendLog(current: GatewayLog[], next: GatewayLog, cap = 500): GatewayLog[] {
@@ -27,6 +28,7 @@ export function toGatewaySnapshot(value: WailsGatewayValue): GatewaySnapshot {
     pid: value.pid ?? null,
     instanceId: value.instanceId ?? null,
     error: value.error ?? null,
+    runtimeConfiguration: value.runtimeConfiguration ?? null,
   };
 }
 

@@ -64,9 +64,13 @@ const (
 type ObservationKind string
 
 const (
-	ObservationPayload                 ObservationKind = "payload"
-	ObservationRoutingResolved         ObservationKind = "routing_resolved"
-	ObservationProviderRequestPrepared ObservationKind = "provider_request_prepared"
+	ObservationPayload                    ObservationKind = "payload"
+	ObservationRoutingResolved            ObservationKind = "routing_resolved"
+	ObservationRoutingResolutionDiagnosed ObservationKind = "routing_resolution_diagnosed"
+	ObservationProviderRequestPrepared    ObservationKind = "provider_request_prepared"
+	ObservationProviderRequestDispatched  ObservationKind = "provider_request_dispatched"
+	ObservationProviderResponseReceived   ObservationKind = "provider_response_received"
+	ObservationProviderResponseForwarded  ObservationKind = "provider_response_forwarded"
 )
 
 type DecodingStatus string
@@ -122,19 +126,48 @@ type PayloadInput struct {
 // correlation/profile values are accepted only for in-process aliasing and are
 // never serialized.
 type GatewayEventInput struct {
-	Kind             ObservationKind `json:"kind"`
-	CorrelationKey   string          `json:"-"`
-	ProfileID        string          `json:"-"`
-	RequestedModel   string          `json:"requestedModel,omitempty"`
-	RoutingSlot      string          `json:"routingSlot,omitempty"`
-	Provider         string          `json:"provider,omitempty"`
-	UpstreamModel    string          `json:"upstreamModel,omitempty"`
-	Mode             string          `json:"mode,omitempty"`
-	ConfiguredEffort string          `json:"configuredEffort,omitempty"`
-	Protocol         string          `json:"protocol,omitempty"`
-	Model            string          `json:"model,omitempty"`
-	Thinking         string          `json:"thinking,omitempty"`
-	EffectiveEffort  string          `json:"effectiveEffort,omitempty"`
+	Kind             ObservationKind          `json:"kind"`
+	CorrelationKey   string                   `json:"-"`
+	ProfileID        string                   `json:"-"`
+	RequestedModel   string                   `json:"requestedModel,omitempty"`
+	RoutingSlot      string                   `json:"routingSlot,omitempty"`
+	Provider         string                   `json:"provider,omitempty"`
+	UpstreamModel    string                   `json:"upstreamModel,omitempty"`
+	Mode             string                   `json:"mode,omitempty"`
+	ConfiguredEffort string                   `json:"configuredEffort,omitempty"`
+	Protocol         string                   `json:"protocol,omitempty"`
+	Model            string                   `json:"model,omitempty"`
+	Thinking         string                   `json:"thinking,omitempty"`
+	EffectiveEffort  string                   `json:"effectiveEffort,omitempty"`
+	CredentialState  string                   `json:"credentialState,omitempty"`
+	Direction        Direction                `json:"-"`
+	StatusCode       int                      `json:"-"`
+	ExchangeIndex    uint64                   `json:"-"`
+	Streaming        bool                     `json:"-"`
+	Resolver         *ResolverDiagnosticInput `json:"resolver,omitempty"`
+}
+
+// ResolverDiagnosticInput is the closed, secret-safe resolver state attached
+// to one request-resolution observation. CorrelationKey remains the only raw
+// in-process value and is held on GatewayEventInput with json:"-".
+type ResolverDiagnosticInput struct {
+	RequestedModel     string
+	ServerInstance     string
+	ResolverGeneration uint64
+	ResolverPresent    bool
+	InstallSource      string
+	ConfigSource       string
+	ExtensionState     string
+	ActiveProfileState string
+	SlotCount          int
+	SolState           string
+	TerraState         string
+	LunaState          string
+	NormalResult       string
+	ResolvedSlot       string
+	FallbackResult     string
+	FinalStage         string
+	KnownAlias         bool
 }
 
 type Observation struct {
@@ -175,18 +208,44 @@ type Observation struct {
 }
 
 type GatewayEventSummary struct {
-	RequestAlias     string `json:"requestAlias"`
-	RequestedModel   string `json:"requestedModel,omitempty"`
-	RoutingSlot      string `json:"routingSlot,omitempty"`
-	ActiveProfile    string `json:"activeProfile,omitempty"`
-	Provider         string `json:"provider,omitempty"`
-	UpstreamModel    string `json:"upstreamModel,omitempty"`
-	Mode             string `json:"mode,omitempty"`
-	ConfiguredEffort string `json:"configuredEffort,omitempty"`
-	Protocol         string `json:"protocol,omitempty"`
-	Model            string `json:"model,omitempty"`
-	Thinking         string `json:"thinking,omitempty"`
-	EffectiveEffort  string `json:"effectiveEffort,omitempty"`
+	RequestAlias     string                     `json:"requestAlias"`
+	RequestedModel   string                     `json:"requestedModel,omitempty"`
+	RoutingSlot      string                     `json:"routingSlot,omitempty"`
+	ActiveProfile    string                     `json:"activeProfile,omitempty"`
+	Provider         string                     `json:"provider,omitempty"`
+	UpstreamModel    string                     `json:"upstreamModel,omitempty"`
+	Mode             string                     `json:"mode,omitempty"`
+	ConfiguredEffort string                     `json:"configuredEffort,omitempty"`
+	Protocol         string                     `json:"protocol,omitempty"`
+	Model            string                     `json:"model,omitempty"`
+	Thinking         string                     `json:"thinking,omitempty"`
+	EffectiveEffort  string                     `json:"effectiveEffort,omitempty"`
+	CredentialState  string                     `json:"credentialState,omitempty"`
+	Direction        Direction                  `json:"direction,omitempty"`
+	StatusCode       int                        `json:"statusCode,omitempty"`
+	ExchangeIndex    uint64                     `json:"exchangeIndex,omitempty"`
+	Streaming        bool                       `json:"streaming,omitempty"`
+	Resolver         *ResolverDiagnosticSummary `json:"resolver,omitempty"`
+}
+
+type ResolverDiagnosticSummary struct {
+	RequestedModel     string `json:"requestedModel,omitempty"`
+	ServerInstance     string `json:"serverInstance,omitempty"`
+	ResolverGeneration uint64 `json:"resolverGeneration,omitempty"`
+	ResolverPresent    bool   `json:"resolverPresent"`
+	InstallSource      string `json:"installSource,omitempty"`
+	ConfigSource       string `json:"configSource,omitempty"`
+	ExtensionState     string `json:"extensionState,omitempty"`
+	ActiveProfileState string `json:"activeProfileState,omitempty"`
+	SlotCount          int    `json:"slotCount"`
+	SolState           string `json:"solState,omitempty"`
+	TerraState         string `json:"terraState,omitempty"`
+	LunaState          string `json:"lunaState,omitempty"`
+	NormalResult       string `json:"normalResult,omitempty"`
+	ResolvedSlot       string `json:"resolvedSlot,omitempty"`
+	FallbackResult     string `json:"fallbackResult,omitempty"`
+	FinalStage         string `json:"finalStage,omitempty"`
+	KnownAlias         bool   `json:"knownAlias"`
 }
 
 type HeaderSummary struct {
@@ -333,6 +392,10 @@ func (a *Analyzer) Record(input PayloadInput) Observation {
 }
 
 func (a *Analyzer) RecordGatewayEvent(input GatewayEventInput) Observation {
+	kind := sanitizeObservationKind(input.Kind)
+	if kind == "" {
+		return Observation{}
+	}
 	a.aliasMu.Lock()
 	requestAlias := a.aliasGatewayKey(a.requestAliases, input.CorrelationKey, "req", &a.nextRequestAlias)
 	profileAlias := ""
@@ -341,8 +404,21 @@ func (a *Analyzer) RecordGatewayEvent(input GatewayEventInput) Observation {
 	}
 	a.aliasMu.Unlock()
 
-	obs := Observation{Kind: sanitizeObservationKind(input.Kind), SessionID: a.session, Timestamp: time.Now().UTC(), Direction: DirectionClientToUpstream, Transport: TransportHTTP, PayloadKind: PayloadEmpty, DecodingStatus: DecodingIdentity, Disposition: DispositionRecorded, RequestID: requestAlias, GatewayEvent: &GatewayEventSummary{
-		RequestAlias: requestAlias, RequestedModel: safeRequestedModel(input.RequestedModel), RoutingSlot: safeEnum(input.RoutingSlot, "sol", "terra", "luna"), ActiveProfile: profileAlias, Provider: safeIdentifier(input.Provider), UpstreamModel: safeIdentifier(input.UpstreamModel), Mode: safeEnum(input.Mode, "normal", "thinking"), ConfiguredEffort: safeEnumDefault(input.ConfiguredEffort, "none", "high", "max"), Protocol: safeEnum(input.Protocol, "anthropic", "openai-chat", "google-genai", "openai-response"), Model: safeIdentifier(input.Model), Thinking: safeEnumDefault(input.Thinking, "none", "enabled", "disabled", "not_applicable"), EffectiveEffort: safeEnumDefault(input.EffectiveEffort, "none", "high", "max"),
+	direction := input.Direction
+	if direction == "" {
+		direction = DirectionClientToUpstream
+	}
+	var resolver *ResolverDiagnosticSummary
+	if input.Resolver != nil {
+		resolver = safeResolverDiagnostic(input.Resolver)
+	}
+	requestedModel := safeRequestedModel(input.RequestedModel)
+	if kind == ObservationRoutingResolutionDiagnosed {
+		requestedModel = ""
+	}
+	obs := Observation{Kind: kind, SessionID: a.session, Timestamp: time.Now().UTC(), Direction: direction, Transport: TransportHTTP, StatusCode: input.StatusCode, PayloadKind: PayloadEmpty, DecodingStatus: DecodingIdentity, Disposition: DispositionRecorded, RequestID: requestAlias, GatewayEvent: &GatewayEventSummary{
+		RequestAlias: requestAlias, RequestedModel: requestedModel, RoutingSlot: safeEnum(input.RoutingSlot, "sol", "terra", "luna"), ActiveProfile: profileAlias, Provider: safeIdentifier(input.Provider), UpstreamModel: safeIdentifier(input.UpstreamModel), Mode: safeEnum(input.Mode, "normal", "thinking"), ConfiguredEffort: safeEnumDefault(input.ConfiguredEffort, "none", "high", "max"), Protocol: safeEnum(input.Protocol, "anthropic", "openai-chat", "google-genai", "openai-response"), Model: safeIdentifier(input.Model), Thinking: safeEnumDefault(input.Thinking, "none", "enabled", "disabled", "not_applicable"), EffectiveEffort: safeEnumDefault(input.EffectiveEffort, "none", "high", "max"), CredentialState: safeCredentialState(input.CredentialState), Resolver: resolver,
+		Direction: direction, StatusCode: input.StatusCode, ExchangeIndex: input.ExchangeIndex, Streaming: input.Streaming,
 	}}
 	return a.buffer.Append(obs)
 }
@@ -361,10 +437,62 @@ func (a *Analyzer) aliasGatewayKey(m map[string]string, raw, prefix string, next
 }
 
 func sanitizeObservationKind(kind ObservationKind) ObservationKind {
-	if kind == ObservationRoutingResolved || kind == ObservationProviderRequestPrepared {
+	if kind == ObservationRoutingResolved || kind == ObservationRoutingResolutionDiagnosed || kind == ObservationProviderRequestPrepared || kind == ObservationProviderRequestDispatched || kind == ObservationProviderResponseReceived || kind == ObservationProviderResponseForwarded {
 		return kind
 	}
-	return ObservationProviderRequestPrepared
+	return ""
+}
+
+func safeResolverDiagnostic(input *ResolverDiagnosticInput) *ResolverDiagnosticSummary {
+	if input == nil {
+		return nil
+	}
+	return &ResolverDiagnosticSummary{
+		RequestedModel: safeResolverRequestedModel(input.RequestedModel), ServerInstance: safeServerInstance(input.ServerInstance), ResolverGeneration: input.ResolverGeneration, ResolverPresent: input.ResolverPresent,
+		InstallSource: safeEnumDefault(input.InstallSource, "none", "startup", "profile_refresh"), ConfigSource: safeEnumDefault(input.ConfigSource, "unknown", "file_seed", "persisted_store"),
+		ExtensionState: safeEnumDefault(input.ExtensionState, "unknown", "absent", "valid", "invalid"), ActiveProfileState: safeEnumDefault(input.ActiveProfileState, "unknown", "present_valid", "missing", "unknown", "invalid"), SlotCount: clampSlotCount(input.SlotCount),
+		SolState: safeEnumDefault(input.SolState, "unknown", "ready", "missing", "invalid", "reference_unresolved"), TerraState: safeEnumDefault(input.TerraState, "unknown", "ready", "missing", "invalid", "reference_unresolved"), LunaState: safeEnumDefault(input.LunaState, "unknown", "ready", "missing", "invalid", "reference_unresolved"),
+		NormalResult: safeEnumDefault(input.NormalResult, "unknown", "explicit_route", "slot_hit", "resolver_absent", "alias_miss", "slot_target_unresolved"), ResolvedSlot: safeEnumDefault(input.ResolvedSlot, "unknown", "sol", "terra", "luna", "unknown"), FallbackResult: safeEnumDefault(input.FallbackResult, "not_consulted", "hit", "miss", "target_unresolved", "not_consulted"), FinalStage: safeEnumDefault(input.FinalStage, "unknown", "explicit_route", "exact_slot", "fallback", "not_found"), KnownAlias: input.KnownAlias,
+	}
+}
+
+func clampSlotCount(value int) int {
+	if value < 0 {
+		return 0
+	}
+	if value > 3 {
+		return 3
+	}
+	return value
+}
+
+func safeResolverRequestedModel(value string) string {
+	switch value {
+	case "gpt-5.6-sol", "known_sol":
+		return "known_sol"
+	case "gpt-5.6-terra", "known_terra":
+		return "known_terra"
+	case "gpt-5.6-luna", "known_luna":
+		return "known_luna"
+	default:
+		return "unknown"
+	}
+}
+
+func safeServerInstance(value string) string {
+	if !strings.HasPrefix(value, "server#") || len(value) <= len("server#") || !digitsOnly(value[len("server#"):]) {
+		return "unknown"
+	}
+	return value
+}
+
+func digitsOnly(value string) bool {
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func safeRequestedModel(value string) string {
@@ -396,6 +524,15 @@ func safeEnumDefault(value, zero string, allowed ...string) string {
 		return zero
 	}
 	return safeEnum(value, allowed...)
+}
+
+func safeCredentialState(value string) string {
+	switch value {
+	case "available", "missing", "unavailable", "unverified":
+		return value
+	default:
+		return "unknown"
+	}
 }
 
 func (a *Analyzer) Snapshot(after uint64) ([]Observation, uint64) {

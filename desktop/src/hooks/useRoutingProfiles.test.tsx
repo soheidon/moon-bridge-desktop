@@ -217,12 +217,13 @@ describe("useRoutingProfiles", () => {
       },
     };
 
-    let result: { ok: boolean; snapshot: RoutingProfileSnapshot | null } | undefined;
+    let result: { ok: boolean; snapshot: RoutingProfileSnapshot | null; status: string } | undefined;
     await act(async () => {
       result = await get().saveProfileDetailed(input);
     });
 
     expect(result!.ok).toBe(true);
+    expect(result!.status).toBe("saved_applied");
     expect(result!.snapshot).toEqual(routingPayload().routingProfiles);
     expect(mocks.command).toHaveBeenCalledWith("SaveRoutingProfile", { profile: input });
 
@@ -253,6 +254,59 @@ describe("useRoutingProfiles", () => {
     expect(result!.ok).toBe(false);
     expect(result!.snapshot).toBeNull();
     expect(get().commandError).toMatchObject({ code: "routing_profile_save_failed" });
+    expect(get().saveStatus).toBe("save_failed");
+
+    unmount();
+  });
+
+  it("reads back a mutation-started save failure and reports persisted_not_applied", async () => {
+    mocks.command.mockResolvedValueOnce(routingPayload());
+    const { get, unmount } = await mountHook(runningSnapshot);
+
+    const input = {
+      id: "deepseek",
+      displayName: "DeepSeek v2",
+      slots: {
+        sol: { provider: "deepseek", upstreamModel: "deepseek-v4-flash", reasoning: "max" as const },
+        terra: { provider: "deepseek", upstreamModel: "deepseek-v4-flash", reasoning: "high" as const },
+        luna: { provider: "deepseek", upstreamModel: "deepseek-v4-flash", reasoning: null },
+      },
+    };
+    const persisted = {
+      routingProfiles: {
+        gatewayRunning: true,
+        activeProfileId: "deepseek",
+        profiles: [{
+          id: "deepseek",
+          displayName: "DeepSeek v2",
+          active: false,
+          configured: true,
+          slots: [
+            { id: "sol", displayName: "Sol", providerId: "deepseek", providerLabel: "DeepSeek", upstreamModel: "deepseek-v4-flash", reasoning: "max" },
+            { id: "terra", displayName: "Terra", providerId: "deepseek", providerLabel: "DeepSeek", upstreamModel: "deepseek-v4-flash", reasoning: "high" },
+            { id: "luna", displayName: "Luna", providerId: "deepseek", providerLabel: "DeepSeek", upstreamModel: "deepseek-v4-flash" },
+          ],
+        }],
+      },
+    };
+    mocks.command.mockRejectedValueOnce({
+      code: "routing_profile_save_failed",
+      message: "session refresh failed",
+      mutationStarted: true,
+      details: { saved: true },
+    });
+    mocks.command.mockResolvedValueOnce(persisted);
+
+    let result: { ok: boolean; snapshot: RoutingProfileSnapshot | null; status: string } | undefined;
+    await act(async () => {
+      result = await get().saveProfileDetailed(input);
+    });
+
+    expect(result!.ok).toBe(false);
+    expect(result!.status).toBe("persisted_not_applied");
+    expect(result!.snapshot).toEqual(persisted.routingProfiles);
+    expect(mocks.command).toHaveBeenLastCalledWith("LoadRoutingProfiles");
+    expect(get().saveStatus).toBe("persisted_not_applied");
 
     unmount();
   });

@@ -27,6 +27,7 @@ import (
 	"moonbridge/internal/secretstore"
 	"moonbridge/internal/service/configgraph"
 	"moonbridge/internal/service/desktopcontrol"
+	"moonbridge/internal/service/egressobservation"
 	"moonbridge/internal/service/provider"
 	"moonbridge/internal/service/proxy"
 	"moonbridge/internal/service/routingprofile"
@@ -46,6 +47,13 @@ import (
 // to server.RoutingProfileSlotResult.
 type routingProfileResolverAdapter struct {
 	resolver *routingprofile.SlotResolver
+}
+
+func (a *routingProfileResolverAdapter) SafeState() routingprofile.SafeResolverState {
+	if a == nil || a.resolver == nil {
+		return routingprofile.SafeResolverState{}
+	}
+	return a.resolver.SafeState()
 }
 
 func (a *routingProfileResolverAdapter) ResolveSlot(requestModel string) (server.RoutingProfileSlotResult, bool) {
@@ -155,6 +163,7 @@ func RunServerWithOptions(ctx context.Context, cfg config.Config, errors io.Writ
 
 func runTransform(ctx context.Context, cfg config.Config, errors io.Writer, options RunOptions) error {
 	var rt *runtime.Runtime
+	routingConfigSource := "file_seed"
 
 	// Shared credential resolver: the single place where stored ciphertext is
 	// decrypted, at the client-generation boundary. Its status registry feeds
@@ -204,7 +213,7 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer, opti
 			transport = transport.Clone()
 		}
 		transport.Proxy = http.ProxyURL(proxyURL)
-		proxyHTTPClient = &http.Client{Transport: transport}
+		proxyHTTPClient = egressobservation.WrapClient(&http.Client{Transport: transport})
 		slog.Info("egress proxy enabled", "url", cfg.EgressProxy)
 	}
 
@@ -300,12 +309,13 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer, opti
 	}
 	if cs != nil {
 		if dbCfg, loadErr := cs.LoadAll(); loadErr == nil {
-			if len(dbCfg.ProviderDefs) > 0 || len(dbCfg.Routes) > 0 {
+			if persistedConfigHasState(dbCfg) {
 				// DB has existing configuration: use it as the active config.
 				logger.Info("从持久化存储加载配置",
 					"providers", len(dbCfg.ProviderDefs),
 					"routes", len(dbCfg.Routes))
 				cfg = *dbCfg
+				routingConfigSource = "persisted_store"
 				if sqlStore, ok := cs.(*store.SQLiteConfigStore); ok {
 					migrationIssues = sqlStore.LastMigrationIssues()
 				}
@@ -439,7 +449,7 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer, opti
 	traceWtr := trace.NewFileWriter(tracer, errors)
 
 	// Build routing profile slot resolver from the config graph snapshot.
-	slotResolver := buildSlotResolver(cfg)
+	slotResolver, slotState := buildSlotResolverWithState(cfg)
 
 	var routingObservationSink server.RoutingObservationSink
 	if sink, ok := options.Traffic.(server.RoutingObservationSink); ok {
@@ -452,6 +462,8 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer, opti
 		TrafficRouting:         options.Traffic,
 		RoutingObservationSink: routingObservationSink,
 		RoutingProfileResolver: &routingProfileResolverAdapter{resolver: slotResolver},
+		RoutingProfileState:    slotState,
+		RoutingConfigSource:    routingConfigSource,
 		ChatClients:            chatClients,
 		GoogleClients:          googleClients,
 		OpenAIHTTPClient:       proxyHTTPClient,
@@ -483,13 +495,30 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer, opti
 	}
 	if options.DesktopControl != nil {
 		options.DesktopControl.WithRoutingProfileRefresh(func(cfg config.Config) {
-			resolver := buildSlotResolver(cfg)
+			resolver, _ := buildSlotResolverWithState(cfg)
 			handler.SwapRoutingProfileResolver(&routingProfileResolverAdapter{resolver: resolver})
 		})
+		options.DesktopControl.WithRoutingResolverStatus(func() any { return handler.RoutingResolverStatus() })
+		options.DesktopControl.WithRuntimeConfiguration(func() any { return handler.RuntimeConfigurationStatus() })
 	}
 	wrapped := http.Handler(handler)
 	wrapped = desktopcontrol.Wrap(wrapped, options.DesktopControl)
 	return runHTTPServer(ctx, cfg.Addr, wrapped, errors, sessionStats, options.OnListening)
+}
+
+// persistedConfigHasState reports whether ConfigStore returned a meaningful
+// persisted snapshot that must replace the file-config seed. Extensions are
+// included because routing_profiles can be the only changed resource after a
+// profile save; ignoring that state would build the startup resolver from the
+// stale YAML snapshot instead.
+func persistedConfigHasState(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	return len(cfg.ProviderDefs) > 0 ||
+		len(cfg.Routes) > 0 ||
+		len(cfg.Models) > 0 ||
+		len(cfg.Extensions) > 0
 }
 
 // buildSlotResolver builds a SlotResolver from the given config.
@@ -497,6 +526,11 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer, opti
 // resource). When the extension is absent, bootstrap from the moonbridge
 // route's provider (known-profile one-shot derivation, no auto-persist).
 func buildSlotResolver(cfg config.Config) *routingprofile.SlotResolver {
+	resolver, _ := buildSlotResolverWithState(cfg)
+	return resolver
+}
+
+func buildSlotResolverWithState(cfg config.Config) (*routingprofile.SlotResolver, routingprofile.SafeResolverState) {
 	graph := configgraph.BuildGraph(cfg, "")
 	resolver := routingprofile.NewSlotResolver(graph)
 	if resolver.BootstrapEligible() {
@@ -506,7 +540,7 @@ func buildSlotResolver(cfg config.Config) *routingprofile.SlotResolver {
 		}
 		resolver = routingprofile.NewSlotResolverFromDefaults(activeProfileID)
 	}
-	return resolver
+	return resolver, resolver.SafeState()
 }
 
 // resolveDefaultClient returns the provider client for the default key.

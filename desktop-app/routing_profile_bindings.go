@@ -28,6 +28,15 @@ type routingProfileController interface {
 	ActivateProfile(ctx context.Context, profileID string) (*routingprofile.Snapshot, error)
 }
 
+type routingProfileStoreError struct {
+	err             error
+	mutationStarted bool
+	saved           bool
+}
+
+func (e *routingProfileStoreError) Error() string { return e.err.Error() }
+func (e *routingProfileStoreError) Unwrap() error { return e.err }
+
 // LoadRoutingProfiles returns the current Codex routing profile table.
 // When the gateway is running, it reads through the live session's control
 // token. When stopped, it reads persisted config directly so the UI can still
@@ -226,6 +235,7 @@ func (a *App) ActivateRoutingSlot(req ActivateRoutingSlotRequest) DesktopCommand
 	if a.routingProfileRefresh != nil {
 		a.routingProfileRefresh(cfg)
 	}
+	a.emitStatus()
 	return okDesktop(&DesktopSnapshot{RoutingProfiles: desktopRoutingProfiles(snap)})
 }
 
@@ -277,6 +287,7 @@ func (a *App) ActivateProfile(req ActivateProfileRequest) DesktopCommandResult {
 	if a.routingProfileRefresh != nil {
 		a.routingProfileRefresh(cfg)
 	}
+	a.emitStatus()
 	return okDesktop(&DesktopSnapshot{RoutingProfiles: desktopRoutingProfiles(snap)})
 }
 
@@ -296,6 +307,17 @@ func (a *App) SaveRoutingProfile(input routingprofile.Input) DesktopCommandResul
 	if !ok {
 		snap, err := a.saveRoutingProfileToStore(input)
 		if err != nil {
+			var storeErr *routingProfileStoreError
+			if errors.As(err, &storeErr) {
+				return routingProfileError("SaveRoutingProfile", "save", "routing_profile_save_failed", &routingprofile.ServiceError{
+					Kind:            routingprofile.KindSaveRejected,
+					Message:         "routing profile save state requires read-back",
+					MutationStarted: storeErr.mutationStarted,
+					Details: map[string]any{
+						"saved": storeErr.saved,
+					},
+				})
+			}
 			return routingProfileError("SaveRoutingProfile", "save", "routing_profile_save_failed", err)
 		}
 		return okDesktop(&DesktopSnapshot{RoutingProfiles: desktopRoutingProfiles(snap)})
@@ -330,6 +352,7 @@ func (a *App) SaveRoutingProfile(input routingprofile.Input) DesktopCommandResul
 	if a.routingProfileRefresh != nil {
 		a.routingProfileRefresh(cfg)
 	}
+	a.emitStatus()
 	return okDesktop(&DesktopSnapshot{RoutingProfiles: desktopRoutingProfiles(snap)})
 }
 
@@ -372,50 +395,28 @@ func (a *App) saveRoutingProfileToStore(input routingprofile.Input) (*routingpro
 		}
 		dbCfg = reload
 	}
-	// routing_profiles extensionの更新
+	// Build the canonical routing_profiles extension config (active_profile +
+	// profiles) through the shared routingprofile builder so stopped saves cannot
+	// drift from the live Save path. A missing/dangling active_profile is
+	// established to the saved profile because the GUI has no Activate while the
+	// gateway is stopped.
 	ext, ok := dbCfg.Extensions["routing_profiles"]
 	if !ok {
 		ext = config.ExtensionSettings{}
 	}
-	if ext.RawConfig == nil {
-		ext.RawConfig = map[string]any{}
+	enabled := true
+	ext.Enabled = &enabled
+	ext.RawConfig = routingprofile.CanonicalConfigForSave(configgraph.BuildGraph(*dbCfg, ""), input)
+	if dbCfg.Extensions == nil {
+		dbCfg.Extensions = map[string]config.ExtensionSettings{}
 	}
-	tableRaw, _ := ext.RawConfig["table"].(map[string]any)
-	if tableRaw == nil {
-		tableRaw = map[string]any{}
-	}
-	profileRaw, _ := tableRaw[input.Profile.ID].(map[string]any)
-	if profileRaw == nil {
-		profileRaw = map[string]any{}
-	}
-	profileRaw["display_name"] = input.Profile.DisplayName
-	slotsRaw, _ := profileRaw["slots"].(map[string]any)
-	if slotsRaw == nil {
-		slotsRaw = map[string]any{}
-	}
-	for slotID, slotInput := range input.Profile.Slots {
-		slotRaw, _ := slotsRaw[slotID].(map[string]any)
-		if slotRaw == nil {
-			slotRaw = map[string]any{}
-		}
-		slotRaw["provider"] = slotInput.Provider
-		slotRaw["upstream_model"] = slotInput.UpstreamModel
-		slotRaw["mode"] = slotInput.Mode
-		if slotInput.Reasoning != nil {
-			slotRaw["reasoning"] = *slotInput.Reasoning
-		}
-		slotsRaw[slotID] = slotRaw
-	}
-	profileRaw["slots"] = slotsRaw
-	tableRaw[input.Profile.ID] = profileRaw
-	ext.RawConfig["table"] = tableRaw
 	dbCfg.Extensions["routing_profiles"] = ext
 	if _, err := cs.SaveConfig(context.Background(), dbCfg); err != nil {
 		return nil, err
 	}
 	reloaded, err := cs.LoadAll()
 	if err != nil {
-		return nil, err
+		return nil, &routingProfileStoreError{err: err, mutationStarted: true, saved: true}
 	}
 	graph := configgraph.BuildGraph(*reloaded, "")
 	snap := routingprofile.SnapshotFromGraph(graph, false)

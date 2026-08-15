@@ -19,6 +19,7 @@ import (
 	"moonbridge/internal/protocol/chat"
 	"moonbridge/internal/protocol/google"
 	openai "moonbridge/internal/protocol/openai"
+	"moonbridge/internal/service/egressobservation"
 	"moonbridge/internal/service/provider"
 	"moonbridge/internal/service/stats"
 	mbtrace "moonbridge/internal/service/trace"
@@ -233,6 +234,8 @@ func (s *Server) handleWithAdapters(
 		return
 	}
 	s.recordProviderRequestPrepared(ctx, openAIReq.Model, preferred, upstreamAny)
+	ctx = s.withProviderEgress(ctx, openAIReq.Model, preferred, openAIReq.Stream, upstreamAny)
+	r = r.WithContext(ctx)
 	// Protocol-specific type assertion and upstream call.
 	var coreResp *format.CoreResponse
 	switch preferred.Protocol {
@@ -722,7 +725,11 @@ func (s *Server) handleWithAdapters(
 	// ------------------------------------------------------------------
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(out)
+	if err := json.NewEncoder(w).Encode(out); err != nil {
+		adapterHookErr = "write_response"
+		return
+	}
+	egressobservation.MarkForwarded(ctx)
 	adapterCompleted = true
 
 	// Record trace with upstream details and final output.
@@ -1605,6 +1612,7 @@ func (s *Server) handleAdapterStream(
 	// Track usage from the final response.completed event.
 	var finalUsage openai.Usage
 	var finalResp *openai.Response
+	streamWriteOK := true
 	for ev := range streamChan {
 		if ev.Event == "response.completed" {
 			if lf, ok := ev.Data.(openai.ResponseLifecycleEvent); ok {
@@ -1615,8 +1623,12 @@ func (s *Server) handleAdapterStream(
 		}
 		if err := writeSSE(w, ev); err != nil {
 			log.Warn("adapter stream: SSE write failed, aborting stream", "error", err)
+			streamWriteOK = false
 			break
 		}
+	}
+	if streamWriteOK && finalResp != nil {
+		egressobservation.MarkForwarded(ctx)
 	}
 
 	// Record usage statistics after stream completes.
@@ -1893,6 +1905,7 @@ func (s *Server) writeCoreResponseAsOpenAIStream(
 	w.WriteHeader(http.StatusOK)
 
 	var finalResp *openai.Response
+	streamWriteOK := true
 	for ev := range streamChan {
 		if ev.Event == "response.completed" {
 			if lf, ok := ev.Data.(openai.ResponseLifecycleEvent); ok {
@@ -1902,8 +1915,12 @@ func (s *Server) writeCoreResponseAsOpenAIStream(
 		}
 		if err := writeSSE(w, ev); err != nil {
 			log.Warn("adapter stream visual fallback: SSE write failed", "error", err)
+			streamWriteOK = false
 			break
 		}
+	}
+	if streamWriteOK && finalResp != nil {
+		egressobservation.MarkForwarded(ctx)
 	}
 
 	if finalResp != nil {

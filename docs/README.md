@@ -22,3 +22,4 @@ Moon Bridge 是一个将 OpenAI Responses API（Codex CLI 原生协议）转换�
 | [Extension 一览](extensions-overview.md) | deepseek_v4、visual、注入式 Web Search 模块，以及开发中的持久化/metrics 能力说明 |
 | [配置迁移](config-migration.md) | 旧配置迁移脚本使用说明 |
 | [已知问题](known-issues.md) | 当前已知问题与限制（E2E、Google tool-use、Windows race 验证、placeholder provider 等） |
+| [Windows CI・push・release指針](WINDOWS_CI_RELEASE_GUIDE.md) | Windows Gate、path安全性、push前検証、release順序と完了条件 |

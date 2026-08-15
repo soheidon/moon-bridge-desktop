@@ -14,6 +14,7 @@ import (
 	"moonbridge/internal/config"
 	"moonbridge/internal/modelref"
 	"moonbridge/internal/protocol/anthropic"
+	"moonbridge/internal/service/egressobservation"
 )
 
 // HTTPConfig controls the HTTP connection pool for a provider.
@@ -212,6 +213,7 @@ func newProviderManager(providerCfgs map[string]ProviderConfig, routes map[strin
 		if httpClient == nil {
 			httpClient = newHTTPClient(cfg.HTTP)
 		}
+		httpClient = egressobservation.WrapClient(httpClient)
 		if issue, blocked := credentialIssueFor(issues, key); blocked {
 			pm.clients[key] = &UnavailableProviderClient{Code: issue.ErrorCode}
 			continue

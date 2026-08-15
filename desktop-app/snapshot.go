@@ -64,6 +64,38 @@ type SafeGatewaySnapshot struct {
 	Listening bool   `json:"listening"`
 }
 
+// RuntimeConfigurationSnapshot is the Desktop-safe view of the currently
+// installed Gateway configuration. It intentionally contains no raw config,
+// profile, provider, credential, or connection identifiers.
+type RuntimeConfigurationSnapshot struct {
+	State                 string                 `json:"state"`
+	ServerInstance        string                 `json:"serverInstance,omitempty"`
+	ResolverGeneration    uint64                 `json:"resolverGeneration"`
+	InstallSource         string                 `json:"installSource"`
+	ConfigSource          string                 `json:"configSource"`
+	ResolverPresent       bool                   `json:"resolverPresent"`
+	RoutingExtensionState string                 `json:"routingExtensionState"`
+	ActiveProfileState    string                 `json:"activeProfileState"`
+	ReadySlotCount        int                    `json:"readySlotCount"`
+	CredentialState       string                 `json:"credentialState"`
+	Slots                 RuntimeSlotSnapshotSet `json:"slots"`
+}
+
+type RuntimeSlotSnapshotSet struct {
+	Sol   RuntimeSlotSnapshot `json:"sol"`
+	Terra RuntimeSlotSnapshot `json:"terra"`
+	Luna  RuntimeSlotSnapshot `json:"luna"`
+}
+
+type RuntimeSlotSnapshot struct {
+	State            string `json:"state"`
+	Provider         string `json:"provider,omitempty"`
+	UpstreamModel    string `json:"upstreamModel,omitempty"`
+	Mode             string `json:"mode,omitempty"`
+	ConfiguredEffort string `json:"configuredEffort,omitempty"`
+	CredentialState  string `json:"credentialState,omitempty"`
+}
+
 // TrafficAnalysisSnapshot is the deliberately reduced Wails view of the
 // long-lived Capture service. It contains state and counts only; identities,
 // addresses, hashes, transaction IDs, and raw errors are never exposed.
@@ -136,18 +168,44 @@ type TrafficObservation struct {
 }
 
 type TrafficGatewayEvent struct {
-	RequestAlias     string `json:"requestAlias"`
-	RequestedModel   string `json:"requestedModel,omitempty"`
-	RoutingSlot      string `json:"routingSlot,omitempty"`
-	ActiveProfile    string `json:"activeProfile,omitempty"`
-	Provider         string `json:"provider,omitempty"`
-	UpstreamModel    string `json:"upstreamModel,omitempty"`
-	Mode             string `json:"mode,omitempty"`
-	ConfiguredEffort string `json:"configuredEffort,omitempty"`
-	Protocol         string `json:"protocol,omitempty"`
-	Model            string `json:"model,omitempty"`
-	Thinking         string `json:"thinking,omitempty"`
-	EffectiveEffort  string `json:"effectiveEffort,omitempty"`
+	RequestAlias     string                     `json:"requestAlias"`
+	RequestedModel   string                     `json:"requestedModel,omitempty"`
+	RoutingSlot      string                     `json:"routingSlot,omitempty"`
+	ActiveProfile    string                     `json:"activeProfile,omitempty"`
+	Provider         string                     `json:"provider,omitempty"`
+	UpstreamModel    string                     `json:"upstreamModel,omitempty"`
+	Mode             string                     `json:"mode,omitempty"`
+	ConfiguredEffort string                     `json:"configuredEffort,omitempty"`
+	Protocol         string                     `json:"protocol,omitempty"`
+	Model            string                     `json:"model,omitempty"`
+	Thinking         string                     `json:"thinking,omitempty"`
+	EffectiveEffort  string                     `json:"effectiveEffort,omitempty"`
+	CredentialState  string                     `json:"credentialState,omitempty"`
+	Direction        string                     `json:"direction,omitempty"`
+	StatusCode       int                        `json:"statusCode,omitempty"`
+	ExchangeIndex    uint64                     `json:"exchangeIndex,omitempty"`
+	Streaming        bool                       `json:"streaming,omitempty"`
+	Resolver         *TrafficResolverDiagnostic `json:"resolver,omitempty"`
+}
+
+type TrafficResolverDiagnostic struct {
+	RequestedModel     string `json:"requestedModel,omitempty"`
+	ServerInstance     string `json:"serverInstance,omitempty"`
+	ResolverGeneration uint64 `json:"resolverGeneration,omitempty"`
+	ResolverPresent    bool   `json:"resolverPresent"`
+	InstallSource      string `json:"installSource,omitempty"`
+	ConfigSource       string `json:"configSource,omitempty"`
+	ExtensionState     string `json:"extensionState,omitempty"`
+	ActiveProfileState string `json:"activeProfileState,omitempty"`
+	SlotCount          int    `json:"slotCount"`
+	SolState           string `json:"solState,omitempty"`
+	TerraState         string `json:"terraState,omitempty"`
+	LunaState          string `json:"lunaState,omitempty"`
+	NormalResult       string `json:"normalResult,omitempty"`
+	ResolvedSlot       string `json:"resolvedSlot,omitempty"`
+	FallbackResult     string `json:"fallbackResult,omitempty"`
+	FinalStage         string `json:"finalStage,omitempty"`
+	KnownAlias         bool   `json:"knownAlias"`
 }
 
 type TrafficUsageSummary struct {
@@ -580,7 +638,12 @@ func safeTrafficGatewayEvent(event *trafficanalysis.GatewayEventSummary) *Traffi
 	if event == nil {
 		return nil
 	}
-	return &TrafficGatewayEvent{RequestAlias: event.RequestAlias, RequestedModel: event.RequestedModel, RoutingSlot: event.RoutingSlot, ActiveProfile: event.ActiveProfile, Provider: event.Provider, UpstreamModel: event.UpstreamModel, Mode: event.Mode, ConfiguredEffort: event.ConfiguredEffort, Protocol: event.Protocol, Model: event.Model, Thinking: event.Thinking, EffectiveEffort: event.EffectiveEffort}
+	var resolver *TrafficResolverDiagnostic
+	if event.Resolver != nil {
+		r := event.Resolver
+		resolver = &TrafficResolverDiagnostic{RequestedModel: r.RequestedModel, ServerInstance: r.ServerInstance, ResolverGeneration: r.ResolverGeneration, ResolverPresent: r.ResolverPresent, InstallSource: r.InstallSource, ConfigSource: r.ConfigSource, ExtensionState: r.ExtensionState, ActiveProfileState: r.ActiveProfileState, SlotCount: r.SlotCount, SolState: r.SolState, TerraState: r.TerraState, LunaState: r.LunaState, NormalResult: r.NormalResult, ResolvedSlot: r.ResolvedSlot, FallbackResult: r.FallbackResult, FinalStage: r.FinalStage, KnownAlias: r.KnownAlias}
+	}
+	return &TrafficGatewayEvent{RequestAlias: event.RequestAlias, RequestedModel: event.RequestedModel, RoutingSlot: event.RoutingSlot, ActiveProfile: event.ActiveProfile, Provider: event.Provider, UpstreamModel: event.UpstreamModel, Mode: event.Mode, ConfiguredEffort: event.ConfiguredEffort, Protocol: event.Protocol, Model: event.Model, Thinking: event.Thinking, EffectiveEffort: event.EffectiveEffort, CredentialState: event.CredentialState, Direction: string(event.Direction), StatusCode: event.StatusCode, ExchangeIndex: event.ExchangeIndex, Streaming: event.Streaming, Resolver: resolver}
 }
 
 // ---- error conversion ----

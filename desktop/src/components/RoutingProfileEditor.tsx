@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { useRoutingProfiles } from "../hooks/useRoutingProfiles";
-import type { RoutingMode, RoutingModelCapability, RoutingProfileCard, RoutingProfileInput, RoutingReasoning, RoutingSlot, RoutingSlotId, RoutingSlotInput } from "../types/routingProfile";
+import type { RoutingMode, RoutingModelCapability, RoutingProfileCard, RoutingProfileInput, RoutingProfileSaveStatus, RoutingReasoning, RoutingSlot, RoutingSlotId, RoutingSlotInput } from "../types/routingProfile";
 
 type Routing = ReturnType<typeof useRoutingProfiles>;
 
@@ -185,6 +185,7 @@ export function RoutingProfileEditor({ routing, capabilities = [], embedded = fa
   const selected = drafts[selectedId];
   const selectedProfile = profiles.find((p) => p.id === selectedId);
   const running = routing.gatewayRunning;
+  const saveStatus = (routing as Routing & { saveStatus?: RoutingProfileSaveStatus | null }).saveStatus;
   // Fail-closed: never allow saving a profile whose snapshot can't provide a
   // provider for every slot (would otherwise persist empty provider ids).
   const missingProvider = selectedProfile ? SLOT_IDS.some((slotId) => providerForSlot(selectedProfile, slotId) === "") : false;
@@ -239,6 +240,9 @@ export function RoutingProfileEditor({ routing, capabilities = [], embedded = fa
       if (routing.saveProfileDetailed) {
         const result = await routing.saveProfileDetailed(input);
         if (result.ok && result.snapshot) {
+          lastSavedRef.current[selectedId] = serialized;
+          setSaveFailedId(null);
+        } else if (result.snapshot && (result.status === "persisted_not_applied" || result.status === "saved_stopped")) {
           lastSavedRef.current[selectedId] = serialized;
           setSaveFailedId(null);
         } else {
@@ -353,6 +357,12 @@ export function RoutingProfileEditor({ routing, capabilities = [], embedded = fa
           {missingProvider && <p className="error-text">プロファイル設定を読み込めないため保存できません。</p>}
 
           <div className="deepseek-actions">
+            {hasPending && !saveFailed && <span className="deepseek-hint">未保存の変更があります（Gatewayには未適用）</span>}
+            {saveStatus === "save_failed" && <span className="error-text">保存に失敗しました。今回の編集はGatewayへ適用されていません。</span>}
+            {saveStatus === "persisted_not_applied" && <span className="error-text">保存済みですが、Gatewayには未適用です。Gatewayの再起動が必要です。</span>}
+            {saveStatus === "state_unknown" && <span className="error-text">保存状態を確認できません。編集内容は保持されています。</span>}
+            {saveStatus === "saved_stopped" && !hasPending && <span className="deepseek-hint">保存済み（Gateway停止中）</span>}
+            {saveStatus === "saved_applied" && !hasPending && selectedProfile?.active && running && <span className="success-text">保存済み・Gatewayへ適用済み</span>}
             {routing.saving && <span className="deepseek-hint">保存中…</span>}
             {saveFailed && (
               <button type="button" className="routing-editor-retry" onClick={handleRetry}>保存を再試行</button>

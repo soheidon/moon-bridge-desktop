@@ -90,6 +90,91 @@ func TestRunServerSeedsEmptyConfigStoreBeforeServingConfigGraph(t *testing.T) {
 	}
 }
 
+func TestPersistedConfigWithExtensionReplacesFileSeed(t *testing.T) {
+	enabled := true
+	tests := []struct {
+		name string
+		cfg  *config.Config
+		want bool
+	}{
+		{
+			name: "routing profile extension is meaningful state",
+			cfg: &config.Config{Extensions: map[string]config.ExtensionSettings{
+				"routing_profiles": {Enabled: &enabled},
+			}},
+			want: true,
+		},
+		{
+			name: "persisted routes are meaningful state",
+			cfg:  &config.Config{Routes: map[string]config.RouteEntry{"moonbridge": {Provider: "deepseek"}}},
+			want: true,
+		},
+		{
+			name: "empty snapshot does not replace file seed",
+			cfg:  &config.Config{},
+			want: false,
+		},
+		{
+			name: "nil snapshot does not replace file seed",
+			cfg:  nil,
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := persistedConfigHasState(tt.cfg); got != tt.want {
+				t.Fatalf("persistedConfigHasState() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildSlotResolverUsesPersistedActiveProfileForAllAliases(t *testing.T) {
+	enabled := true
+	maxEffort := "max"
+	highEffort := "high"
+	cfg := config.Config{Extensions: map[string]config.ExtensionSettings{
+		"routing_profiles": {
+			Enabled: &enabled,
+			RawConfig: map[string]any{
+				"active_profile": "persisted",
+				"profiles": map[string]any{
+					"persisted": map[string]any{
+						"display_name": "Persisted",
+						"slots": map[string]any{
+							"sol":   map[string]any{"provider": "deepseek", "upstream_model": "deepseek-v4-flash", "mode": "thinking", "reasoning": &maxEffort},
+							"terra": map[string]any{"provider": "deepseek", "upstream_model": "deepseek-v4-flash", "mode": "thinking", "reasoning": &highEffort},
+							"luna":  map[string]any{"provider": "deepseek", "upstream_model": "deepseek-v4-flash", "mode": "normal"},
+						},
+					},
+				},
+			},
+		},
+	}}
+	resolver := buildSlotResolver(cfg)
+	cases := []struct {
+		model string
+		slot  string
+		mode  string
+	}{
+		{model: "gpt-5.6-sol", slot: "sol", mode: "thinking"},
+		{model: "gpt-5.6-terra", slot: "terra", mode: "thinking"},
+		{model: "gpt-5.6-luna", slot: "luna", mode: "normal"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.model, func(t *testing.T) {
+			result, ok := resolver.ResolveSlot(tc.model)
+			if !ok {
+				t.Fatalf("ResolveSlot(%q) failed", tc.model)
+			}
+			if result.SlotID != tc.slot || result.Mode != tc.mode || result.ProviderKey != "deepseek" || result.UpstreamModel != "deepseek-v4-flash" {
+				t.Fatalf("ResolveSlot(%q) = %#v", tc.model, result)
+			}
+		})
+	}
+}
+
 func TestCaptureTraceDirectoriesUseSession(t *testing.T) {
 	responseTracer := mbtrace.New(captureResponseTraceConfig(true))
 	if got, want := responseTracer.Directory(), filepath.Join("data", "trace", "Capture", "Response", responseTracer.SessionID()); got != want {

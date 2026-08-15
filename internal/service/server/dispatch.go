@@ -17,6 +17,7 @@ import (
 	"moonbridge/internal/extension/plugin"
 	"moonbridge/internal/logger"
 	"moonbridge/internal/protocol/openai"
+	"moonbridge/internal/service/egressobservation"
 	"moonbridge/internal/service/provider"
 	"moonbridge/internal/service/stats"
 
@@ -186,7 +187,7 @@ func (server *Server) handleResponses(writer http.ResponseWriter, request *http.
 
 	record.Model = responsesRequest.Model
 	request = withRoutingObservationContext(request, requestCorrelation)
-	resolvedRoute, routingAlias, resolveErr := server.resolveModelOrFallback(responsesRequest.Model, relayMarker)
+	resolvedRoute, routingAlias, resolveErr := server.resolveModelOrFallbackContext(request.Context(), responsesRequest.Model, relayMarker, true)
 	if resolveErr == nil {
 		var candidateInfo string
 		for i, c := range resolvedRoute.Candidates {
@@ -528,6 +529,7 @@ func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *
 		}
 		upstreamReq.Header.Set("Content-Type", "application/json")
 		upstreamReq.Header.Set("Authorization", "Bearer "+apiKey)
+		upstreamReq = upstreamReq.WithContext(server.withProviderEgress(upstreamReq.Context(), responsesRequest.Model, candidate, responsesRequest.Stream, &upstreamRequest))
 
 		client := server.openAIHTTP
 		if client == nil {
@@ -596,6 +598,9 @@ func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *
 			hookErr = "copy upstream response"
 			log.Error("复制上游响应失败", "error", err)
 			return
+		}
+		if upstreamResp.StatusCode >= 200 && upstreamResp.StatusCode < 300 && (!responsesRequest.Stream || bytes.Contains(captured.Bytes(), []byte("response.completed")) || bytes.Contains(captured.Bytes(), []byte("[DONE]"))) {
+			egressobservation.MarkForwarded(upstreamReq.Context())
 		}
 
 		if traceEnabled {

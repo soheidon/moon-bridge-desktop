@@ -20,13 +20,15 @@ const APIVersion = 2
 // Desktop shell. It is intentionally independent from Moon Bridge's normal
 // management API so it works in every server mode.
 type Control struct {
-	InstanceID      string
-	Token           string
-	ServerToken     string
-	PID             int
-	StartedAt       time.Time
-	trafficAnalysis http.Handler
-	trafficStatus   func() any
+	InstanceID            string
+	Token                 string
+	ServerToken           string
+	PID                   int
+	StartedAt             time.Time
+	trafficAnalysis       http.Handler
+	trafficStatus         func() any
+	routingResolverStatus func() any
+	runtimeConfiguration  func() any
 
 	routingProfileRefresh func(cfg config.Config)
 
@@ -51,6 +53,20 @@ func (c *Control) WithTrafficAnalysis(handler http.Handler) *Control {
 // to the traffic-analysis package.
 func (c *Control) WithTrafficAnalysisStatus(status func() any) *Control {
 	c.trafficStatus = status
+	return c
+}
+
+// WithRoutingResolverStatus exposes only the reduced, secret-safe resolver
+// lifecycle state through the authenticated system status endpoint.
+func (c *Control) WithRoutingResolverStatus(status func() any) *Control {
+	c.routingResolverStatus = status
+	return c
+}
+
+// WithRuntimeConfiguration exposes the effective, secret-safe runtime
+// configuration through the authenticated system status endpoint.
+func (c *Control) WithRuntimeConfiguration(status func() any) *Control {
+	c.runtimeConfiguration = status
 	return c
 }
 
@@ -123,14 +139,16 @@ func Wrap(next http.Handler, control *Control) http.Handler {
 		switch {
 		case r.URL.Path == "/api/v1/system/status" && r.Method == http.MethodGet:
 			writeJSON(w, http.StatusOK, map[string]any{
-				"status":       "ok",
-				"desktop_mode": true,
-				"instance_id":  control.InstanceID,
-				"pid":          control.PID,
-				"started_at":   control.StartedAt,
-				"api_version":  APIVersion,
-				"capabilities": append([]string{"config_init", "instance_identity", "graceful_shutdown"}, trafficCapability(control)...),
-				"capture":      trafficStatus(control),
+				"status":                "ok",
+				"desktop_mode":          true,
+				"instance_id":           control.InstanceID,
+				"pid":                   control.PID,
+				"started_at":            control.StartedAt,
+				"api_version":           APIVersion,
+				"capabilities":          append([]string{"config_init", "instance_identity", "graceful_shutdown"}, trafficCapability(control)...),
+				"capture":               trafficStatus(control),
+				"routing_resolver":      routingResolverStatus(control),
+				"runtime_configuration": runtimeConfiguration(control),
 			})
 		case r.URL.Path == "/api/v1/system/shutdown" && r.Method == http.MethodPost:
 			writeJSON(w, http.StatusAccepted, map[string]any{"status": "shutting_down"})
@@ -157,6 +175,20 @@ func trafficStatus(control *Control) any {
 		return nil
 	}
 	return control.trafficStatus()
+}
+
+func routingResolverStatus(control *Control) any {
+	if control.routingResolverStatus == nil {
+		return nil
+	}
+	return control.routingResolverStatus()
+}
+
+func runtimeConfiguration(control *Control) any {
+	if control.runtimeConfiguration == nil {
+		return nil
+	}
+	return control.runtimeConfiguration()
 }
 
 func validBearer(r *http.Request, expected string) bool {

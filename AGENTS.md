@@ -18,6 +18,7 @@
 ## Verification and reporting
 
 - Run the verification required by the active plan after each implementation boundary.
+- Before Windows Desktop pushes or releases, follow `docs/WINDOWS_CI_RELEASE_GUIDE.md`; delivery is incomplete until required GitHub Actions jobs are green.
 - Update Progress, Discoveries, Decision Log, and Verification in the plan with factual results.
 - Do not mark work complete until all acceptance criteria pass.
 - If blocked, record the blocker and leave the plan incomplete.

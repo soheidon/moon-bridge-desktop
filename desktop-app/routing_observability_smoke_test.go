@@ -289,7 +289,7 @@ extensions:
 		RecoveryDir:   recoveryDir,
 		CodexHome:     codexHome,
 		BackupDir:     backupDir,
-		TrafficLogDir: filepath.Join(root, "logs"),
+		TrafficLogDir: filepath.Join(root, "logs", "traffic-analysis"),
 		AppDataRoot:   filepath.Join(root, "appdata"),
 	}, filepath.Join(recoveryDir, "recovery-state-v2.json"))
 	if err != nil {
@@ -305,7 +305,7 @@ extensions:
 		BackupDir:    backupDir,
 		EmitEvents:   noopEmit,
 	})
-	app.trafficLogDir = filepath.Join(root, "logs")
+	app.trafficLogDir = filepath.Join(root, "logs", "traffic-analysis")
 	app.startup(context.Background())
 	defer app.shutdown(context.Background())
 
@@ -316,9 +316,22 @@ extensions:
 	if _, err := app.ensureTrafficTransaction(); err != nil {
 		t.Fatalf("ensureTrafficTransaction() error = %v", err)
 	}
+	beforeResolverStatus := authedStatusBody(t, app.session.Address, app.session.ControlToken)["routing_resolver"]
+	beforeResolverJSON, err := json.Marshal(beforeResolverStatus)
+	if err != nil {
+		t.Fatalf("marshal startup resolver status: %v", err)
+	}
 	trafficStarted := app.StartTrafficAnalysis()
 	if !trafficStarted.OK || trafficStarted.Value == nil || trafficStarted.Value.TrafficAnalysis == nil {
 		t.Fatalf("StartTrafficAnalysis() = %#v, want success", trafficStarted)
+	}
+	afterResolverStatus := authedStatusBody(t, app.session.Address, app.session.ControlToken)["routing_resolver"]
+	afterResolverJSON, err := json.Marshal(afterResolverStatus)
+	if err != nil {
+		t.Fatalf("marshal post-capture resolver status: %v", err)
+	}
+	if string(beforeResolverJSON) != string(afterResolverJSON) {
+		t.Fatalf("Traffic Analysis changed resolver status: before=%s after=%s", beforeResolverJSON, afterResolverJSON)
 	}
 	listen := app.traffic.Status().ListeningAddress
 	if listen == "" {
@@ -362,7 +375,15 @@ extensions:
 				events = append(events, item)
 			}
 		}
-		if len(events) != 2 || events[0].Kind != trafficanalysis.ObservationRoutingResolved || events[1].Kind != trafficanalysis.ObservationProviderRequestPrepared {
+		wantKinds := []trafficanalysis.ObservationKind{
+			trafficanalysis.ObservationRoutingResolutionDiagnosed,
+			trafficanalysis.ObservationRoutingResolved,
+			trafficanalysis.ObservationProviderRequestPrepared,
+			trafficanalysis.ObservationProviderRequestDispatched,
+			trafficanalysis.ObservationProviderResponseReceived,
+			trafficanalysis.ObservationProviderResponseForwarded,
+		}
+		if len(events) != len(wantKinds) {
 			var safeEvents []string
 			for _, item := range events {
 				if item.GatewayEvent != nil {
@@ -371,13 +392,27 @@ extensions:
 			}
 			t.Fatalf("events for %s alias %s = %v, want ordered routing/prepared pair", model, alias, safeEvents)
 		}
-		resolved := events[0].GatewayEvent
-		prepared := events[1].GatewayEvent
+		for i, wantKind := range wantKinds {
+			if events[i].Kind != wantKind {
+				t.Fatalf("events for %s alias %s[%d] = %s, want %s", model, alias, i, events[i].Kind, wantKind)
+			}
+		}
+		diagnostic := events[0].GatewayEvent
+		if diagnostic.Resolver == nil || diagnostic.Resolver.RequestedModel != map[string]string{"gpt-5.6-luna": "known_luna", "gpt-5.6-sol": "known_sol", "gpt-5.6-terra": "known_terra"}[model] || diagnostic.Resolver.NormalResult != "slot_hit" || diagnostic.Resolver.FinalStage != "exact_slot" || diagnostic.Resolver.ResolvedSlot != strings.TrimPrefix(model, "gpt-5.6-") {
+			t.Fatalf("resolver diagnostic %s = %#v", model, diagnostic)
+		}
+		resolved := events[1].GatewayEvent
+		prepared := events[2].GatewayEvent
 		if resolved.RequestedModel != model || resolved.RoutingSlot != strings.TrimPrefix(strings.TrimPrefix(model, "gpt-5.6-"), "") || resolved.Mode != map[string]string{"gpt-5.6-luna": "normal", "gpt-5.6-sol": "thinking", "gpt-5.6-terra": "thinking"}[model] {
 			t.Fatalf("resolved %s = %#v", model, resolved)
 		}
 		if prepared.RequestedModel != model || prepared.RoutingSlot != resolved.RoutingSlot || prepared.Mode != resolved.Mode || prepared.Thinking != wantThinking[model] || prepared.EffectiveEffort != wantEffort[model] {
 			t.Fatalf("prepared %s = %#v", model, prepared)
+		}
+		for _, event := range events[3:] {
+			if event.GatewayEvent.RequestedModel != model || event.GatewayEvent.RoutingSlot != resolved.RoutingSlot || event.GatewayEvent.Mode != resolved.Mode {
+				t.Fatalf("egress %s = %#v, want request metadata propagated", model, event.GatewayEvent)
+			}
 		}
 		responseObserved := false
 		for _, item := range items {

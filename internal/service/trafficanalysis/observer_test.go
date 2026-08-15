@@ -574,20 +574,37 @@ func TestGatewayEventsAliasAndSanitizeWithoutRawKeys(t *testing.T) {
 	}
 	first := analyzer.RecordGatewayEvent(GatewayEventInput{Kind: ObservationRoutingResolved, CorrelationKey: "opaque-request-secret", ProfileID: "profile-secret", RequestedModel: "gpt-5.6-luna", RoutingSlot: "luna", Provider: "deepseek", UpstreamModel: "deepseek-v4-flash", Mode: "normal", ConfiguredEffort: ""})
 	second := analyzer.RecordGatewayEvent(GatewayEventInput{Kind: ObservationProviderRequestPrepared, CorrelationKey: "opaque-request-secret", ProfileID: "profile-secret", Provider: "deepseek", Protocol: "anthropic", Model: "deepseek-v4-flash", Thinking: "disabled"})
+	third := analyzer.RecordGatewayEvent(GatewayEventInput{Kind: ObservationProviderResponseReceived, CorrelationKey: "opaque-request-secret", ProfileID: "profile-secret", Provider: "deepseek", Protocol: "anthropic", Model: "deepseek-v4-flash", StatusCode: 200, ExchangeIndex: 1})
+	diagnostic := analyzer.RecordGatewayEvent(GatewayEventInput{Kind: ObservationRoutingResolutionDiagnosed, CorrelationKey: "opaque-request-secret", Resolver: &ResolverDiagnosticInput{RequestedModel: "gpt-5.6-luna", ServerInstance: "server#7", ResolverGeneration: 4, ResolverPresent: true, InstallSource: "startup", ConfigSource: "persisted_store", ExtensionState: "valid", ActiveProfileState: "present_valid", SlotCount: 3, SolState: "ready", TerraState: "ready", LunaState: "ready", NormalResult: "slot_hit", ResolvedSlot: "luna", FallbackResult: "not_consulted", FinalStage: "exact_slot", KnownAlias: true}})
 	if first.GatewayEvent == nil || second.GatewayEvent == nil || first.GatewayEvent.RequestAlias != second.GatewayEvent.RequestAlias {
 		t.Fatalf("event aliases = %#v / %#v, want correlated", first.GatewayEvent, second.GatewayEvent)
 	}
 	if first.GatewayEvent.ActiveProfile != "profile#1" {
 		t.Fatalf("profile alias = %q, want profile#1", first.GatewayEvent.ActiveProfile)
 	}
+	if third.GatewayEvent == nil || third.GatewayEvent.StatusCode != 200 || third.GatewayEvent.ExchangeIndex != 1 {
+		t.Fatalf("egress event summary = %#v", third.GatewayEvent)
+	}
+	if diagnostic.GatewayEvent == nil || diagnostic.GatewayEvent.Resolver == nil || diagnostic.GatewayEvent.Resolver.RequestedModel != "known_luna" || diagnostic.GatewayEvent.RequestAlias != first.GatewayEvent.RequestAlias {
+		t.Fatalf("resolver diagnostic = %#v", diagnostic.GatewayEvent)
+	}
 	encoded, err := json.Marshal(first)
 	if err != nil {
 		t.Fatal(err)
 	}
 	text := string(encoded)
-	for _, sentinel := range []string{"opaque-request-secret", "profile-secret", "Authorization", "api-key"} {
+	for _, sentinel := range []string{"opaque-request-secret", "profile-secret", "Authorization", "api-key", "C:\\Users\\secret", "https://secret.example"} {
 		if strings.Contains(text, sentinel) {
 			t.Fatalf("serialized event contains sentinel %q: %s", sentinel, text)
+		}
+	}
+	encoded, err = json.Marshal(diagnostic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sentinel := range []string{"opaque-request-secret", "C:\\Users\\secret", "https://secret.example", "Authorization", "api-key"} {
+		if strings.Contains(string(encoded), sentinel) {
+			t.Fatalf("serialized resolver diagnostic contains sentinel %q: %s", sentinel, encoded)
 		}
 	}
 	if first.Kind != ObservationRoutingResolved || second.Kind != ObservationProviderRequestPrepared {

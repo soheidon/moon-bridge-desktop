@@ -343,24 +343,61 @@ func TestRoutingObservationEmitsCorrelatedSafeEvents(t *testing.T) {
 	}
 	sink := &routingEventSink{}
 	mapping := &exactTrafficMapping{target: "deepseek-v4-flash", ok: true}
-	handler := New(Config{AdapterRegistry: newRoutingTestAdapterRegistry(t), ProviderMgr: pm, TrafficRouting: mapping, RoutingObservationSink: sink, RoutingProfileResolver: &stubSlotResolver{slots: map[string]RoutingProfileSlotResult{"gpt-5.6-luna": {SlotID: "luna", ActiveProfileID: "deepseek", ProviderKey: "deepseek", UpstreamModel: "deepseek-v4-flash", Mode: "normal"}}}})
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(`{"model":"gpt-5.6-luna","reasoning":{"effort":"medium"},"input":"hello"}`)))
-	if response.Code != http.StatusOK || calls != 1 {
-		t.Fatalf("status=%d calls=%d body=%s", response.Code, calls, response.Body.String())
+	resolver := &stubSlotResolver{slots: map[string]RoutingProfileSlotResult{
+		"gpt-5.6-sol":   {SlotID: "sol", ActiveProfileID: "deepseek", ProviderKey: "deepseek", UpstreamModel: "deepseek-v4-flash", Mode: "thinking", Reasoning: ptrString("max")},
+		"gpt-5.6-terra": {SlotID: "terra", ActiveProfileID: "deepseek", ProviderKey: "deepseek", UpstreamModel: "deepseek-v4-flash", Mode: "thinking", Reasoning: ptrString("high")},
+		"gpt-5.6-luna":  {SlotID: "luna", ActiveProfileID: "deepseek", ProviderKey: "deepseek", UpstreamModel: "deepseek-v4-flash", Mode: "normal"},
+	}}
+	handler := New(Config{AdapterRegistry: newRoutingTestAdapterRegistry(t), ProviderMgr: pm, TrafficRouting: mapping, RoutingObservationSink: sink, RoutingProfileResolver: resolver})
+	models := []struct {
+		requested string
+		slot      string
+		mode      string
+	}{
+		{requested: "gpt-5.6-sol", slot: "sol", mode: "thinking"},
+		{requested: "gpt-5.6-terra", slot: "terra", mode: "thinking"},
+		{requested: "gpt-5.6-luna", slot: "luna", mode: "normal"},
+		{requested: "gpt-5.6-sol", slot: "sol", mode: "thinking"},
 	}
-	if len(sink.events) != 2 || sink.events[0].Kind != trafficanalysis.ObservationRoutingResolved || sink.events[1].Kind != trafficanalysis.ObservationProviderRequestPrepared {
-		t.Fatalf("events = %#v, want routing/prepared pair", sink.events)
+	for _, model := range models {
+		response := httptest.NewRecorder()
+		body := fmt.Sprintf(`{"model":%q,"reasoning":{"effort":"medium"},"input":"hello"}`, model.requested)
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/responses", strings.NewReader(body)))
+		if response.Code != http.StatusOK {
+			t.Fatalf("model=%s status=%d calls=%d body=%s", model.requested, response.Code, calls, response.Body.String())
+		}
 	}
-	if sink.events[0].CorrelationKey == "" || sink.events[0].CorrelationKey != sink.events[1].CorrelationKey {
-		t.Fatalf("correlation = %#v", sink.events)
+	if calls != len(models) {
+		t.Fatalf("provider calls=%d, want %d", calls, len(models))
+	}
+	if len(sink.events) != len(models)*6 {
+		t.Fatalf("events=%d, want %d events: %#v", len(sink.events), len(models)*6, sink.events)
 	}
 	if len(mapping.source) != 0 {
 		t.Fatalf("traffic fallback was consulted before exact routing slot: %#v", mapping.source)
 	}
-	prepared := sink.events[1]
-	if prepared.RequestedModel != "gpt-5.6-luna" || prepared.RoutingSlot != "luna" || prepared.Mode != "normal" || prepared.Provider != "deepseek" || prepared.UpstreamModel != "deepseek-v4-flash" || prepared.Thinking != "disabled" {
-		t.Fatalf("prepared provenance = %#v", prepared)
+	seenCorrelations := map[string]bool{}
+	for i, model := range models {
+		group := sink.events[i*6 : (i+1)*6]
+		if group[0].Kind != trafficanalysis.ObservationRoutingResolutionDiagnosed || group[1].Kind != trafficanalysis.ObservationRoutingResolved || group[2].Kind != trafficanalysis.ObservationProviderRequestPrepared || group[3].Kind != trafficanalysis.ObservationProviderRequestDispatched || group[4].Kind != trafficanalysis.ObservationProviderResponseReceived || group[5].Kind != trafficanalysis.ObservationProviderResponseForwarded {
+			t.Fatalf("model=%s events=%#v, want routing/prepared/dispatch/received/forwarded sequence", model.requested, group)
+		}
+		if group[0].Resolver == nil || group[0].Resolver.RequestedModel != model.requested {
+			t.Fatalf("model=%s diagnostic=%#v", model.requested, group[0].Resolver)
+		}
+		correlation := group[1].CorrelationKey
+		if correlation == "" || seenCorrelations[correlation] {
+			t.Fatalf("model=%s correlation=%q already seen=%v", model.requested, correlation, seenCorrelations)
+		}
+		seenCorrelations[correlation] = true
+		for _, event := range group[1:] {
+			if event.CorrelationKey != correlation || event.RequestedModel != model.requested || event.RoutingSlot != model.slot || event.Mode != model.mode || event.Provider != "deepseek" || event.UpstreamModel != "deepseek-v4-flash" {
+				t.Fatalf("model=%s metadata drifted: %#v", model.requested, group)
+			}
+		}
+		if group[3].ExchangeIndex != 1 || group[4].ExchangeIndex != 1 || group[5].ExchangeIndex != 1 {
+			t.Fatalf("model=%s egress exchange index mismatch: %#v", model.requested, group)
+		}
 	}
 }
 

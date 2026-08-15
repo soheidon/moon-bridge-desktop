@@ -431,6 +431,9 @@ func (s *SQLiteConfigStore) LoadAll() (*config.Config, error) {
 	s.issueMu.Lock()
 	s.issues = issues
 	s.issueMu.Unlock()
+	if err := s.migrateLegacyRoutingProfileShape(context.Background(), &fc); err != nil {
+		return nil, fmt.Errorf("migrate legacy routing profile shape: %w", err)
+	}
 	if fc.Mode == "" {
 		return nil, fmt.Errorf("%w: mode is empty", ErrConfigNotSeeded)
 	}
@@ -514,6 +517,55 @@ func (s *SQLiteConfigStore) migrateLegacyPlaintextKeys(ctx context.Context, fc *
 		return nil, err
 	}
 	return issues, nil
+}
+
+// migrateLegacyRoutingProfileShape repairs a routing_profiles extension that was
+// persisted under the legacy "table" key (a stopped-state save bug) into the
+// canonical "profiles" + "active_profile" shape. It is fail-closed: any payload
+// other than the exact expected legacy object is left untouched. The repair is
+// written back once; steady-state LoadAll performs no write.
+func (s *SQLiteConfigStore) migrateLegacyRoutingProfileShape(ctx context.Context, fc *config.FileConfig) error {
+	ext, ok := fc.Extensions["routing_profiles"]
+	if !ok {
+		return nil
+	}
+	cfg := ext.Config
+	if cfg == nil {
+		return nil
+	}
+	tableVal, hasTable := cfg["table"]
+	if !hasTable {
+		return nil
+	}
+	if _, hasProfiles := cfg["profiles"]; hasProfiles {
+		return nil // already canonical; never clobber
+	}
+	table, ok := tableVal.(map[string]any)
+	if !ok || len(table) == 0 {
+		return nil // unexpected payload; do not migrate
+	}
+	cfg["profiles"] = table
+	delete(cfg, "table")
+	if active, _ := cfg["active_profile"].(string); active == "" && len(table) == 1 {
+		for id := range table {
+			cfg["active_profile"] = id
+		}
+	}
+	ext.Config = cfg
+	fc.Extensions["routing_profiles"] = ext
+
+	data, err := json.Marshal(fc.Extensions)
+	if err != nil {
+		return fmt.Errorf("marshal migrated routing_profiles extension: %w", err)
+	}
+	settingsTable := s.table("settings")
+	if err := s.db.WithTx(ctx, func(tx db.Tx) error {
+		_, err := tx.ExecContext(ctx, "INSERT OR REPLACE INTO "+settingsTable+" (key, value) VALUES (?, ?)", "extensions", string(data))
+		return err
+	}); err != nil {
+		return fmt.Errorf("persist migrated routing_profiles shape: %w", err)
+	}
+	return nil
 }
 
 func (s *SQLiteConfigStore) loadFileConfig() (config.FileConfig, error) {

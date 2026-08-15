@@ -29,6 +29,19 @@ type SlotResolver struct {
 	table               tableFile
 	activeProfileID     string
 	hasProfileExtension bool
+	activeProfileState  string
+}
+
+// SafeResolverState is a reduced, identifier-free view of resolver readiness.
+// It is intended for bounded diagnostics and never contains profile, provider,
+// model, URL, or credential values.
+type SafeResolverState struct {
+	ExtensionState     string `json:"extensionState"`
+	ActiveProfileState string `json:"activeProfileState"`
+	SlotCount          int    `json:"slotCount"`
+	SolState           string `json:"solState"`
+	TerraState         string `json:"terraState"`
+	LunaState          string `json:"lunaState"`
 }
 
 // NewSlotResolver builds a SlotResolver from a config graph snapshot.
@@ -39,6 +52,7 @@ func NewSlotResolver(graph configgraph.Graph) *SlotResolver {
 		table:               table,
 		activeProfileID:     activeProfileIDFromGraph(graph, table),
 		hasProfileExtension: hasExtension,
+		activeProfileState:  activeProfileStateFromGraph(graph, table),
 	}
 }
 
@@ -80,7 +94,77 @@ func NewSlotResolverFromDefaults(activeProfileID string) *SlotResolver {
 		table:               defaultTable(),
 		activeProfileID:     activeProfileID,
 		hasProfileExtension: false,
+		activeProfileState:  safeActiveProfileState(activeProfileID),
 	}
+}
+
+// SafeState returns only stable enum/boolean/count readiness information.
+func (r *SlotResolver) SafeState() SafeResolverState {
+	state := SafeResolverState{
+		ExtensionState:     "absent",
+		ActiveProfileState: r.activeProfileState,
+		SolState:           r.safeSlotState(SlotSol),
+		TerraState:         r.safeSlotState(SlotTerra),
+		LunaState:          r.safeSlotState(SlotLuna),
+	}
+	if r.hasProfileExtension {
+		state.ExtensionState = "valid"
+		if r.activeProfileState != "present_valid" {
+			state.ExtensionState = "invalid"
+		}
+	}
+	if r.activeProfileState == "present_valid" {
+		for _, slotState := range []string{state.SolState, state.TerraState, state.LunaState} {
+			if slotState == "ready" {
+				state.SlotCount++
+			}
+		}
+	}
+	return state
+}
+
+func (r *SlotResolver) safeSlotState(slotID string) string {
+	if r.activeProfileState != "present_valid" {
+		return "invalid"
+	}
+	profile := r.table.Profiles[r.activeProfileID]
+	if profile == nil {
+		return "invalid"
+	}
+	slot := profile.Slots[slotID]
+	if slot == nil {
+		return "missing"
+	}
+	if _, err := normalizeSlotMode(slot.Mode, slot.Reasoning); err != nil {
+		return "invalid"
+	}
+	return "ready"
+}
+
+func safeActiveProfileState(activeProfileID string) string {
+	if activeProfileID == "" {
+		return "missing"
+	}
+	return "present_valid"
+}
+
+func activeProfileStateFromGraph(graph configgraph.Graph, table tableFile) string {
+	res := resource(graph, configgraph.ResourceExtension, ExtensionResourceID)
+	if res == nil {
+		return safeActiveProfileState(activeProfileIDFromGraph(graph, table))
+	}
+	cfg, ok := res.Value["config"].(map[string]any)
+	if !ok {
+		return "invalid"
+	}
+	id, ok := cfg["active_profile"].(string)
+	if !ok || id == "" {
+		return "missing"
+	}
+	if _, ok := table.Profiles[id]; !ok {
+		return "unknown"
+	}
+	return "present_valid"
 }
 
 // BootstrapEligible reports whether the resolver was built without a

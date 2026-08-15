@@ -75,7 +75,7 @@ func TestRealTrafficBindingLifecycle(t *testing.T) {
 		RecoveryDir:   recoveryDir,
 		CodexHome:     codexHome,
 		BackupDir:     backupDir,
-		TrafficLogDir: filepath.Join(root, "logs"),
+		TrafficLogDir: filepath.Join(root, "logs", "traffic-analysis"),
 		AppDataRoot:   filepath.Join(root, "appdata"),
 	}, filepath.Join(recoveryDir, "recovery-state-v2.json"))
 	if err != nil {
@@ -93,7 +93,7 @@ func TestRealTrafficBindingLifecycle(t *testing.T) {
 	// The injected Recovery store skips the create branch of ensureRecoveryStore,
 	// so the autosave log dir is never derived. Pin it to the temp root to keep
 	// the real user profile untouched.
-	app.trafficLogDir = filepath.Join(root, "logs")
+	app.trafficLogDir = filepath.Join(root, "logs", "traffic-analysis")
 	app.startup(context.Background())
 	defer app.shutdown(context.Background())
 
@@ -211,7 +211,7 @@ func TestLiveRestoreConflictResolutionFlow(t *testing.T) {
 		RecoveryDir:   recoveryDir,
 		CodexHome:     codexHome,
 		BackupDir:     backupDir,
-		TrafficLogDir: filepath.Join(root, "logs"),
+		TrafficLogDir: filepath.Join(root, "logs", "traffic-analysis"),
 		AppDataRoot:   filepath.Join(root, "appdata"),
 	}, filepath.Join(recoveryDir, "recovery-state-v2.json"))
 	if err != nil {
@@ -226,7 +226,7 @@ func TestLiveRestoreConflictResolutionFlow(t *testing.T) {
 		BackupDir:    backupDir,
 		EmitEvents:   noopEmit,
 	})
-	app.trafficLogDir = filepath.Join(root, "logs")
+	app.trafficLogDir = filepath.Join(root, "logs", "traffic-analysis")
 	app.startup(context.Background())
 	defer app.shutdown(context.Background())
 

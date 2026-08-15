@@ -56,3 +56,17 @@ export interface RoutingProfileInput {
   displayName: string;
   slots: Record<RoutingSlotId, RoutingSlotInput>;
 }
+
+export type RoutingProfileSaveStatus =
+  | "saved_stopped"
+  | "saved_applied"
+  | "save_failed"
+  | "persisted_not_applied"
+  | "state_unknown";
+
+export interface RoutingProfileSaveResult {
+  ok: boolean;
+  snapshot: RoutingProfileSnapshot | null;
+  status: RoutingProfileSaveStatus;
+  error: import("./deepseek").CommandError | null;
+}

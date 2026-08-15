@@ -975,6 +975,28 @@ func extensionConfigValue(table tableFile) map[string]any {
 	return out
 }
 
+// CanonicalConfigForSave builds the canonical routing_profiles extension config
+// value (the config sub-map stored under ExtensionSettings.RawConfig) for a
+// stopped-state save. It reuses tableFromGraph and inputToProfileFile so the
+// stopped save path and the live Save path share one shape and cannot drift.
+//
+// active_profile rule: a persisted active_profile that still references a
+// present profile is preserved; a missing (empty) or dangling active_profile is
+// established to input.Profile.ID. This is required because the GUI has no
+// separate Activate operation while the gateway is stopped, so a plain save
+// must already produce a valid active profile.
+func CanonicalConfigForSave(graph configgraph.Graph, input Input) map[string]any {
+	table := tableFromGraph(graph)
+	if table.Profiles == nil {
+		table.Profiles = map[string]*profileFile{}
+	}
+	table.Profiles[input.Profile.ID] = inputToProfileFile(input.Profile)
+	if _, ok := table.Profiles[table.ActiveProfile]; !ok {
+		table.ActiveProfile = input.Profile.ID
+	}
+	return extensionConfigValue(table)
+}
+
 func routeValue(provider, upstreamModel string) map[string]any {
 	return map[string]any{
 		"model":        upstreamModel,

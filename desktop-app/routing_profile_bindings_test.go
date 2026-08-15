@@ -249,6 +249,71 @@ func TestLoadRoutingProfilesStoppedReadsPersistedSQLite(t *testing.T) {
 	}
 }
 
+// TestGatewayStartupUsesPersistedResolverState exercises the real SQLite
+// persistence -> gateway startup -> runTransform -> Server install path. The
+// assertion is deliberately limited to the safe status contract.
+func TestGatewayStartupUsesPersistedResolverState(t *testing.T) {
+	configPath, dbPath := integrationConfig(t, "server-tok")
+	specs := bridgeapp.BuiltinExtensions().ConfigSpecs()
+	base, err := config.LoadFromFileWithOptions(configPath, config.LoadOptions{ExtensionSpecs: specs})
+	if err != nil {
+		t.Fatalf("LoadFromFileWithOptions() error = %v", err)
+	}
+	saved := configWithRoutingProfileExtension(t, base, map[string]map[string]any{
+		"local": {
+			"display_name": "Local",
+			"slots": map[string]any{
+				"sol":   map[string]any{"provider": "local", "upstream_model": "local-test-model", "mode": "thinking", "reasoning": "high"},
+				"terra": map[string]any{"provider": "local", "upstream_model": "local-test-model", "mode": "thinking", "reasoning": "high"},
+				"luna":  map[string]any{"provider": "local", "upstream_model": "local-test-model", "mode": "normal"},
+			},
+		},
+	}, "local")
+	cs, closeStore, err := openPersistedConfigStore(dbPath, specs)
+	if err != nil {
+		t.Fatalf("openPersistedConfigStore() error = %v", err)
+	}
+	if _, err := cs.SaveConfig(context.Background(), &saved); err != nil {
+		closeStore()
+		t.Fatalf("SaveConfig() error = %v", err)
+	}
+	closeStore()
+
+	app := NewApp(AppOptions{ConfigPath: configPath, EmitEvents: noopEmit})
+	defer app.shutdown(context.Background())
+	if result := app.StartGateway(StartGatewayRequest{}); !result.OK {
+		t.Fatalf("StartGateway() = %#v, want success", result)
+	}
+	session, ok := app.copySession()
+	if !ok {
+		t.Fatal("copySession() = false after successful gateway start")
+	}
+	body := authedStatusBody(t, session.Address, session.ControlToken)
+	resolver, ok := body["routing_resolver"].(map[string]any)
+	if !ok {
+		t.Fatalf("routing_resolver = %#v, want safe status object", body["routing_resolver"])
+	}
+	if resolver["server_instance"] == "" || resolver["generation"] != float64(1) || resolver["config_source"] != "persisted_store" || resolver["resolver_present"] != true {
+		t.Fatalf("routing resolver startup status = %#v", resolver)
+	}
+	state, ok := resolver["routing_profile_state"].(map[string]any)
+	if !ok {
+		t.Fatalf("routing_profile_state = %#v, want object", resolver["routing_profile_state"])
+	}
+	for key, want := range map[string]any{
+		"extensionState":     "valid",
+		"activeProfileState": "present_valid",
+		"slotCount":          float64(3),
+		"solState":           "ready",
+		"terraState":         "ready",
+		"lunaState":          "ready",
+	} {
+		if state[key] != want {
+			t.Fatalf("routing_profile_state[%q] = %#v, want %#v", key, state[key], want)
+		}
+	}
+}
+
 // writeTransformConfigWithSQLitePath writes a valid Transform config whose
 // db_sqlite extension points at rawPath verbatim (relative or absolute),
 // mirroring a real user config. The path is emitted as a quoted YAML string.
@@ -667,6 +732,313 @@ func TestSaveRoutingProfileMutationError(t *testing.T) {
 	}
 	if !res.Error.MutationStarted {
 		t.Fatal("mutationStarted = false, want true (a mutation began before failure)")
+	}
+}
+
+// deepseekProfileConfig returns the confirmed DeepSeek profile as a
+// config.profiles map for seeding a persisted store.
+func deepseekProfileConfig() map[string]map[string]any {
+	return map[string]map[string]any{
+		deepseek.ProviderID: {
+			"display_name": "DeepSeek",
+			"slots": map[string]any{
+				routingprofile.SlotSol:   map[string]any{"provider": deepseek.ProviderID, "upstream_model": deepseek.ModelFlash, "mode": "thinking", "reasoning": deepseek.ReasoningMax},
+				routingprofile.SlotTerra: map[string]any{"provider": deepseek.ProviderID, "upstream_model": deepseek.ModelFlash, "mode": "thinking", "reasoning": deepseek.ReasoningHigh},
+				routingprofile.SlotLuna:  map[string]any{"provider": deepseek.ProviderID, "upstream_model": deepseek.ModelFlash, "mode": "normal"},
+			},
+		},
+	}
+}
+
+// seedRoutingProfileStore seeds the persisted SQLite store with a canonical
+// routing_profiles extension and returns the config/db paths for a stopped save.
+func seedRoutingProfileStore(t *testing.T, profiles map[string]map[string]any, activeProfile string) (configPath, dbPath string) {
+	t.Helper()
+	configPath, dbPath = integrationConfig(t, "server-tok")
+	specs := bridgeapp.BuiltinExtensions().ConfigSpecs()
+	base, err := config.LoadFromFileWithOptions(configPath, config.LoadOptions{ExtensionSpecs: specs})
+	if err != nil {
+		t.Fatalf("LoadFromFileWithOptions() error = %v", err)
+	}
+	saved := configWithRoutingProfileExtension(t, base, profiles, activeProfile)
+	cs, closeStore, err := openPersistedConfigStore(dbPath, specs)
+	if err != nil {
+		t.Fatalf("openPersistedConfigStore() error = %v", err)
+	}
+	if _, err := cs.SaveConfig(context.Background(), &saved); err != nil {
+		closeStore()
+		t.Fatalf("SaveConfig() error = %v", err)
+	}
+	closeStore()
+	return configPath, dbPath
+}
+
+// TestSaveRoutingProfileStoppedWritesCanonicalShape proves a stopped-state save
+// writes the canonical {active_profile, profiles} shape (not the legacy "table"
+// shape) and preserves the three slots.
+func TestSaveRoutingProfileStoppedWritesCanonicalShape(t *testing.T) {
+	configPath, dbPath := integrationConfig(t, "server-tok")
+	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
+	app := NewApp(AppOptions{
+		Service: svc, NewIdentity: fixedIdentity("inst-1", "token-1"), ConfigPath: configPath, EmitEvents: noopEmit,
+	})
+	defer app.shutdown(context.Background())
+
+	if res := app.SaveRoutingProfile(validRoutingProfileInput()); !res.OK || res.Error != nil {
+		t.Fatalf("SaveRoutingProfile() = %#v, want ok", res)
+	}
+
+	cs, closeStore, err := openPersistedConfigStore(dbPath, bridgeapp.BuiltinExtensions().ConfigSpecs())
+	if err != nil {
+		t.Fatalf("openPersistedConfigStore() error = %v", err)
+	}
+	defer closeStore()
+	dbCfg, err := cs.LoadAll()
+	if err != nil {
+		t.Fatalf("LoadAll() error = %v", err)
+	}
+	ext, ok := dbCfg.Extensions["routing_profiles"]
+	if !ok {
+		t.Fatal("routing_profiles extension missing after stopped save")
+	}
+	if ext.Enabled == nil || !*ext.Enabled {
+		t.Fatalf("extension enabled = %v, want true", ext.Enabled)
+	}
+	if _, ok := ext.RawConfig["table"]; ok {
+		t.Fatalf("RawConfig still carries legacy %q key: %#v", "table", ext.RawConfig)
+	}
+	if ext.RawConfig["active_profile"] != deepseek.ProviderID {
+		t.Fatalf("RawConfig[active_profile] = %#v, want %q (established on first save)", ext.RawConfig["active_profile"], deepseek.ProviderID)
+	}
+	profilesRaw, ok := ext.RawConfig["profiles"].(map[string]any)
+	if !ok {
+		t.Fatalf("RawConfig[profiles] = %#v, want map", ext.RawConfig["profiles"])
+	}
+	prof, ok := profilesRaw[deepseek.ProviderID].(map[string]any)
+	if !ok {
+		t.Fatalf("profiles[%q] = %#v, want map", deepseek.ProviderID, profilesRaw[deepseek.ProviderID])
+	}
+	slots, ok := prof["slots"].(map[string]any)
+	if !ok {
+		t.Fatalf("profiles[%q].slots = %#v, want map", deepseek.ProviderID, prof["slots"])
+	}
+	checkSlot := func(slotID, wantModel string, wantReasoning any) {
+		t.Helper()
+		slot, ok := slots[slotID].(map[string]any)
+		if !ok {
+			t.Fatalf("slot %q = %#v, want map", slotID, slots[slotID])
+		}
+		if slot["upstream_model"] != wantModel {
+			t.Fatalf("slot %q upstream_model = %#v, want %q", slotID, slot["upstream_model"], wantModel)
+		}
+		gotReasoning, present := slot["reasoning"]
+		if !present {
+			t.Fatalf("slot %q missing reasoning key (canonical shape writes null for no override)", slotID)
+		}
+		if wantReasoning == nil {
+			if gotReasoning != nil {
+				t.Fatalf("slot %q reasoning = %#v, want null", slotID, gotReasoning)
+			}
+			return
+		}
+		if gotReasoning != wantReasoning {
+			t.Fatalf("slot %q reasoning = %#v, want %v", slotID, gotReasoning, wantReasoning)
+		}
+	}
+	checkSlot(routingprofile.SlotSol, deepseek.ModelFlash, deepseek.ReasoningMax)
+	checkSlot(routingprofile.SlotTerra, deepseek.ModelFlash, deepseek.ReasoningHigh)
+	checkSlot(routingprofile.SlotLuna, deepseek.ModelFlash, nil)
+}
+
+// TestSaveRoutingProfileStoppedActiveProfileRule pins the active_profile
+// contract: a valid persisted active_profile is preserved; a missing or dangling
+// one is established to the profile being saved.
+func TestSaveRoutingProfileStoppedActiveProfileRule(t *testing.T) {
+	tests := []struct {
+		name          string
+		profiles      map[string]map[string]any
+		activeProfile string
+		wantActive    string
+	}{
+		{
+			name:          "preserve valid active_profile",
+			profiles:      map[string]map[string]any{"other": {"display_name": "Other", "slots": map[string]any{}}, deepseek.ProviderID: deepseekProfileConfig()[deepseek.ProviderID]},
+			activeProfile: "other",
+			wantActive:    "other",
+		},
+		{
+			name:          "establish when missing",
+			profiles:      deepseekProfileConfig(),
+			activeProfile: "",
+			wantActive:    deepseek.ProviderID,
+		},
+		{
+			name:          "establish when dangling",
+			profiles:      deepseekProfileConfig(),
+			activeProfile: "ghost",
+			wantActive:    deepseek.ProviderID,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath, dbPath := seedRoutingProfileStore(t, tt.profiles, tt.activeProfile)
+			svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
+			app := NewApp(AppOptions{
+				Service: svc, NewIdentity: fixedIdentity("inst-1", "token-1"), ConfigPath: configPath, EmitEvents: noopEmit,
+			})
+			defer app.shutdown(context.Background())
+
+			if res := app.SaveRoutingProfile(validRoutingProfileInput()); !res.OK || res.Error != nil {
+				t.Fatalf("SaveRoutingProfile() = %#v, want ok", res)
+			}
+
+			cs, closeStore, err := openPersistedConfigStore(dbPath, bridgeapp.BuiltinExtensions().ConfigSpecs())
+			if err != nil {
+				t.Fatalf("openPersistedConfigStore() error = %v", err)
+			}
+			defer closeStore()
+			dbCfg, err := cs.LoadAll()
+			if err != nil {
+				t.Fatalf("LoadAll() error = %v", err)
+			}
+			ext, ok := dbCfg.Extensions["routing_profiles"]
+			if !ok {
+				t.Fatal("routing_profiles extension missing after stopped save")
+			}
+			if ext.RawConfig["active_profile"] != tt.wantActive {
+				t.Fatalf("active_profile = %#v, want %q", ext.RawConfig["active_profile"], tt.wantActive)
+			}
+		})
+	}
+}
+
+// TestSaveRoutingProfileStoppedThenRestartReady proves a stopped-state save
+// survives a real SQLite close/reopen and a gateway restart resolves to a
+// ready 3/3 resolver (extensionState=valid, activeProfileState=present_valid).
+func TestSaveRoutingProfileStoppedThenRestartReady(t *testing.T) {
+	configPath, _ := integrationConfig(t, "server-tok")
+
+	// Stopped save writes the canonical shape and closes its store.
+	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
+	app := NewApp(AppOptions{
+		Service: svc, NewIdentity: fixedIdentity("inst-1", "token-1"), ConfigPath: configPath, EmitEvents: noopEmit,
+	})
+	if res := app.SaveRoutingProfile(validRoutingProfileInput()); !res.OK || res.Error != nil {
+		app.shutdown(context.Background())
+		t.Fatalf("SaveRoutingProfile() = %#v, want ok", res)
+	}
+	app.shutdown(context.Background())
+
+	// Fresh app starts a real gateway and re-reads the persisted store.
+	app2 := NewApp(AppOptions{ConfigPath: configPath, EmitEvents: noopEmit})
+	defer app2.shutdown(context.Background())
+	if result := app2.StartGateway(StartGatewayRequest{}); !result.OK {
+		t.Fatalf("StartGateway() = %#v, want success", result)
+	}
+	session, ok := app2.copySession()
+	if !ok {
+		t.Fatal("copySession() = false after successful gateway start")
+	}
+	body := authedStatusBody(t, session.Address, session.ControlToken)
+	resolver, ok := body["routing_resolver"].(map[string]any)
+	if !ok {
+		t.Fatalf("routing_resolver = %#v, want safe status object", body["routing_resolver"])
+	}
+	if resolver["config_source"] != "persisted_store" || resolver["resolver_present"] != true {
+		t.Fatalf("routing resolver startup status = %#v", resolver)
+	}
+	state, ok := resolver["routing_profile_state"].(map[string]any)
+	if !ok {
+		t.Fatalf("routing_profile_state = %#v, want object", resolver["routing_profile_state"])
+	}
+	for key, want := range map[string]any{
+		"extensionState":     "valid",
+		"activeProfileState": "present_valid",
+		"slotCount":          float64(3),
+		"solState":           "ready",
+		"terraState":         "ready",
+		"lunaState":          "ready",
+	} {
+		if state[key] != want {
+			t.Fatalf("routing_profile_state[%q] = %#v, want %#v", key, state[key], want)
+		}
+	}
+}
+
+// TestGatewayStartupMigratesLegacyRoutingProfileTable proves the end-to-end
+// upgrade-without-touching-settings path: a store seeded with the legacy
+// {"table": ...} shape (no profiles, no active_profile) is auto-repaired at
+// LoadAll during gateway startup, so the resolver comes up ready 3/3 instead of
+// active_profile=missing / 0/3 invalid.
+func TestGatewayStartupMigratesLegacyRoutingProfileTable(t *testing.T) {
+	configPath, dbPath := integrationConfig(t, "server-tok")
+	specs := bridgeapp.BuiltinExtensions().ConfigSpecs()
+	base, err := config.LoadFromFileWithOptions(configPath, config.LoadOptions{ExtensionSpecs: specs})
+	if err != nil {
+		t.Fatalf("LoadFromFileWithOptions() error = %v", err)
+	}
+	// Legacy stopped-save shape: the profile payload lives under the "table" key
+	// with no profiles / active_profile.
+	enabled := true
+	base.Extensions = map[string]config.ExtensionSettings{
+		"routing_profiles": {
+			Enabled: &enabled,
+			RawConfig: map[string]any{
+				"table": map[string]any{
+					"local": map[string]any{
+						"display_name": "Local",
+						"slots": map[string]any{
+							"sol":   map[string]any{"provider": "local", "upstream_model": "local-test-model", "mode": "thinking", "reasoning": "high"},
+							"terra": map[string]any{"provider": "local", "upstream_model": "local-test-model", "mode": "thinking", "reasoning": "high"},
+							"luna":  map[string]any{"provider": "local", "upstream_model": "local-test-model", "mode": "normal"},
+						},
+					},
+				},
+			},
+		},
+	}
+	cs, closeStore, err := openPersistedConfigStore(dbPath, specs)
+	if err != nil {
+		t.Fatalf("openPersistedConfigStore() error = %v", err)
+	}
+	if _, err := cs.SaveConfig(context.Background(), &base); err != nil {
+		closeStore()
+		t.Fatalf("SaveConfig() error = %v", err)
+	}
+	closeStore()
+
+	app := NewApp(AppOptions{ConfigPath: configPath, EmitEvents: noopEmit})
+	defer app.shutdown(context.Background())
+	if result := app.StartGateway(StartGatewayRequest{}); !result.OK {
+		t.Fatalf("StartGateway() = %#v, want success", result)
+	}
+	session, ok := app.copySession()
+	if !ok {
+		t.Fatal("copySession() = false after successful gateway start")
+	}
+	body := authedStatusBody(t, session.Address, session.ControlToken)
+	resolver, ok := body["routing_resolver"].(map[string]any)
+	if !ok {
+		t.Fatalf("routing_resolver = %#v, want safe status object", body["routing_resolver"])
+	}
+	if resolver["config_source"] != "persisted_store" || resolver["resolver_present"] != true {
+		t.Fatalf("routing resolver startup status = %#v", resolver)
+	}
+	state, ok := resolver["routing_profile_state"].(map[string]any)
+	if !ok {
+		t.Fatalf("routing_profile_state = %#v, want object", resolver["routing_profile_state"])
+	}
+	for key, want := range map[string]any{
+		"extensionState":     "valid",
+		"activeProfileState": "present_valid",
+		"slotCount":          float64(3),
+		"solState":           "ready",
+		"terraState":         "ready",
+		"lunaState":          "ready",
+	} {
+		if state[key] != want {
+			t.Fatalf("routing_profile_state[%q] = %#v, want %#v", key, state[key], want)
+		}
 	}
 }
 

@@ -41,6 +41,31 @@ func TestApplyPatchToFileConfigUpdatesDefaultsMaxTokens(t *testing.T) {
 	}
 }
 
+func TestApplyPatchToFileConfigUpdatesNestedRoutingProfileActiveProfile(t *testing.T) {
+	enabled := true
+	fc := testConfig().ToFileConfig()
+	fc.Extensions = map[string]config.ExtensionFileConfig{
+		"routing_profiles": {
+			Enabled: &enabled,
+			Config: map[string]any{
+				"profiles": map[string]any{
+					"profile-a": map[string]any{},
+				},
+			},
+		},
+	}
+
+	patched, errs := ApplyPatchToFileConfig(fc, []PatchOp{{
+		Kind: ResourceExtension, ID: "routing_profiles", Field: "config.active_profile", Value: "profile-a",
+	}})
+	if len(errs) != 0 {
+		t.Fatalf("nested routing profile patch returned errors: %+v", errs)
+	}
+	if got := patched.Extensions["routing_profiles"].Config["active_profile"]; got != "profile-a" {
+		t.Fatalf("routing_profiles.active_profile = %#v, want profile-a", got)
+	}
+}
+
 func TestApplyPatchToFileConfigUpdatesModelReasoningSupport(t *testing.T) {
 	fc := testConfig().ToFileConfig()
 

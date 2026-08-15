@@ -1,4 +1,5 @@
-import type { ExitConfirmationPayload, TrafficObservation } from "../types/trafficAnalysis";
+import type { ExitConfirmationPayload, TrafficObservation, TrafficRequestSummary } from "../types/trafficAnalysis";
+import { summarizeTrafficRequests } from "../types/trafficAnalysis";
 import type { useTrafficAnalysis } from "../hooks/useTrafficAnalysis";
 import { trafficActionDisabled } from "../trafficAnalysisActions";
 
@@ -12,6 +13,7 @@ export function TrafficAnalysisCard({ traffic }: { traffic: TrafficState }) {
   const actions = trafficActionDisabled(traffic.observations.length, traffic.pending);
   const codexConfig = codexConfigStatus(active, relayActive, traffic.status);
   const target = traffic.status?.configPath;
+  const requestSummaries = summarizeTrafficRequests(traffic.observations);
 
   return (
     <section className="panel traffic-card" aria-labelledby="traffic-analysis-title">
@@ -101,12 +103,43 @@ export function TrafficAnalysisCard({ traffic }: { traffic: TrafficState }) {
               {traffic.error && <p className="error-text">{traffic.error.message}（{traffic.error.code}）</p>}
               {traffic.progress && <p className="traffic-progress">{traffic.progress.message}</p>}
             </div>
+            <RequestSummaryList summaries={requestSummaries} />
             <ObservationList traffic={traffic} observations={traffic.observations} />
             {traffic.observations.length === 0 && <p className="traffic-empty-hint">観測データがまだないため、クリアはできません。観測の開始後は自動保存されます。</p>}
           </>
         )}
       </div>
     </section>
+  );
+}
+
+function RequestSummaryList({ summaries }: { summaries: TrafficRequestSummary[] }) {
+  if (summaries.length === 0) return null;
+  return (
+    <div className="traffic-request-summaries" aria-label="リクエスト実効経路サマリー">
+      <h3 className="traffic-observation-summary-title">リクエスト実効経路</h3>
+      <div className="traffic-request-summary-list">
+        {summaries.slice().reverse().map((summary) => (
+          <article className="traffic-request-summary" key={summary.requestAlias}>
+            <div className="traffic-request-summary-header">
+              <strong>{summary.requestAlias}</strong>
+              <span>{summary.route} · {summary.transportOutcome} · {summary.statusClass}</span>
+            </div>
+            <div className="traffic-observation-fields">
+              <span>model: {summary.requestedModel}</span>
+              <span>slot: {summary.resolvedSlot}</span>
+              <span>provider: {summary.provider}</span>
+              <span>upstream: {summary.upstreamModel}</span>
+              <span>mode: {summary.mode}</span>
+              <span>thinking: {summary.thinking}</span>
+              <span>credential: {summary.credentialState}</span>
+              <span>resolver: {summary.resolverState} · generation {summary.resolverGeneration}</span>
+              <span>attempts: {summary.attemptCount}</span>
+            </div>
+          </article>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -156,6 +189,9 @@ function ObservationList({ traffic, observations }: { traffic: TrafficState; obs
             {item.gatewayEvent.protocol && <span>protocol: {item.gatewayEvent.protocol}</span>}
             {item.gatewayEvent.thinking && <span>thinking: {item.gatewayEvent.thinking}</span>}
             {item.gatewayEvent.effectiveEffort && <span>effective: {item.gatewayEvent.effectiveEffort}</span>}
+            {item.gatewayEvent.exchangeIndex !== undefined && <span>exchange: {item.gatewayEvent.exchangeIndex}</span>}
+            {item.gatewayEvent.statusCode !== undefined && <span>HTTP {item.gatewayEvent.statusCode}</span>}
+            {item.gatewayEvent.streaming && <span>streaming</span>}
           </div> : <div className="traffic-observation-fields">
             <span>{item.method ?? "event"}</span>
             {item.requestAlias && <span>{item.requestAlias}</span>}

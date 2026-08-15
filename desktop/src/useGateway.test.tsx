@@ -61,6 +61,7 @@ describe("toGatewaySnapshot", () => {
       pid: 25596,
       instanceId: "inst-1",
       error: null,
+      runtimeConfiguration: null,
     });
   });
 
@@ -72,6 +73,7 @@ describe("toGatewaySnapshot", () => {
       pid: null,
       instanceId: null,
       error: null,
+      runtimeConfiguration: null,
     });
   });
 

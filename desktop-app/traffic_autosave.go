@@ -396,6 +396,25 @@ func renderObservationLine(o TrafficObservation) string {
 		appendLogField(&b, "  model", e.Model)
 		appendLogField(&b, "  thinking", e.Thinking)
 		appendLogField(&b, "  effective_effort", e.EffectiveEffort)
+		if e.Resolver != nil {
+			r := e.Resolver
+			appendLogField(&b, "  resolver_requested_model", r.RequestedModel)
+			appendLogField(&b, "  server_instance", r.ServerInstance)
+			fmt.Fprintf(&b, "  resolver_generation: %d\n", r.ResolverGeneration)
+			fmt.Fprintf(&b, "  resolver_present: %t\n", r.ResolverPresent)
+			appendLogField(&b, "  install_source", r.InstallSource)
+			appendLogField(&b, "  config_source", r.ConfigSource)
+			appendLogField(&b, "  extension_state", r.ExtensionState)
+			appendLogField(&b, "  active_profile_state", r.ActiveProfileState)
+			fmt.Fprintf(&b, "  slot_count: %d\n", r.SlotCount)
+			appendLogField(&b, "  sol_state", r.SolState)
+			appendLogField(&b, "  terra_state", r.TerraState)
+			appendLogField(&b, "  luna_state", r.LunaState)
+			appendLogField(&b, "  normal_result", r.NormalResult)
+			appendLogField(&b, "  resolved_slot", r.ResolvedSlot)
+			appendLogField(&b, "  fallback_result", r.FallbackResult)
+			appendLogField(&b, "  final_stage", r.FinalStage)
+		}
 		return b.String()
 	}
 	appendLogField(&b, "  request_alias", o.RequestAlias)

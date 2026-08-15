@@ -47,7 +47,7 @@ func validatePatchTarget(fc config.FileConfig, schema map[ResourceKind]map[strin
 	if !ok {
 		return patchError(op, "unknownKind", fmt.Sprintf("unknown resource kind %q", op.Kind))
 	}
-	if !fields[op.Field] {
+	if !fields[op.Field] && !(op.Kind == ResourceExtension && op.Field == "config.active_profile") {
 		return patchError(op, "unknownField", fmt.Sprintf("unknown field %q for %s", op.Field, op.Kind))
 	}
 	if !resourceExists(fc, op.Kind, op.ID) {
@@ -478,6 +478,19 @@ func applyExtensionPatch(fc *config.FileConfig, op PatchOp) *FieldError {
 			return invalidValue(op, err)
 		}
 		extension.Config = value
+	case "config.active_profile":
+		if extension.Config == nil {
+			extension.Config = make(map[string]any)
+		}
+		if op.Clear {
+			delete(extension.Config, "active_profile")
+			break
+		}
+		value, err := stringValue(op.Value)
+		if err != nil {
+			return invalidValue(op, err)
+		}
+		extension.Config["active_profile"] = value
 	default:
 		return patchError(op, "unknownField", fmt.Sprintf("unknown extension field %q", op.Field))
 	}

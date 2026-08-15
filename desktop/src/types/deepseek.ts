@@ -82,4 +82,5 @@ export interface CommandError {
   mutationStarted: boolean;
   gatewayLeftRunning: boolean;
   gatewaySnapshot: import("./gateway").GatewaySnapshot | null;
+  details?: Record<string, unknown>;
 }

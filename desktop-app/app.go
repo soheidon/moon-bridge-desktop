@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,12 +68,13 @@ type RoundTripResult struct {
 // and InstanceID are only populated while running; ConfigPath is the last
 // successfully started config path and survives a stop.
 type GatewaySnapshot struct {
-	State      string  `json:"state"`      // stopped|starting|running|stopping|error
-	Address    string  `json:"address"`    // running時のみ実Listenアドレス
-	ConfigPath string  `json:"configPath"` // activeConfigPath（最後に成功した Start の path）のみ
-	PID        *int    `json:"pid"`        // running時のみ
-	InstanceID *string `json:"instanceId"` // running時のみ
-	Error      *string `json:"error"`      // state==error 時のみ lastError
+	State      string                        `json:"state"`      // stopped|starting|running|stopping|error
+	Address    string                        `json:"address"`    // running時のみ実Listenアドレス
+	ConfigPath string                        `json:"configPath"` // activeConfigPath（最後に成功した Start の path）のみ
+	PID        *int                          `json:"pid"`        // running時のみ
+	InstanceID *string                       `json:"instanceId"` // running時のみ
+	Error      *string                       `json:"error"`      // state==error 時のみ lastError
+	Runtime    *RuntimeConfigurationSnapshot `json:"runtimeConfiguration,omitempty"`
 }
 
 type StartGatewayRequest struct {
@@ -487,7 +490,9 @@ func (a *App) GatewayStatus() GatewayCommandResult {
 		return a.closedResult("gateway.status")
 	}
 	a.invalidateStaleSession() // clear a session the running gateway no longer matches (never errors)
-	return GatewayCommandResult{OK: true, Value: a.snapshotPtr()}
+	snap := a.snapshot()
+	snap.Runtime = a.runtimeConfigurationSnapshot()
+	return GatewayCommandResult{OK: true, Value: &snap}
 }
 
 func (a *App) startGatewayLocked(requestPath string) GatewayCommandResult {
@@ -657,6 +662,93 @@ func (a *App) snapshot() GatewaySnapshot {
 func (a *App) snapshotPtr() *GatewaySnapshot {
 	snap := a.snapshot()
 	return &snap
+}
+
+type runtimeConfigurationWire struct {
+	State                 string             `json:"state"`
+	ServerInstance        string             `json:"server_instance"`
+	ResolverGeneration    uint64             `json:"resolver_generation"`
+	InstallSource         string             `json:"install_source"`
+	ConfigSource          string             `json:"config_source"`
+	ResolverPresent       bool               `json:"resolver_present"`
+	RoutingExtensionState string             `json:"routing_extension_state"`
+	ActiveProfileState    string             `json:"active_profile_state"`
+	ReadySlotCount        int                `json:"ready_slot_count"`
+	CredentialState       string             `json:"credential_state"`
+	Slots                 runtimeSlotWireSet `json:"slots"`
+}
+
+type runtimeSlotWireSet struct {
+	Sol   runtimeSlotWire `json:"sol"`
+	Terra runtimeSlotWire `json:"terra"`
+	Luna  runtimeSlotWire `json:"luna"`
+}
+
+type runtimeSlotWire struct {
+	State            string `json:"state"`
+	Provider         string `json:"provider,omitempty"`
+	UpstreamModel    string `json:"upstream_model,omitempty"`
+	Mode             string `json:"mode,omitempty"`
+	ConfiguredEffort string `json:"configured_effort,omitempty"`
+	CredentialState  string `json:"credential_state,omitempty"`
+}
+
+func unavailableRuntimeConfiguration() *RuntimeConfigurationSnapshot {
+	return &RuntimeConfigurationSnapshot{State: "unavailable", CredentialState: "unknown"}
+}
+
+// runtimeConfigurationSnapshot reads the authenticated status endpoint of the
+// current Gateway run. Failure is intentionally reduced to unavailable; raw
+// response bodies, tokens, paths, and transport errors never cross the Wails
+// boundary.
+func (a *App) runtimeConfigurationSnapshot() *RuntimeConfigurationSnapshot {
+	if a.svc.Status().Status != gateway.StatusRunning {
+		return unavailableRuntimeConfiguration()
+	}
+	session, ok := a.copySession()
+	if !ok || session.Address == "" || session.ControlToken == "" {
+		return unavailableRuntimeConfiguration()
+	}
+	req, err := http.NewRequestWithContext(a.appCtx, http.MethodGet, "http://"+session.Address+"/api/v1/system/status", nil)
+	if err != nil {
+		return unavailableRuntimeConfiguration()
+	}
+	req.Header.Set("Authorization", "Bearer "+session.ControlToken)
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return unavailableRuntimeConfiguration()
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return unavailableRuntimeConfiguration()
+	}
+	var body struct {
+		Runtime *runtimeConfigurationWire `json:"runtime_configuration"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil || body.Runtime == nil {
+		return unavailableRuntimeConfiguration()
+	}
+	return mapRuntimeConfiguration(body.Runtime)
+}
+
+func mapRuntimeConfiguration(wire *runtimeConfigurationWire) *RuntimeConfigurationSnapshot {
+	if wire == nil {
+		return unavailableRuntimeConfiguration()
+	}
+	return &RuntimeConfigurationSnapshot{
+		State: wire.State, ServerInstance: wire.ServerInstance, ResolverGeneration: wire.ResolverGeneration,
+		InstallSource: wire.InstallSource, ConfigSource: wire.ConfigSource, ResolverPresent: wire.ResolverPresent,
+		RoutingExtensionState: wire.RoutingExtensionState, ActiveProfileState: wire.ActiveProfileState,
+		ReadySlotCount: wire.ReadySlotCount, CredentialState: wire.CredentialState,
+		Slots: RuntimeSlotSnapshotSet{
+			Sol: mapRuntimeSlot(wire.Slots.Sol), Terra: mapRuntimeSlot(wire.Slots.Terra), Luna: mapRuntimeSlot(wire.Slots.Luna),
+		},
+	}
+}
+
+func mapRuntimeSlot(slot runtimeSlotWire) RuntimeSlotSnapshot {
+	return RuntimeSlotSnapshot{State: slot.State, Provider: slot.Provider, UpstreamModel: slot.UpstreamModel, Mode: slot.Mode, ConfiguredEffort: slot.ConfiguredEffort, CredentialState: slot.CredentialState}
 }
 
 func (a *App) emitStatus() {

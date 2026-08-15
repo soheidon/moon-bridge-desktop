@@ -46,7 +46,7 @@ export function Header({ snapshot, busy, onStart, onStop, gatewayWarning, page, 
             className={`btn btn-settings${page === "settings" ? " active" : ""}`}
             aria-current={page === "settings" ? "page" : undefined}
             onClick={() => onNavigate(getNavigationTarget(page, "settings"))}
-          >設定</button>
+          >{page === "settings" ? "設定を閉じる" : "設定"}</button>
         </nav>
       </div>
     </header>
