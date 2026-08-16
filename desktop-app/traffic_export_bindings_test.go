@@ -228,6 +228,9 @@ func TestTrafficAnalysisRevealExportOwnershipGuard(t *testing.T) {
 
 	t.Run("reveals an owned destination via the explorer seam", func(t *testing.T) {
 		app.recordExport(dest)
+		if err := os.WriteFile(dest, []byte("export"), 0o644); err != nil {
+			t.Fatalf("os.WriteFile() error = %v", err)
+		}
 		var got []string
 		app.explorerFunc = func(args ...string) error {
 			got = append(got, args...)
@@ -247,6 +250,15 @@ func TestTrafficAnalysisRevealExportOwnershipGuard(t *testing.T) {
 		result := app.TrafficAnalysisRevealExport(TrafficRevealRequest{Destination: dest})
 		if result.OK || result.Error == nil || result.Error.Code != "reveal_unsupported" {
 			t.Fatalf("TrafficAnalysisRevealExport() = %#v, want reveal_unsupported", result)
+		}
+	})
+
+	t.Run("rejects an owned destination that no longer exists", func(t *testing.T) {
+		missing := filepath.Join(t.TempDir(), "missing.log")
+		app.recordExport(missing)
+		result := app.TrafficAnalysisRevealExport(TrafficRevealRequest{Destination: missing})
+		if result.OK || result.Error == nil || result.Error.Code != "export_destination_missing" {
+			t.Fatalf("TrafficAnalysisRevealExport() = %#v, want export_destination_missing", result)
 		}
 	})
 }

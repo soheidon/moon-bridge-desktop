@@ -48,6 +48,7 @@ export const ZERO_ARG_COMMANDS: ReadonlySet<string> = new Set([
   "StopTrafficAnalysis",
   "TrafficAnalysisObservations",
   "TrafficAnalysisOpenLogFolder",
+  "TrafficAnalysisOpenLogFile",
   "TrafficAnalysisStatus",
 ]);
 

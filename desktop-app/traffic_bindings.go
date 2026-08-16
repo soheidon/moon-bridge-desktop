@@ -1059,6 +1059,9 @@ func (a *App) TrafficAnalysisRevealExport(req TrafficRevealRequest) DesktopComma
 	if !owned {
 		return errDesktop("TrafficAnalysisRevealExport", "export", "reveal_ownership_mismatch", "export destination is not owned by this session", false)
 	}
+	if _, err = os.Stat(canonical); err != nil {
+		return errDesktop("TrafficAnalysisRevealExport", "export", "export_destination_missing", "export destination does not exist", false)
+	}
 	if err := a.explorerFunc("/select," + canonical); err != nil {
 		return errDesktop("TrafficAnalysisRevealExport", "export", "reveal_unsupported", "unable to open the export folder", false)
 	}
@@ -1077,6 +1080,9 @@ func (a *App) TrafficAnalysisOpenLogFolder() DesktopCommandResult {
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return errDesktop("TrafficAnalysisOpenLogFolder", "log_folder", "log_folder_unavailable", "unable to ensure the traffic log folder", false)
+	}
+	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		return errDesktop("TrafficAnalysisOpenLogFolder", "log_folder", "log_folder_unavailable", "traffic log folder is unavailable", false)
 	}
 	if err := a.explorerFunc(dir); err != nil {
 		return errDesktop("TrafficAnalysisOpenLogFolder", "log_folder", "open_folder_unsupported", "unable to open the traffic log folder", false)
@@ -1099,6 +1105,9 @@ func (a *App) TrafficAnalysisOpenLogFile() DesktopCommandResult {
 	}
 	if path == "" {
 		return errDesktop("TrafficAnalysisOpenLogFile", "log_file", "log_file_unavailable", "no traffic log file is available", false)
+	}
+	if _, err := os.Stat(path); err != nil {
+		return errDesktop("TrafficAnalysisOpenLogFile", "log_file", "log_file_unavailable", "traffic log file is unavailable", false)
 	}
 	if err := a.explorerFunc(path); err != nil {
 		return errDesktop("TrafficAnalysisOpenLogFile", "log_file", "open_log_unsupported", "unable to open the traffic log file", false)
