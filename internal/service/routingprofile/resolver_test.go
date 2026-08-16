@@ -304,6 +304,66 @@ func TestBootstrapEligible_ExtensionPresentInvalidActiveProfileWithValidRoute(t 
 	}
 }
 
+func TestSafeBaselineStateClassification(t *testing.T) {
+	cases := []struct {
+		name     string
+		baseline *slotFile
+		want     string
+	}{
+		{name: "ready", baseline: &slotFile{Provider: deepseek.ProviderID, UpstreamModel: deepseek.ModelFlash, Mode: ModeNormal}, want: "ready"},
+		{name: "missing nil", baseline: nil, want: "missing"},
+		{name: "missing empty provider", baseline: &slotFile{Provider: "", UpstreamModel: deepseek.ModelFlash, Mode: ModeNormal}, want: "missing"},
+		{name: "missing empty model", baseline: &slotFile{Provider: deepseek.ProviderID, UpstreamModel: "", Mode: ModeNormal}, want: "missing"},
+		{name: "invalid thinking mode", baseline: &slotFile{Provider: deepseek.ProviderID, UpstreamModel: deepseek.ModelFlash, Mode: ModeThinking}, want: "invalid"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			table := defaultTable()
+			table.Baseline = tc.baseline
+			r := &SlotResolver{
+				table:               table,
+				activeProfileID:     deepseek.ProviderID,
+				hasProfileExtension: true,
+				activeProfileState:  "present_valid",
+			}
+			if got := r.SafeState().BaselineState; got != tc.want {
+				t.Fatalf("BaselineState = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// The resolver contract: a missing or invalid baseline must never change
+// SlotCount or the Sol/Terra/Luna ready determination. BaselineState is
+// diagnostic-only and never promotes the baseline to a required 4th slot.
+func TestBaselineStateDoesNotAffectSlotReadiness(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		baseline *slotFile
+	}{
+		{name: "missing", baseline: nil},
+		{name: "invalid", baseline: &slotFile{Provider: deepseek.ProviderID, UpstreamModel: deepseek.ModelFlash, Mode: ModeThinking}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			table := defaultTable()
+			table.Baseline = tc.baseline
+			r := &SlotResolver{
+				table:               table,
+				activeProfileID:     deepseek.ProviderID,
+				hasProfileExtension: true,
+				activeProfileState:  "present_valid",
+			}
+			state := r.SafeState()
+			if state.SlotCount != 3 {
+				t.Fatalf("SlotCount = %d, want 3 (baseline must not affect it): %+v", state.SlotCount, state)
+			}
+			if state.SolState != "ready" || state.TerraState != "ready" || state.LunaState != "ready" {
+				t.Fatalf("slot states = %s/%s/%s, want ready/ready/ready: %+v", state.SolState, state.TerraState, state.LunaState, state)
+			}
+		})
+	}
+}
+
 // --- helpers ---
 
 func tableResourcesFromTable(table tableFile) []configgraph.Resource {

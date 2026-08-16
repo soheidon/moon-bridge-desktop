@@ -411,6 +411,7 @@ func renderObservationLine(o TrafficObservation) string {
 			appendLogField(&b, "  sol_state", r.SolState)
 			appendLogField(&b, "  terra_state", r.TerraState)
 			appendLogField(&b, "  luna_state", r.LunaState)
+			appendLogField(&b, "  baseline_state", r.BaselineState)
 			appendLogField(&b, "  normal_result", r.NormalResult)
 			appendLogField(&b, "  resolved_slot", r.ResolvedSlot)
 			appendLogField(&b, "  fallback_result", r.FallbackResult)

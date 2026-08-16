@@ -5,6 +5,7 @@ import type { RoutingModelCapability, RoutingReasoning } from "../types/routingP
 import type { useDeepSeek } from "../hooks/useDeepSeek";
 import type { useRoutingProfiles } from "../hooks/useRoutingProfiles";
 import { RoutingProfileEditor } from "./RoutingProfileEditor";
+import { BaselineAdvancedSettings } from "./BaselineAdvancedSettings";
 
 type DeepSeekState = ReturnType<typeof useDeepSeek>;
 type RoutingState = ReturnType<typeof useRoutingProfiles>;
@@ -158,6 +159,8 @@ export function DeepSeekCard({ snapshot, deepseek, routing }: { snapshot: Gatewa
             capabilities={deepseekCapabilities(deepseek)}
             embedded
           />
+
+          <BaselineAdvancedSettings routing={routing} />
         </div>
       )}
     </section>

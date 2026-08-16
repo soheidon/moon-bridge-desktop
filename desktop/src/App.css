@@ -201,6 +201,19 @@ body {
 .routing-editor-mode-label, .routing-editor-reasoning-label { color: var(--text-secondary); font-size: 11px; font-weight: 600; white-space: nowrap; }
 .routing-editor-reasoning-select { width: 100px !important; min-width: 100px; max-width: 100px; }
 .routing-editor-embedded .deepseek-actions { margin-top: 4px; }
+/* Baseline (詳細設定) — compact standalone form, kept separate from the 6-column
+   .routing-editor-row grid so it doesn't stretch to full width. */
+.baseline-advanced-settings { margin-top: 14px; }
+.baseline-summary-row { display: flex; align-items: center; gap: 10px; }
+.baseline-row-label { font-size: 11px; font-weight: 600; }
+.baseline-summary-row .up-mono { color: var(--text-secondary); }
+.baseline-edit { display: grid; gap: 10px; width: fit-content; max-width: 100%; }
+.baseline-edit-row { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 12px; }
+.baseline-field { display: grid; gap: 3px; }
+.baseline-field-label { font-size: 11px; font-weight: 600; color: var(--text-muted); }
+.baseline-field select { min-width: 160px; padding: 3px 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-input); color: var(--text-primary); font: inherit; font-size: 11px; }
+.baseline-mode-label { font-size: 11px; color: var(--text-secondary); font-weight: 600; white-space: nowrap; padding-bottom: 4px; }
+.baseline-edit-actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; }
 .deepseek-provider-content { display: grid; gap: 8px; padding: 10px 16px 12px 24px; border-bottom: 1px solid var(--border); }
 .deepseek-setting-row { grid-template-columns: 90px max-content; gap: 8px; }
 .deepseek-key-field { display: flex; align-items: center; gap: 8px; }

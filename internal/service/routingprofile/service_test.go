@@ -582,6 +582,39 @@ func TestLoad(t *testing.T) {
 	}
 }
 
+func TestBaselineDefaultPresentInSnapshot(t *testing.T) {
+	graph := configgraph.Graph{Resources: typicalGraph()}
+	snap := SnapshotFromGraph(graph, true)
+	if snap.Baseline == nil {
+		t.Fatal("want a baseline slot in the snapshot")
+	}
+	if snap.Baseline.ID != SlotBaseline || snap.Baseline.DisplayName != "Baseline" {
+		t.Errorf("baseline identity = %q/%q, want baseline/Baseline", snap.Baseline.ID, snap.Baseline.DisplayName)
+	}
+	if snap.Baseline.ProviderID != deepseek.ProviderID || snap.Baseline.ProviderLabel != "DeepSeek" || snap.Baseline.UpstreamModel != deepseek.ModelFlash || snap.Baseline.Mode != ModeNormal {
+		t.Errorf("baseline = %+v, want deepseek/DeepSeek/deepseek-v4-flash/normal", snap.Baseline)
+	}
+	if snap.Baseline.Reasoning != nil {
+		t.Errorf("baseline must not carry reasoning, got %v", *snap.Baseline.Reasoning)
+	}
+}
+
+func TestBaselineSurvivesConfigRoundTrip(t *testing.T) {
+	table := defaultTable()
+	if table.Baseline == nil {
+		t.Fatal("default table must carry a baseline")
+	}
+	graph := configgraph.Graph{Resources: []configgraph.Resource{{
+		Kind:  configgraph.ResourceExtension,
+		ID:    ExtensionResourceID,
+		Value: extensionValue(table),
+	}}}
+	restored := tableFromGraph(graph)
+	if restored.Baseline == nil || restored.Baseline.Provider != deepseek.ProviderID || restored.Baseline.UpstreamModel != deepseek.ModelFlash || restored.Baseline.Mode != ModeNormal {
+		t.Fatalf("baseline not restored through config round-trip: %+v", restored.Baseline)
+	}
+}
+
 // --- helpers ---
 
 func strField(graph configgraph.Graph, kind configgraph.ResourceKind, id, field string) string {

@@ -23,6 +23,7 @@ import (
 type routingProfileController interface {
 	Load(ctx context.Context) (*routingprofile.Snapshot, error)
 	Save(ctx context.Context, input routingprofile.Input) (*routingprofile.Snapshot, error)
+	SaveBaseline(ctx context.Context, input routingprofile.BaselineInput) (*routingprofile.Snapshot, error)
 	// Deprecated: Use ActivateProfile instead. Retained for backward compatibility.
 	ActivateSlot(ctx context.Context, profileID, slotID string) (*routingprofile.Snapshot, error)
 	ActivateProfile(ctx context.Context, profileID string) (*routingprofile.Snapshot, error)
@@ -356,6 +357,71 @@ func (a *App) SaveRoutingProfile(input routingprofile.Input) DesktopCommandResul
 	return okDesktop(&DesktopSnapshot{RoutingProfiles: desktopRoutingProfiles(snap)})
 }
 
+// SaveBaseline persists the global baseline route (provider/model, Mode normal).
+// Runtime routing is unchanged; the baseline is observational only. Mirrors
+// SaveRoutingProfile for the live/stopped split and session refresh.
+func (a *App) SaveBaseline(input routingprofile.BaselineInput) DesktopCommandResult {
+	a.operationMu.Lock()
+	defer a.operationMu.Unlock()
+	if a.closed.Load() {
+		return hostClosed("SaveBaseline")
+	}
+	if err := input.Validate(); err != nil {
+		return routingProfileError("SaveBaseline", "validation", "routing_profile_validate_failed", err)
+	}
+	session, ok := a.ensureActiveSession()
+	if !ok {
+		snap, err := a.saveBaselineToStore(input)
+		if err != nil {
+			var storeErr *routingProfileStoreError
+			if errors.As(err, &storeErr) {
+				return routingProfileError("SaveBaseline", "save", "routing_profile_save_failed", &routingprofile.ServiceError{
+					Kind:            routingprofile.KindSaveRejected,
+					Message:         "routing profile save state requires read-back",
+					MutationStarted: storeErr.mutationStarted,
+					Details: map[string]any{
+						"saved": storeErr.saved,
+					},
+				})
+			}
+			return routingProfileError("SaveBaseline", "save", "routing_profile_save_failed", err)
+		}
+		return okDesktop(&DesktopSnapshot{RoutingProfiles: desktopRoutingProfiles(snap)})
+	}
+	ctrl := a.newRoutingProfile("http://"+session.Address, session.ControlToken)
+	snap, err := ctrl.SaveBaseline(a.appCtx, input)
+	if err != nil {
+		return routingProfileError("SaveBaseline", "save", "routing_profile_save_failed", err)
+	}
+	cfg, derr := a.deriveConfigCodex(session)
+	if derr != nil {
+		session.ConfigValid = false
+		return DesktopCommandResult{
+			OK: false,
+			Error: &CommandError{
+				Operation:       "SaveBaseline",
+				Stage:           "refresh_session_config",
+				Code:            "routing_profile_saved_session_refresh_failed",
+				Message:         "baseline saved but session config refresh failed",
+				Retryable:       true,
+				MutationStarted: true,
+				Details: map[string]any{
+					"saved":                  true,
+					"sessionConfigRefreshed": false,
+					"requiresGatewayRestart": true,
+				},
+			},
+		}
+	}
+	session.Config = cfg
+	session.ConfigValid = true
+	if a.routingProfileRefresh != nil {
+		a.routingProfileRefresh(cfg)
+	}
+	a.emitStatus()
+	return okDesktop(&DesktopSnapshot{RoutingProfiles: desktopRoutingProfiles(snap)})
+}
+
 // saveRoutingProfileToStore persists a routing profile edit to the SQLite store
 // without a live gateway session. When no persisted store exists or it is
 // unseeded, it seeds from the YAML config first then applies the edit.
@@ -407,6 +473,69 @@ func (a *App) saveRoutingProfileToStore(input routingprofile.Input) (*routingpro
 	enabled := true
 	ext.Enabled = &enabled
 	ext.RawConfig = routingprofile.CanonicalConfigForSave(configgraph.BuildGraph(*dbCfg, ""), input)
+	if dbCfg.Extensions == nil {
+		dbCfg.Extensions = map[string]config.ExtensionSettings{}
+	}
+	dbCfg.Extensions["routing_profiles"] = ext
+	if _, err := cs.SaveConfig(context.Background(), dbCfg); err != nil {
+		return nil, err
+	}
+	reloaded, err := cs.LoadAll()
+	if err != nil {
+		return nil, &routingProfileStoreError{err: err, mutationStarted: true, saved: true}
+	}
+	graph := configgraph.BuildGraph(*reloaded, "")
+	snap := routingprofile.SnapshotFromGraph(graph, false)
+	return &snap, nil
+}
+
+// saveBaselineToStore persists a baseline edit to the SQLite store without a
+// live gateway session. It shares the seed-then-apply shape of
+// saveRoutingProfileToStore but updates only the global baseline via
+// CanonicalConfigForBaselineSave.
+func (a *App) saveBaselineToStore(input routingprofile.BaselineInput) (*routingprofile.Snapshot, error) {
+	dbPath, hasStore, err := a.resolveSQLiteDBPath()
+	if err != nil {
+		return nil, err
+	}
+	if !hasStore {
+		return nil, errors.New("no persisted store configured")
+	}
+	needSeed := false
+	if _, serr := os.Stat(dbPath); errors.Is(serr, os.ErrNotExist) {
+		needSeed = true
+	}
+	cs, closeStore, err := openPersistedConfigStore(dbPath, app.BuiltinExtensions().ConfigSpecs())
+	if err != nil {
+		return nil, err
+	}
+	defer closeStore()
+	if needSeed {
+		if err := a.seedStoreFromYAML(cs); err != nil {
+			return nil, err
+		}
+	}
+	dbCfg, err := cs.LoadAll()
+	if err != nil {
+		if !errors.Is(err, store.ErrConfigNotSeeded) {
+			return nil, err
+		}
+		if err := a.seedStoreFromYAML(cs); err != nil {
+			return nil, err
+		}
+		reload, rerr := cs.LoadAll()
+		if rerr != nil {
+			return nil, rerr
+		}
+		dbCfg = reload
+	}
+	ext, ok := dbCfg.Extensions["routing_profiles"]
+	if !ok {
+		ext = config.ExtensionSettings{}
+	}
+	enabled := true
+	ext.Enabled = &enabled
+	ext.RawConfig = routingprofile.CanonicalConfigForBaselineSave(configgraph.BuildGraph(*dbCfg, ""), input)
 	if dbCfg.Extensions == nil {
 		dbCfg.Extensions = map[string]config.ExtensionSettings{}
 	}

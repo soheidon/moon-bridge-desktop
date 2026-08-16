@@ -959,6 +959,7 @@ func newResolverDiagnostic(modelName, serverInstance, configSource string, holde
 		result.SolState = "unknown"
 		result.TerraState = "unknown"
 		result.LunaState = "unknown"
+		result.BaselineState = "unknown"
 		return result
 	}
 	state := stateProvider.SafeState()
@@ -968,6 +969,7 @@ func newResolverDiagnostic(modelName, serverInstance, configSource string, holde
 	result.SolState = state.SolState
 	result.TerraState = state.TerraState
 	result.LunaState = state.LunaState
+	result.BaselineState = state.BaselineState
 	return result
 }
 

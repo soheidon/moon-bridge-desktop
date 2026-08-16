@@ -202,6 +202,7 @@ type TrafficResolverDiagnostic struct {
 	SolState           string `json:"solState,omitempty"`
 	TerraState         string `json:"terraState,omitempty"`
 	LunaState          string `json:"lunaState,omitempty"`
+	BaselineState      string `json:"baselineState,omitempty"`
 	NormalResult       string `json:"normalResult,omitempty"`
 	ResolvedSlot       string `json:"resolvedSlot,omitempty"`
 	FallbackResult     string `json:"fallbackResult,omitempty"`
@@ -423,6 +424,7 @@ type RoutingProfileSnapshot struct {
 	Profiles        []RoutingProfileCard `json:"profiles"`
 	ActiveProfileID string               `json:"activeProfileId"`
 	GatewayRunning  bool                 `json:"gatewayRunning"`
+	Baseline        *RoutingBaseline     `json:"baseline,omitempty"`
 }
 
 // RoutingProfileCard is one routing profile. Active is backend-confirmed from
@@ -446,6 +448,16 @@ type RoutingSlot struct {
 	UpstreamModel string  `json:"upstreamModel"`
 	Mode          string  `json:"mode"`
 	Reasoning     *string `json:"reasoning,omitempty"`
+}
+
+// RoutingBaseline is the secret-free Desktop view of the global baseline route.
+// It carries no reasoning and a fixed normal mode; it is informational only and
+// never drives routing.
+type RoutingBaseline struct {
+	ProviderID    string `json:"providerId"`
+	ProviderLabel string `json:"providerLabel"`
+	UpstreamModel string `json:"upstreamModel"`
+	Mode          string `json:"mode"`
 }
 
 type CodexBackupInfo struct {
@@ -563,6 +575,19 @@ func desktopRoutingProfiles(snap *routingprofile.Snapshot) *RoutingProfileSnapsh
 		Profiles:        profiles,
 		ActiveProfileID: snap.ActiveProfileID,
 		GatewayRunning:  snap.GatewayRunning,
+		Baseline:        desktopRoutingBaseline(snap.Baseline),
+	}
+}
+
+func desktopRoutingBaseline(b *routingprofile.Slot) *RoutingBaseline {
+	if b == nil {
+		return nil
+	}
+	return &RoutingBaseline{
+		ProviderID:    b.ProviderID,
+		ProviderLabel: b.ProviderLabel,
+		UpstreamModel: b.UpstreamModel,
+		Mode:          b.Mode,
 	}
 }
 
@@ -642,7 +667,7 @@ func safeTrafficGatewayEvent(event *trafficanalysis.GatewayEventSummary) *Traffi
 	var resolver *TrafficResolverDiagnostic
 	if event.Resolver != nil {
 		r := event.Resolver
-		resolver = &TrafficResolverDiagnostic{RequestedModel: r.RequestedModel, ServerInstance: r.ServerInstance, ResolverGeneration: r.ResolverGeneration, ResolverPresent: r.ResolverPresent, InstallSource: r.InstallSource, ConfigSource: r.ConfigSource, ExtensionState: r.ExtensionState, ActiveProfileState: r.ActiveProfileState, SlotCount: r.SlotCount, SolState: r.SolState, TerraState: r.TerraState, LunaState: r.LunaState, NormalResult: r.NormalResult, ResolvedSlot: r.ResolvedSlot, FallbackResult: r.FallbackResult, FinalStage: r.FinalStage, KnownAlias: r.KnownAlias}
+		resolver = &TrafficResolverDiagnostic{RequestedModel: r.RequestedModel, ServerInstance: r.ServerInstance, ResolverGeneration: r.ResolverGeneration, ResolverPresent: r.ResolverPresent, InstallSource: r.InstallSource, ConfigSource: r.ConfigSource, ExtensionState: r.ExtensionState, ActiveProfileState: r.ActiveProfileState, SlotCount: r.SlotCount, SolState: r.SolState, TerraState: r.TerraState, LunaState: r.LunaState, BaselineState: r.BaselineState, NormalResult: r.NormalResult, ResolvedSlot: r.ResolvedSlot, FallbackResult: r.FallbackResult, FinalStage: r.FinalStage, KnownAlias: r.KnownAlias}
 	}
 	return &TrafficGatewayEvent{RequestAlias: event.RequestAlias, RequestedModel: event.RequestedModel, RoutingSlot: event.RoutingSlot, ActiveProfile: event.ActiveProfile, Provider: event.Provider, UpstreamModel: event.UpstreamModel, Mode: event.Mode, ConfiguredEffort: event.ConfiguredEffort, Protocol: event.Protocol, Model: event.Model, ResponseModel: event.ResponseModel, Thinking: event.Thinking, EffectiveEffort: event.EffectiveEffort, CredentialState: event.CredentialState, Direction: string(event.Direction), StatusCode: event.StatusCode, ExchangeIndex: event.ExchangeIndex, Streaming: event.Streaming, Resolver: resolver}
 }

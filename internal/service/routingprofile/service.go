@@ -36,6 +36,11 @@ const (
 	SlotSol   = "sol"
 	SlotTerra = "terra"
 	SlotLuna  = "luna"
+	// SlotBaseline is the global, profile-independent safe baseline route. It is
+	// deliberately not part of allSlots/modelToSlot: the resolver never routes to
+	// it at request time. It is surfaced only through the snapshot and resolver
+	// diagnostics as an observable safety reference.
+	SlotBaseline = "baseline"
 
 	providerLabel = "DeepSeek"
 
@@ -72,6 +77,7 @@ type profileFile struct {
 type tableFile struct {
 	ActiveProfile string                  `json:"active_profile,omitempty"`
 	Profiles      map[string]*profileFile `json:"profiles"`
+	Baseline      *slotFile               `json:"baseline,omitempty"`
 }
 
 // --- snapshot (secret-free DTO) ---
@@ -104,6 +110,7 @@ type Snapshot struct {
 	GatewayRunning  bool      `json:"gatewayRunning"`
 	ActiveProfileID string    `json:"activeProfileId"`
 	Profiles        []Profile `json:"profiles"`
+	Baseline        *Slot     `json:"baseline,omitempty"`
 }
 
 // SnapshotFromGraph derives a snapshot from a config graph. The active profile
@@ -127,6 +134,7 @@ func SnapshotFromGraph(graph configgraph.Graph, gatewayRunning bool) Snapshot {
 		GatewayRunning:  gatewayRunning,
 		ActiveProfileID: activeProfileID,
 		Profiles:        profiles,
+		Baseline:        baselineFromTable(table),
 	}
 }
 
@@ -178,6 +186,26 @@ func (in Input) Validate() error {
 		if mode == ModeThinking && slot.Reasoning != nil && !reasoningAllowed(slot.UpstreamModel, *slot.Reasoning) {
 			return invalidInput("profile.slots."+slotID+".reasoning", "slot reasoning must be one of low, high, max")
 		}
+	}
+	return nil
+}
+
+// BaselineInput is the edit payload for the global baseline route. Mode is
+// fixed normal and reasoning is not carried, so only provider/model are
+// editable.
+type BaselineInput struct {
+	Provider      string `json:"provider"`
+	UpstreamModel string `json:"upstreamModel"`
+}
+
+// Validate checks the baseline input shape. Mode is not part of the input: it
+// is always persisted as normal.
+func (in BaselineInput) Validate() error {
+	if strings.TrimSpace(in.Provider) == "" {
+		return invalidInput("baseline.provider", "baseline provider must not be empty")
+	}
+	if strings.TrimSpace(in.UpstreamModel) == "" {
+		return invalidInput("baseline.upstreamModel", "baseline upstreamModel must not be empty")
 	}
 	return nil
 }
@@ -310,6 +338,66 @@ func (s *Service) Save(ctx context.Context, input Input) (*Snapshot, error) {
 	return nil, &ServiceError{
 		Kind:            KindRevisionConflictExceeded,
 		Message:         "configuration changed repeatedly; retry saving the routing profile",
+		MutationStarted: true,
+		Retryable:       true,
+		Details:         residualState(finalGraph),
+	}
+}
+
+// SaveBaseline persists the global, profile-independent baseline route. Mode is
+// fixed normal and reasoning is not carried, so only provider/model are edited.
+// Runtime routing is unchanged: the baseline is surfaced only through the
+// snapshot and resolver diagnostics, never consulted as a request-time fallback.
+func (s *Service) SaveBaseline(ctx context.Context, input BaselineInput) (*Snapshot, error) {
+	if err := input.Validate(); err != nil {
+		return nil, err
+	}
+	for attempt := 0; attempt < maxReconcileAttempts; attempt++ {
+		graph, err := s.api.Graph(ctx)
+		if err != nil {
+			return nil, gatewayFailed(err, "unable to load current configuration", false)
+		}
+		table := tableFromGraph(graph)
+		table.Baseline = inputToBaselineFile(input)
+		_, outcome := s.reconcileSave(ctx, graph, table)
+		if outcome.err != nil {
+			return nil, outcome.err
+		}
+		if outcome.conflict {
+			continue
+		}
+		finalGraph, err := s.api.Graph(ctx)
+		if err != nil {
+			return nil, &ServiceError{
+				Kind:            KindGatewayAPIFailed,
+				Message:         "baseline saved but could not be re-read for verification",
+				MutationStarted: true,
+				Retryable:       true,
+			}
+		}
+		if detail, ok := verifySavedTable(finalGraph, table); !ok {
+			return nil, &ServiceError{
+				Kind:            KindVerifyFailed,
+				Message:         "saved baseline does not match the requested state",
+				MutationStarted: true,
+				Details:         map[string]any{"final_state_mismatch": detail},
+			}
+		}
+		snap := SnapshotFromGraph(finalGraph, true)
+		return &snap, nil
+	}
+	finalGraph, err := s.api.Graph(ctx)
+	if err != nil {
+		return nil, &ServiceError{
+			Kind:            KindGatewayAPIFailed,
+			Message:         "configuration changed repeatedly",
+			MutationStarted: true,
+			Retryable:       true,
+		}
+	}
+	return nil, &ServiceError{
+		Kind:            KindRevisionConflictExceeded,
+		Message:         "configuration changed repeatedly; retry saving the baseline route",
 		MutationStarted: true,
 		Retryable:       true,
 		Details:         residualState(finalGraph),
@@ -775,21 +863,31 @@ func tableFromGraph(graph configgraph.Graph) tableFile {
 			slot.Mode, _ = normalizeSlotMode("", slot.Reasoning)
 		}
 	}
+	// Baseline is a canonicalized, always-present safety reference. A missing
+	// baseline key (legacy config) is filled with the default here; this is lazy
+	// canonicalization, not a migration — it is persisted only on the next save.
+	if table.Baseline == nil {
+		table.Baseline = defaultTable().Baseline
+	} else if table.Baseline.Mode == "" {
+		table.Baseline.Mode, _ = normalizeSlotMode("", nil)
+	}
 	return table
 }
 
 func defaultTable() tableFile {
 	strPtr := func(s string) *string { return &s }
-	return tableFile{Profiles: map[string]*profileFile{
-		deepseek.ProviderID: {
-			DisplayName: providerLabel,
-			Slots: map[string]*slotFile{
-				SlotSol:   {Provider: deepseek.ProviderID, UpstreamModel: deepseek.ModelFlash, Reasoning: strPtr(deepseek.ReasoningMax)},
-				SlotTerra: {Provider: deepseek.ProviderID, UpstreamModel: deepseek.ModelFlash, Reasoning: strPtr(deepseek.ReasoningHigh)},
-				SlotLuna:  {Provider: deepseek.ProviderID, UpstreamModel: deepseek.ModelFlash, Reasoning: nil},
+	return tableFile{
+		Baseline: &slotFile{Provider: deepseek.ProviderID, UpstreamModel: deepseek.ModelFlash, Mode: ModeNormal},
+		Profiles: map[string]*profileFile{
+			deepseek.ProviderID: {
+				DisplayName: providerLabel,
+				Slots: map[string]*slotFile{
+					SlotSol:   {Provider: deepseek.ProviderID, UpstreamModel: deepseek.ModelFlash, Reasoning: strPtr(deepseek.ReasoningMax)},
+					SlotTerra: {Provider: deepseek.ProviderID, UpstreamModel: deepseek.ModelFlash, Reasoning: strPtr(deepseek.ReasoningHigh)},
+					SlotLuna:  {Provider: deepseek.ProviderID, UpstreamModel: deepseek.ModelFlash, Reasoning: nil},
+				},
 			},
-		},
-	}}
+		}}
 }
 
 func profilesFromTable(graph configgraph.Graph, table tableFile, activeProvider string) []Profile {
@@ -831,6 +929,29 @@ func profilesFromTable(graph configgraph.Graph, table tableFile, activeProvider 
 		})
 	}
 	return out
+}
+
+// baselineFromTable maps the global baseline route to the secret-free Slot DTO.
+// It returns nil when the baseline is absent or unconfigured (empty provider or
+// model), so the wire shape has no half-configured baseline.
+func baselineFromTable(table tableFile) *Slot {
+	b := table.Baseline
+	if b == nil || strings.TrimSpace(b.Provider) == "" || strings.TrimSpace(b.UpstreamModel) == "" {
+		return nil
+	}
+	mode := b.Mode
+	if mode == "" {
+		mode = ModeNormal
+	}
+	return &Slot{
+		ID:            SlotBaseline,
+		DisplayName:   "Baseline",
+		ProviderID:    b.Provider,
+		ProviderLabel: providerDisplayLabel(b.Provider),
+		UpstreamModel: b.UpstreamModel,
+		Mode:          mode,
+		Reasoning:     nil,
+	}
 }
 
 func activeRouteProvider(graph configgraph.Graph) string {
@@ -953,6 +1074,15 @@ func inputToProfileFile(in ProfileInput) *profileFile {
 	return p
 }
 
+func inputToBaselineFile(in BaselineInput) *slotFile {
+	return &slotFile{
+		Provider:      strings.TrimSpace(in.Provider),
+		UpstreamModel: strings.TrimSpace(in.UpstreamModel),
+		Mode:          ModeNormal,
+		Reasoning:     nil,
+	}
+}
+
 func extensionValue(table tableFile) map[string]any {
 	return map[string]any{
 		"enabled": true,
@@ -994,6 +1124,15 @@ func CanonicalConfigForSave(graph configgraph.Graph, input Input) map[string]any
 	if _, ok := table.Profiles[table.ActiveProfile]; !ok {
 		table.ActiveProfile = input.Profile.ID
 	}
+	return extensionConfigValue(table)
+}
+
+// CanonicalConfigForBaselineSave builds the canonical routing_profiles extension
+// config value for a stopped-state baseline save, mirroring CanonicalConfigForSave.
+// Only the baseline is updated; profiles and active_profile are preserved.
+func CanonicalConfigForBaselineSave(graph configgraph.Graph, input BaselineInput) map[string]any {
+	table := tableFromGraph(graph)
+	table.Baseline = inputToBaselineFile(input)
 	return extensionConfigValue(table)
 }
 

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { command } from "../platform/desktop";
 import type { GatewaySnapshot } from "../types/gateway";
 import type { CommandError } from "../types/deepseek";
-import type { RoutingProfileInput, RoutingProfileSaveResult, RoutingProfileSaveStatus, RoutingProfileSnapshot } from "../types/routingProfile";
+import type { RoutingBaselineInput, RoutingProfileInput, RoutingProfileSaveResult, RoutingProfileSaveStatus, RoutingProfileSnapshot } from "../types/routingProfile";
 
 type WailsRoutingProfileSnapshot = { routingProfiles?: RoutingProfileSnapshot };
 
@@ -114,6 +114,27 @@ export function useRoutingProfiles(snapshot: GatewaySnapshot) {
     return result.ok;
   }, [saveProfileDetailed]);
 
+  // Baseline is global/profile-independent. The backend auto-branches between a
+  // live gateway save and a stopped persisted-store save, same as profiles.
+  const saveBaseline = useCallback(async (input: RoutingBaselineInput): Promise<boolean> => {
+    if (saving) return false;
+    setSaving(true);
+    setError(null);
+    setCommandError(null);
+    try {
+      const next = await command<WailsRoutingProfileSnapshot>("SaveBaseline", input);
+      if (!next.routingProfiles) throw new Error("routing profiles unavailable");
+      setRouting(next.routingProfiles);
+      return true;
+    } catch (reason) {
+      setCommandError(asCommandError(reason));
+      setError(asCommandErrorMessage(reason));
+      return false;
+    } finally {
+      setSaving(false);
+    }
+  }, [saving]);
+
   const activeProfileId = routing?.activeProfileId ? routing.activeProfileId : null;
   const profiles = routing?.profiles ?? [];
 
@@ -132,6 +153,7 @@ export function useRoutingProfiles(snapshot: GatewaySnapshot) {
     activateProfile,
     saveProfile,
     saveProfileDetailed,
+    saveBaseline,
   };
 }
 

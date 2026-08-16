@@ -204,6 +204,17 @@ The resolved slot keeps its slot ID, active-profile identity, provider, upstream
 
 For DeepSeek V4's Anthropic compatibility, `budget_tokens` is not a control field: the provider documents it as accepted but ignored. The supported observable contract is `thinking.type` plus `output_config.effort`. Invalid mode or effort fails before provider conversion and transport.
 
+## 10b. Baseline route（安全基準ルート）
+
+The routing-profile extension additionally holds a global, profile-independent `config.baseline` (top-level, not a 4th profile slot). It is the internal safety reference route, defaulting to `deepseek / deepseek-v4-flash / normal`.
+
+- Mode is fixed `normal` and carries no reasoning override; only `provider` and `upstream_model` are editable (`SaveBaseline`).
+- It is deliberately **not** part of `allSlots`/`modelToSlot`: the resolver never routes to it at request time. Slot miss remains fail-closed — there is no runtime fallback to Baseline.
+- `SafeResolverState.BaselineState` (`ready`/`missing`/`invalid`) is diagnostic only. It never affects `SlotCount` (3/3) or the Sol/Terra/Luna readiness.
+- A missing baseline key in legacy config is lazily canonicalized on read (filled with the default); it is persisted only on the next save, not migrated.
+
+The card-level 「既定」 label was removed; the "default" role is consolidated into Baseline. 確認済み（実装・単体テスト・build済み）.
+
 ## 11. Internal observability boundary
 
 After JSON decode, Gateway creates an in-process correlation key. Traffic Analysis aliases it to `req#N` and the active profile to `profile#N`; raw values never enter headers, public APIs, DTOs, autosave, errors, or trace output. Two structured event kinds use the existing bounded ring:

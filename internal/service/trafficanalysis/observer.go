@@ -165,6 +165,7 @@ type ResolverDiagnosticInput struct {
 	SolState           string
 	TerraState         string
 	LunaState          string
+	BaselineState      string
 	NormalResult       string
 	ResolvedSlot       string
 	FallbackResult     string
@@ -244,6 +245,7 @@ type ResolverDiagnosticSummary struct {
 	SolState           string `json:"solState,omitempty"`
 	TerraState         string `json:"terraState,omitempty"`
 	LunaState          string `json:"lunaState,omitempty"`
+	BaselineState      string `json:"baselineState,omitempty"`
 	NormalResult       string `json:"normalResult,omitempty"`
 	ResolvedSlot       string `json:"resolvedSlot,omitempty"`
 	FallbackResult     string `json:"fallbackResult,omitempty"`
@@ -454,7 +456,7 @@ func safeResolverDiagnostic(input *ResolverDiagnosticInput) *ResolverDiagnosticS
 		RequestedModel: safeResolverRequestedModel(input.RequestedModel), ServerInstance: safeServerInstance(input.ServerInstance), ResolverGeneration: input.ResolverGeneration, ResolverPresent: input.ResolverPresent,
 		InstallSource: safeEnumDefault(input.InstallSource, "none", "startup", "profile_refresh"), ConfigSource: safeEnumDefault(input.ConfigSource, "unknown", "file_seed", "persisted_store"),
 		ExtensionState: safeEnumDefault(input.ExtensionState, "unknown", "absent", "valid", "invalid"), ActiveProfileState: safeEnumDefault(input.ActiveProfileState, "unknown", "present_valid", "missing", "unknown", "invalid"), SlotCount: clampSlotCount(input.SlotCount),
-		SolState: safeEnumDefault(input.SolState, "unknown", "ready", "missing", "invalid", "reference_unresolved"), TerraState: safeEnumDefault(input.TerraState, "unknown", "ready", "missing", "invalid", "reference_unresolved"), LunaState: safeEnumDefault(input.LunaState, "unknown", "ready", "missing", "invalid", "reference_unresolved"),
+		SolState: safeEnumDefault(input.SolState, "unknown", "ready", "missing", "invalid", "reference_unresolved"), TerraState: safeEnumDefault(input.TerraState, "unknown", "ready", "missing", "invalid", "reference_unresolved"), LunaState: safeEnumDefault(input.LunaState, "unknown", "ready", "missing", "invalid", "reference_unresolved"), BaselineState: safeEnumDefault(input.BaselineState, "unknown", "ready", "missing", "invalid"),
 		NormalResult: safeEnumDefault(input.NormalResult, "unknown", "explicit_route", "slot_hit", "resolver_absent", "alias_miss", "slot_target_unresolved"), ResolvedSlot: safeEnumDefault(input.ResolvedSlot, "unknown", "sol", "terra", "luna", "unknown"), FallbackResult: safeEnumDefault(input.FallbackResult, "not_consulted", "hit", "miss", "target_unresolved", "not_consulted"), FinalStage: safeEnumDefault(input.FinalStage, "unknown", "explicit_route", "exact_slot", "fallback", "not_found"), KnownAlias: input.KnownAlias,
 	}
 }

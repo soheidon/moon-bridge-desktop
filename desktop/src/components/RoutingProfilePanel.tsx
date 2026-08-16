@@ -15,10 +15,6 @@ const REASONING_LABEL: Record<RoutingReasoning, string> = {
 
 const PROVIDER_CATALOG = ["DeepSeek", "MiMo", "MiniMax", "Kimi", "OpenRouter"];
 
-function reasoningLabel(slot: RoutingSlot): string {
-  return slot.reasoning ? REASONING_LABEL[slot.reasoning] : "(既定)";
-}
-
 function placeholderProfile(displayName: string) {
   return {
     id: displayName.toLowerCase(),
@@ -36,7 +32,7 @@ function placeholderProfile(displayName: string) {
 }
 
 function slotSummary(slot: RoutingSlot): string {
-  const reasoning = slot.reasoning ? ` + thinking: ${reasoningLabel(slot)}` : " (既定)";
+  const reasoning = slot.reasoning ? ` + thinking: ${REASONING_LABEL[slot.reasoning]}` : "";
   return `${slot.displayName} → ${slot.upstreamModel}${reasoning}`;
 }
 

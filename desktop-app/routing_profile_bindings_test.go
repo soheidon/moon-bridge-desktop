@@ -39,6 +39,10 @@ func (r *scriptedRoutingProfile) Save(context.Context, routingprofile.Input) (*r
 	return r.snapshot, r.saveErr
 }
 
+func (r *scriptedRoutingProfile) SaveBaseline(context.Context, routingprofile.BaselineInput) (*routingprofile.Snapshot, error) {
+	return r.snapshot, r.saveErr
+}
+
 func (r *scriptedRoutingProfile) ActivateSlot(_ context.Context, profileID, slotID string) (*routingprofile.Snapshot, error) {
 	r.activatedProfile = profileID
 	r.activatedSlot = slotID

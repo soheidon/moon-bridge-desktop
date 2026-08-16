@@ -43,6 +43,7 @@ function routingState(overrides: Record<string, unknown> = {}): ReturnType<typeo
     activateProfile: () => Promise.resolve(true),
     saveProfile: () => Promise.resolve(true),
 		saveProfileDetailed: () => Promise.resolve({ ok: false, snapshot: null, status: "save_failed", error: null }),
+    saveBaseline: () => Promise.resolve(false),
     ...overrides,
   };
 }
@@ -61,7 +62,7 @@ describe("RoutingProfilePanel", () => {
     expect(markup).toContain("Luna");
     expect(markup).toContain("Sol → deepseek-v4-flash + thinking: Max");
     expect(markup).toContain("Terra → deepseek-v4-flash + thinking: High");
-    expect(markup).toContain("Luna → deepseek-v4-flash (既定)");
+    expect(markup).toContain("Luna → deepseek-v4-flash");
     expect(markup).toContain("選択中");
     expect(markup).not.toContain("このプロバイダに切替");
     expect(markup).not.toContain("利用中");

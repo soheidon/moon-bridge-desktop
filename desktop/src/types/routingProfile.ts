@@ -37,11 +37,22 @@ export interface RoutingProfileCard {
   slots: RoutingSlot[];
 }
 
+// The global, profile-independent baseline route. Mode is fixed to "normal" and
+// carries no reasoning override. It is an observable safety reference, not an
+// active fallback: it never participates in slot resolution.
+export interface RoutingBaseline {
+  providerId: string;
+  providerLabel: string;
+  upstreamModel: string;
+  mode: "normal";
+}
+
 // ActiveProfileID is "" on the wire when no profile is active.
 export interface RoutingProfileSnapshot {
   profiles: RoutingProfileCard[];
   activeProfileId: string;
   gatewayRunning: boolean;
+  baseline?: RoutingBaseline;
 }
 
 export interface RoutingSlotInput {
@@ -49,6 +60,13 @@ export interface RoutingSlotInput {
   upstreamModel: string;
   mode?: RoutingMode;
   reasoning?: RoutingReasoning | null; // null = no override (normal)
+}
+
+// Baseline edit payload. Mode is fixed server-side to "normal"; only provider
+// and upstream model are editable.
+export interface RoutingBaselineInput {
+  provider: string;
+  upstreamModel: string;
 }
 
 export interface RoutingProfileInput {

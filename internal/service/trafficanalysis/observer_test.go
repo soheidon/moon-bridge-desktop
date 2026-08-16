@@ -575,7 +575,7 @@ func TestGatewayEventsAliasAndSanitizeWithoutRawKeys(t *testing.T) {
 	first := analyzer.RecordGatewayEvent(GatewayEventInput{Kind: ObservationRoutingResolved, CorrelationKey: "opaque-request-secret", ProfileID: "profile-secret", RequestedModel: "gpt-5.6-luna", RoutingSlot: "luna", Provider: "deepseek", UpstreamModel: "deepseek-v4-flash", Mode: "normal", ConfiguredEffort: ""})
 	second := analyzer.RecordGatewayEvent(GatewayEventInput{Kind: ObservationProviderRequestPrepared, CorrelationKey: "opaque-request-secret", ProfileID: "profile-secret", Provider: "deepseek", Protocol: "anthropic", Model: "deepseek-v4-flash", Thinking: "disabled"})
 	third := analyzer.RecordGatewayEvent(GatewayEventInput{Kind: ObservationProviderResponseReceived, CorrelationKey: "opaque-request-secret", ProfileID: "profile-secret", Provider: "deepseek", Protocol: "anthropic", Model: "deepseek-v4-flash", StatusCode: 200, ExchangeIndex: 1})
-	diagnostic := analyzer.RecordGatewayEvent(GatewayEventInput{Kind: ObservationRoutingResolutionDiagnosed, CorrelationKey: "opaque-request-secret", Resolver: &ResolverDiagnosticInput{RequestedModel: "gpt-5.6-luna", ServerInstance: "server#7", ResolverGeneration: 4, ResolverPresent: true, InstallSource: "startup", ConfigSource: "persisted_store", ExtensionState: "valid", ActiveProfileState: "present_valid", SlotCount: 3, SolState: "ready", TerraState: "ready", LunaState: "ready", NormalResult: "slot_hit", ResolvedSlot: "luna", FallbackResult: "not_consulted", FinalStage: "exact_slot", KnownAlias: true}})
+	diagnostic := analyzer.RecordGatewayEvent(GatewayEventInput{Kind: ObservationRoutingResolutionDiagnosed, CorrelationKey: "opaque-request-secret", Resolver: &ResolverDiagnosticInput{RequestedModel: "gpt-5.6-luna", ServerInstance: "server#7", ResolverGeneration: 4, ResolverPresent: true, InstallSource: "startup", ConfigSource: "persisted_store", ExtensionState: "valid", ActiveProfileState: "present_valid", SlotCount: 3, SolState: "ready", TerraState: "ready", LunaState: "ready", BaselineState: "ready", NormalResult: "slot_hit", ResolvedSlot: "luna", FallbackResult: "not_consulted", FinalStage: "exact_slot", KnownAlias: true}})
 	responseModelSentinel := analyzer.RecordGatewayEvent(GatewayEventInput{Kind: ObservationProviderResponseModel, CorrelationKey: "opaque-request-secret", ProfileID: "profile-secret", Provider: "deepseek", Protocol: "anthropic", ResponseModel: "SENTINEL RESPONSE MODEL"})
 	responseModelKnown := analyzer.RecordGatewayEvent(GatewayEventInput{Kind: ObservationProviderResponseModel, CorrelationKey: "opaque-request-secret", ProfileID: "profile-secret", Provider: "deepseek", Protocol: "anthropic", ResponseModel: "deepseek-v4-flash"})
 	if first.GatewayEvent == nil || second.GatewayEvent == nil || first.GatewayEvent.RequestAlias != second.GatewayEvent.RequestAlias {
@@ -589,6 +589,9 @@ func TestGatewayEventsAliasAndSanitizeWithoutRawKeys(t *testing.T) {
 	}
 	if diagnostic.GatewayEvent == nil || diagnostic.GatewayEvent.Resolver == nil || diagnostic.GatewayEvent.Resolver.RequestedModel != "known_luna" || diagnostic.GatewayEvent.RequestAlias != first.GatewayEvent.RequestAlias {
 		t.Fatalf("resolver diagnostic = %#v", diagnostic.GatewayEvent)
+	}
+	if diagnostic.GatewayEvent.Resolver.BaselineState != "ready" {
+		t.Fatalf("resolver diagnostic baseline state = %q, want ready", diagnostic.GatewayEvent.Resolver.BaselineState)
 	}
 	if responseModelSentinel.GatewayEvent == nil || responseModelSentinel.GatewayEvent.ResponseModel != "unknown" {
 		t.Fatalf("response model sentinel not collapsed to unknown: %#v", responseModelSentinel.GatewayEvent)

@@ -134,6 +134,30 @@ func TestTrafficLogWriterRendersSecretFreeAndFooters(t *testing.T) {
 	}
 }
 
+func TestRenderObservationLineIncludesBaselineState(t *testing.T) {
+	o := TrafficObservation{
+		Kind:      "routing_resolution_diagnosed",
+		Sequence:  1,
+		Timestamp: "2026-08-03T00:00:00Z",
+		Direction: "client_to_upstream",
+		Transport: "http",
+		GatewayEvent: &TrafficGatewayEvent{
+			Resolver: &TrafficResolverDiagnostic{
+				RequestedModel: "gpt-5.6-sol",
+				SlotCount:      3,
+				SolState:       "ready",
+				TerraState:     "ready",
+				LunaState:      "ready",
+				BaselineState:  "ready",
+			},
+		},
+	}
+	got := renderObservationLine(o)
+	if !strings.Contains(got, "baseline_state: ready") {
+		t.Fatalf("renderObservationLine() missing baseline_state: %q", got)
+	}
+}
+
 func TestTrafficLogWriterCloseWithoutFooterLeavesActive(t *testing.T) {
 	dir := t.TempDir()
 	source := &fakeObs{}

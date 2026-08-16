@@ -65,6 +65,7 @@ function routingState(overrides: Record<string, unknown> = {}): Omit<ReturnType<
     refresh: () => Promise.resolve(),
     activateProfile: () => Promise.resolve(true),
     saveProfile: () => Promise.resolve(true),
+    saveBaseline: () => Promise.resolve(false),
     capabilities: [
       { modelId: "deepseek-v4-flash", supportedReasoning: ["low", "high", "max"], defaultReasoning: "high" },
       { modelId: "openrouter/model-a", supportedReasoning: ["low", "high", "max"], defaultReasoning: "high" },

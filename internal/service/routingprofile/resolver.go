@@ -1,6 +1,8 @@
 package routingprofile
 
 import (
+	"strings"
+
 	"moonbridge/internal/service/configgraph"
 )
 
@@ -42,6 +44,7 @@ type SafeResolverState struct {
 	SolState           string `json:"solState"`
 	TerraState         string `json:"terraState"`
 	LunaState          string `json:"lunaState"`
+	BaselineState      string `json:"baselineState"`
 }
 
 // NewSlotResolver builds a SlotResolver from a config graph snapshot.
@@ -106,6 +109,7 @@ func (r *SlotResolver) SafeState() SafeResolverState {
 		SolState:           r.safeSlotState(SlotSol),
 		TerraState:         r.safeSlotState(SlotTerra),
 		LunaState:          r.safeSlotState(SlotLuna),
+		BaselineState:      r.safeBaselineState(),
 	}
 	if r.hasProfileExtension {
 		state.ExtensionState = "valid"
@@ -136,6 +140,21 @@ func (r *SlotResolver) safeSlotState(slotID string) string {
 		return "missing"
 	}
 	if _, err := normalizeSlotMode(slot.Mode, slot.Reasoning); err != nil {
+		return "invalid"
+	}
+	return "ready"
+}
+
+// safeBaselineState classifies the global baseline route for diagnostics only.
+// It never affects SlotCount or the Sol/Terra/Luna ready determination: a
+// missing/invalid baseline must not change the resolver's overall readiness.
+func (r *SlotResolver) safeBaselineState() string {
+	b := r.table.Baseline
+	if b == nil || strings.TrimSpace(b.Provider) == "" || strings.TrimSpace(b.UpstreamModel) == "" {
+		return "missing"
+	}
+	mode, err := normalizeSlotMode(b.Mode, nil)
+	if err != nil || mode != ModeNormal {
 		return "invalid"
 	}
 	return "ready"
