@@ -34,7 +34,7 @@ export function Header({ snapshot, busy, onStart, onStop, gatewayWarning, page, 
       <div className="header-meta">
         {gatewayWarning && <span className="header-warning">Gateway実行中: {gatewayWarning}</span>}
         <nav className="header-nav" aria-label="ページ切替">
-          <span className="version-info">v0.3.0</span>
+          <span className="version-info">v0.4.0</span>
           <button
             type="button"
             className={`header-nav-tab${page === "traffic" ? " active" : ""}`}
