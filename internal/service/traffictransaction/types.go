@@ -56,6 +56,19 @@ const (
 // restart. The value must equal recovery.StatusConfigConflict.
 const ReconciliationStatusConfigConflict = "config_conflict"
 
+// IntegrationTarget mirrors recovery.IntegrationTarget at the transaction
+// boundary. The recovery writer maps these onto recovery.State.IntegrationTarget
+// and derives recovery.State.IntegrationActive from the layer: gateway/analysis
+// are "redirected" (active), original is fully restored (inactive). The values
+// must equal the recovery package's Target* constants.
+type IntegrationTarget string
+
+const (
+	TargetOriginal IntegrationTarget = "original"
+	TargetGateway  IntegrationTarget = "gateway"
+	TargetAnalysis IntegrationTarget = "analysis"
+)
+
 type GatewaySnapshot struct {
 	Running           bool
 	InstanceID        string
@@ -127,6 +140,13 @@ type Checkpoint struct {
 	PreviousPresent              bool
 	PreviousValue                string
 	AppliedValue                 string
+	// IntegrationTarget records which layer the Codex config is redirected to.
+	// OriginalPresent records that the Gateway layer's true original upstream is
+	// recorded; the later S1→S0 gateway Disable uses it to decide whether to
+	// delete the key (false) or restore a recorded value (true). It does not
+	// decide the S2→S1 demote target, which is always gateway.
+	IntegrationTarget IntegrationTarget
+	OriginalPresent   bool
 	BackupID                     string
 	GatewayInstance              string
 	GatewayAddress               string

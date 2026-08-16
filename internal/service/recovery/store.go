@@ -175,6 +175,11 @@ func (s *Store) decode(data []byte) (*State, error) {
 	if st.AppliedOpenaiBaseURL != "" && codexconfig.ValidateTrafficURL(st.AppliedOpenaiBaseURL) != nil {
 		return nil, &Error{Kind: KindRestoreFailed, Message: "recovery applied route is invalid"}
 	}
+	if st.OriginalOpenaiBaseURLPresent {
+		if st.OriginalOpenaiBaseURL == nil || codexconfig.ValidateTrafficURL(*st.OriginalOpenaiBaseURL) != nil {
+			return nil, &Error{Kind: KindRestoreFailed, Message: "recovery original route is invalid"}
+		}
+	}
 	return &st, nil
 }
 
@@ -436,6 +441,14 @@ func (s *Store) normalizeForWrite(st *State) (*State, error) {
 			return nil, &Error{Kind: KindRestoreFailed, Message: "recovery applied route is invalid"}
 		}
 	}
+	if out.OriginalOpenaiBaseURLPresent {
+		if out.OriginalOpenaiBaseURL == nil {
+			return nil, &Error{Kind: KindRestoreFailed, Message: "recovery original route is invalid"}
+		}
+		if err := codexconfig.ValidateTrafficURL(*out.OriginalOpenaiBaseURL); err != nil {
+			return nil, &Error{Kind: KindRestoreFailed, Message: "recovery original route is invalid"}
+		}
+	}
 	if out.ConfigPath != "" {
 		out.ConfigPath, err = s.normalizePath(out.ConfigPath, s.paths.CodexHome)
 		if err != nil {
@@ -536,6 +549,7 @@ func cloneState(st *State) *State {
 		return &v
 	}
 	out.PreviousOpenaiBaseURL = copyStr(st.PreviousOpenaiBaseURL)
+	out.OriginalOpenaiBaseURL = copyStr(st.OriginalOpenaiBaseURL)
 	out.BackupPath = copyStr(st.BackupPath)
 	out.UpdatedAt = copyStr(st.UpdatedAt)
 	out.AutoLogStatus = copyStr(st.AutoLogStatus)
@@ -862,6 +876,9 @@ func assertClassificationOnly(before, after *State) error {
 		before.PreviousOpenaiBaseURLPresent != after.PreviousOpenaiBaseURLPresent ||
 		!strPtrEq(before.PreviousOpenaiBaseURL, after.PreviousOpenaiBaseURL) ||
 		before.AppliedOpenaiBaseURL != after.AppliedOpenaiBaseURL ||
+		before.IntegrationTarget != after.IntegrationTarget ||
+		before.OriginalOpenaiBaseURLPresent != after.OriginalOpenaiBaseURLPresent ||
+		!strPtrEq(before.OriginalOpenaiBaseURL, after.OriginalOpenaiBaseURL) ||
 		before.ConfigHashBeforeApply != after.ConfigHashBeforeApply ||
 		before.ConfigHashAfterApply != after.ConfigHashAfterApply ||
 		!strPtrEq(before.BackupPath, after.BackupPath) ||

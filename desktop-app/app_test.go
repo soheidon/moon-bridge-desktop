@@ -363,12 +363,12 @@ func TestStopGatewayErrorMapping(t *testing.T) {
 
 	timeoutSvc := newScriptedController(gateway.State{Status: gateway.StatusRunning})
 	timeoutSvc.stopFn = func(context.Context) error { return context.DeadlineExceeded }
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     timeoutSvc,
 		NewIdentity: fixedIdentity("inst-x", "tok-x"),
 		ConfigPath:  cfg,
 		EmitEvents:  noopEmit,
-	})
+	}))
 	res := app.StopGateway(StopGatewayRequest{})
 	if res.OK || res.Error == nil {
 		t.Fatalf("StopGateway() = %#v, want timeout failure", res)
@@ -386,12 +386,12 @@ func TestStopGatewayErrorMapping(t *testing.T) {
 
 	failSvc := newScriptedController(gateway.State{Status: gateway.StatusRunning})
 	failSvc.stopFn = func(context.Context) error { return fmt.Errorf("stop boom") }
-	app2 := NewApp(AppOptions{
+	app2 := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     failSvc,
 		NewIdentity: fixedIdentity("inst-x", "tok-x"),
 		ConfigPath:  cfg,
 		EmitEvents:  noopEmit,
-	})
+	}))
 	defer app2.shutdown(context.Background())
 	res2 := app2.StopGateway(StopGatewayRequest{})
 	if res2.OK || res2.Error == nil {
@@ -446,12 +446,12 @@ func TestSnapshotClearsRuntimeFieldsOnStop(t *testing.T) {
 	cfg := writeCaptureAnthropicConfig(t, t.TempDir())
 	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
 	rec := &eventRecorder{}
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  cfg,
 		EmitEvents:  rec.emit,
-	})
+	}))
 	defer app.shutdown(context.Background())
 
 	start := app.StartGateway(StartGatewayRequest{})
@@ -488,12 +488,12 @@ func TestTrafficServiceReusedAcrossGatewayRestarts(t *testing.T) {
 	cfg := writeCaptureAnthropicConfig(t, t.TempDir())
 	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
 	ids, allIDs := sequenceIdentity()
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: ids,
 		ConfigPath:  cfg,
 		EmitEvents:  noopEmit,
-	})
+	}))
 	defer app.shutdown(context.Background())
 
 	// First start.
@@ -552,11 +552,11 @@ func TestConfigPathSeparation(t *testing.T) {
 		t.Fatalf("WriteFile(invalid config) error = %v", err)
 	}
 	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		EmitEvents:  noopEmit,
-	})
+	}))
 	defer app.shutdown(context.Background())
 
 	if got := app.GatewayStatus().Value.ConfigPath; got != "" {
@@ -613,12 +613,12 @@ func TestRestartGatewayFromRunningEmitsStopAndStart(t *testing.T) {
 	cfg := writeCaptureAnthropicConfig(t, t.TempDir())
 	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
 	rec := &eventRecorder{}
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  cfg,
 		EmitEvents:  rec.emit,
-	})
+	}))
 	defer app.shutdown(context.Background())
 
 	if !app.StartGateway(StartGatewayRequest{}).OK {
@@ -735,11 +735,11 @@ func TestGatewayM5Flow(t *testing.T) {
 	configPath := writeCaptureAnthropicConfig(t, t.TempDir())
 	newIdentity, identities := sequenceIdentity()
 	rec := &eventRecorder{}
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		NewIdentity: newIdentity,
 		ConfigPath:  configPath,
 		EmitEvents:  rec.emit,
-	})
+	}))
 	defer app.shutdown(context.Background())
 
 	// 1. StartGateway → running in-process with the DI identity.

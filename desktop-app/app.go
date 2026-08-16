@@ -20,6 +20,7 @@ import (
 	"moonbridge/internal/service/codexlauncher"
 	"moonbridge/internal/service/deepseek"
 	"moonbridge/internal/service/gateway"
+	"moonbridge/internal/service/gatewayintegration"
 	"moonbridge/internal/service/recovery"
 	"moonbridge/internal/service/routingprofile"
 	"moonbridge/internal/service/routingswitch"
@@ -202,6 +203,9 @@ type App struct {
 	recoveryHome      string
 	trafficConfigPath string
 	trafficBackupDir  string
+
+	gatewayInt           *gatewayintegration.Service
+	gatewayIntConfigPath string
 
 	// trafficLog holds the autosave writer for the current capture session. It
 	// is atomic so EndRun (which must not take trafficMu) and TrafficAnalysisStatus
@@ -414,6 +418,10 @@ func (a *App) shutdown(context.Context) {
 	codexCancel()
 	a.codexMu.Unlock()
 
+	// Restore the original upstream before stopping the gateway. Best effort:
+	// a failed restore is retained as recovery evidence for the next boot.
+	_ = a.disableGatewayIntegration()
+
 	gwStopCtx, gwCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	_ = a.svc.Stop(gwStopCtx) // cleanup continues even after traffic failure
 	gwCancel()
@@ -553,6 +561,12 @@ func (a *App) startGatewayLocked(requestPath string) GatewayCommandResult {
 	// The session is built only after Start succeeds: the address materializes
 	// with the successful run, and the control token must be this run's.
 	st := a.svc.Status()
+	// Redirect Codex to this run's gateway address (S0 → S1). A failure here is
+	// classified so the gateway is stopped only when the config is unchanged or
+	// rolled back; a fail-closed or already-integrated outcome keeps it running.
+	if err := a.integrateGateway("http://" + st.Addr); err != nil {
+		return a.gatewayIntegrationError("gateway.start", err)
+	}
 	a.sessionMu.Lock()
 	a.session = &gatewaySession{
 		InstanceID:   st.InstanceID,
@@ -574,6 +588,35 @@ func (a *App) stopGatewayLocked() GatewayCommandResult {
 		a.clearSession()
 		return GatewayCommandResult{OK: true, Value: a.snapshotPtr()}
 	}
+	// 1. Demote the inner Traffic Analysis layer first (S2 → S1) so Codex never
+	// points at a stopped capture listener. Fail-closed: a teardown failure
+	// aborts the whole stop rather than leaving Codex pointing at a dead port.
+	if a.trafficTx != nil {
+		a.trafficMu.Lock()
+		trafficCtx, trafficCancel := context.WithTimeout(a.appCtx, 15*time.Second)
+		st := a.traffic.Status()
+		var trafficErr error
+		switch {
+		case st.Mode == trafficanalysis.ModeDesktop:
+			_, trafficErr = a.trafficTx.Disable(trafficCtx)
+		case st.Mode == trafficanalysis.ModeCaptureOnly && st.CaptureState == "passthrough":
+			_, trafficErr = a.trafficTx.Finish(trafficCtx, false)
+		}
+		trafficCancel()
+		if trafficErr == nil {
+			a.closeTrafficAutosaveLocked(true)
+		}
+		a.trafficMu.Unlock()
+		if trafficErr != nil {
+			return a.fail("gateway.stop", "traffic", "traffic_teardown_failed", "traffic analysis could not be stopped", true, trafficErr)
+		}
+	}
+	// 2. Restore the original upstream (S1 → S0) before the process stops.
+	// disableGatewayIntegration logs its own success/failure diagnostic.
+	if err := a.disableGatewayIntegration(); err != nil {
+		return a.fail("gateway.stop", "integration", "gateway_integration_disable_failed", "gateway integration could not be disabled", true, err)
+	}
+	// 3. Stop the gateway process.
 	stopCtx, cancel := context.WithTimeout(a.appCtx, 10*time.Second)
 	defer cancel()
 	if err := a.svc.Stop(stopCtx); err != nil {
@@ -606,6 +649,49 @@ func (a *App) stopError(operation string, err error) GatewayCommandResult {
 		return res
 	}
 	return a.fail(operation, "stopping", "gateway_stop_failed", "gateway stop failed", false, err)
+}
+
+// integrateGateway binds the outer integration service and redirects Codex to
+// the given gateway address. It is a thin wrapper so startGatewayLocked can
+// classify the failure without reaching into the service.
+func (a *App) integrateGateway(targetURL string) error {
+	gwInt, err := a.ensureGatewayIntegration()
+	if err != nil {
+		return err
+	}
+	return gwInt.Enable(a.appCtx, targetURL)
+}
+
+// disableGatewayIntegration restores the original upstream recorded by the
+// Gateway layer. It is a no-op when nothing is integrated. The Disable outcome
+// is logged so a no-op that hides an orphaned gateway config stays visible.
+func (a *App) disableGatewayIntegration() error {
+	gwInt, err := a.ensureGatewayIntegration()
+	if err != nil {
+		return err
+	}
+	report, err := gwInt.DisableWithReport(a.appCtx)
+	logGatewayDisable(err == nil, report, err)
+	return err
+}
+
+// gatewayIntegrationError classifies a failed gateway integration. A fail-closed
+// or already-integrated outcome leaves the gateway running (Codex may already
+// point at it); any other failure means the config is unchanged or rolled back,
+// so the just-started gateway is stopped.
+func (a *App) gatewayIntegrationError(operation string, err error) GatewayCommandResult {
+	logGatewayIntegrationError(operation, err)
+	if errors.Is(err, gatewayintegration.ErrFailClosed) || errors.Is(err, gatewayintegration.ErrAlreadyIntegrated) {
+		res := a.fail(operation, "integration", "gateway_integration_failed", "gateway integration failed; recovery is required", true, err)
+		res.Error.GatewayLeftRunning = true
+		res.Error.RecoveryRequired = true
+		return res
+	}
+	stopCtx, cancel := context.WithTimeout(a.appCtx, 10*time.Second)
+	defer cancel()
+	_ = a.svc.Stop(stopCtx)
+	a.clearSession()
+	return a.fail(operation, "integration", "gateway_integration_failed", "gateway integration failed", true, err)
 }
 
 func (a *App) fail(operation, stage, code, message string, retryable bool, cause error) GatewayCommandResult {

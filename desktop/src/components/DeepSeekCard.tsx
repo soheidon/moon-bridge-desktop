@@ -118,7 +118,6 @@ export function DeepSeekCard({ snapshot, deepseek, routing }: { snapshot: Gatewa
           {deepseek.progress && <p className="deepseek-hint">{deepseek.progress.message}</p>}
 
           <div className="deepseek-settings-body">
-            {status?.apiKeySet && <p className="deepseek-hint">保存済みAPIキーがある場合は、APIキーが優先されます。</p>}
             <div className="deepseek-setting-row">
               <span className="deepseek-setting-label">環境変数名</span>
               <input

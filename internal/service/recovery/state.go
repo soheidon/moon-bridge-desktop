@@ -35,6 +35,57 @@ const (
 	PhaseInactive           Phase = "inactive"
 )
 
+// IntegrationTarget is the layer that currently owns the Codex openai_base_url
+// redirection. It extends the legacy two-state model (original vs capture) with
+// the Gateway integration layer, so a crash can be rolled back to the true
+// original upstream regardless of which layer was active.
+type IntegrationTarget string
+
+const (
+	TargetOriginal IntegrationTarget = "original"
+	TargetGateway  IntegrationTarget = "gateway"
+	TargetAnalysis IntegrationTarget = "analysis"
+)
+
+// Target resolves the current integration layer. Records written before the
+// three-state model have no integrationTarget; they are inferred from
+// IntegrationActive (legacy only ever activated the analysis/capture layer).
+func (s *State) Target() IntegrationTarget {
+	if s == nil {
+		return TargetOriginal
+	}
+	if s.IntegrationTarget != "" {
+		return s.IntegrationTarget
+	}
+	if s.IntegrationActive {
+		return TargetAnalysis
+	}
+	return TargetOriginal
+}
+
+// OriginalBaseURL returns the true original upstream to restore to when a full
+// integration teardown is required. New-model records store it explicitly
+// (Gateway layer only); a legacy record predating the Gateway layer stored the
+// original upstream in PreviousOpenaiBaseURL, so that is the fallback.
+func (s *State) OriginalBaseURL() (*string, bool) {
+	if s == nil {
+		return nil, false
+	}
+	if s.OriginalOpenaiBaseURLPresent {
+		return s.OriginalOpenaiBaseURL, true
+	}
+	if s.IntegrationTarget != "" {
+		// New three-state record: the Gateway layer is the sole owner of the true
+		// original, so OriginalOpenaiBaseURLPresent=false means the original had no
+		// openai_base_url key. The inner PreviousOpenaiBaseURL is the gateway URL,
+		// not the original, and must not be used as a restore target.
+		return nil, false
+	}
+	// Legacy two-state record: the original upstream was stored in
+	// PreviousOpenaiBaseURL.
+	return s.PreviousOpenaiBaseURL, s.PreviousOpenaiBaseURLPresent
+}
+
 // IsKnownPhase reports whether a persisted Recovery phase is part of the
 // schema-v2 contract. Unknown strings are decoded for forward compatibility,
 // but callers must classify them as recovery-required before taking action.
@@ -113,6 +164,15 @@ type State struct {
 	PreviousOpenaiBaseURLPresent bool    `json:"previousOpenaiBaseUrlPresent"`
 	PreviousOpenaiBaseURL        *string `json:"previousOpenaiBaseUrl,omitempty"` // 適用前（存在時）
 	AppliedOpenaiBaseURL         string  `json:"appliedOpenaiBaseUrl"`
+
+	// IntegrationTarget records which layer currently owns the Codex
+	// openai_base_url redirection (original/gateway/analysis). OriginalOpenaiBaseURL
+	// is the true original upstream recorded by the Gateway layer and preserved
+	// across the inner (analysis) layer's checkpoints; only the Gateway layer
+	// creates or clears it.
+	IntegrationTarget          IntegrationTarget `json:"integrationTarget,omitempty"`
+	OriginalOpenaiBaseURLPresent bool            `json:"originalOpenaiBaseUrlPresent"`
+	OriginalOpenaiBaseURL        *string         `json:"originalOpenaiBaseUrl,omitempty"`
 
 	ConfigHashBeforeApply string  `json:"configHashBeforeApply"` // 全文 SHA-256
 	ConfigHashAfterApply  string  `json:"configHashAfterApply"`  // 全文 SHA-256

@@ -491,7 +491,7 @@ func (s *Service) Disable(ctx context.Context) (Snapshot, error) {
 		return s.disableRecovery(ctx, txID, ownerID, journal, traffic.Generation, false)
 	}
 
-	if err := s.deps.Recovery.Checkpoint(ctx, checkpointForDisable(txID, "", PhaseDisableCompleted, DurableInactive, journal, final.Generation, false)); err != nil {
+	if err := s.deps.Recovery.Checkpoint(ctx, checkpointForDisableDemote(txID, journal, final.Generation, finalConfig.ConfigHash)); err != nil {
 		return s.disableRecovery(ctx, txID, ownerID, journal, traffic.Generation, false)
 	}
 	finalJournal, err := s.deps.Recovery.Current(ctx)
@@ -548,7 +548,10 @@ func (s *Service) Finish(ctx context.Context, discardUnsaved bool) (Snapshot, er
 		return Snapshot{}, safeError(KindFinishPrecondition, "capture relay is not finishable", true)
 	}
 	config, err := s.deps.Config.ReadRootURL(ctx)
-	if err != nil || !matchesPreviousRootURL(config, journal) {
+	// The relay is finishable when the config is at either the demoted applied
+	// value (gateway URL, or the original for a legacy record) or the restored
+	// previous value (a fully restored legacy record with no key present).
+	if err != nil || (!matchesPreviousRootURL(config, journal) && !matchesAppliedRootURL(config, journal)) {
 		return Snapshot{}, safeError(KindFinishPrecondition, "restored configuration evidence is unavailable", true)
 	}
 	if journal.UnsavedObservationsMayRemain && !discardUnsaved {
@@ -614,6 +617,7 @@ func finishCheckpoint(id string, phase Phase, source Checkpoint, generation uint
 		AppliedValue: source.AppliedValue, BackupID: source.BackupID,
 		GatewayInstance: source.GatewayInstance, GatewayAddress: source.GatewayAddress,
 		CaptureGeneration: generation, IntegrationActive: false,
+		IntegrationTarget: source.IntegrationTarget, OriginalPresent: source.OriginalPresent,
 		RelayActive: true, CaptureState: "passthrough",
 		UnsavedObservationsMayRemain: source.UnsavedObservationsMayRemain,
 		UnsavedDiscardConfirmed:      discardUnsaved && source.UnsavedObservationsMayRemain,
@@ -783,6 +787,7 @@ func checkpointFor(id string, phase Phase, prepared *codexconfig.PreparedRootURL
 		GatewayAddress:    gw.Address,
 		CaptureGeneration: generation,
 		IntegrationActive: active,
+		IntegrationTarget: TargetAnalysis,
 	}
 }
 
@@ -809,6 +814,40 @@ func checkpointForDisable(id, owner string, phase Phase, durable DurablePhase, s
 		GatewayAddress:    source.GatewayAddress,
 		CaptureGeneration: generation,
 		IntegrationActive: active,
+		IntegrationTarget: source.IntegrationTarget,
+		OriginalPresent:   source.OriginalPresent,
+	}
+}
+
+// checkpointForDisableDemote builds the final Disable checkpoint. The analysis
+// layer has fully restored Codex to the gateway URL, so the recovery record
+// must demote from analysis back to gateway while preserving the Gateway layer's
+// original-upstream evidence (the writer retains OriginalOpenaiBaseURL). The
+// demote target is always gateway: OriginalPresent only governs whether the
+// later S1→S0 gateway Disable deletes the key or restores a recorded value, and
+// must not decide the S2→S1 state target (doing so would leave the config at
+// :38440 with a recovery record that claims no integration — an orphan). The
+// applied value is the now-current gateway URL (source.PreviousValue), and
+// BeforeHash is empty because the true original hash belongs to the outer
+// Gateway layer and is not recoverable from this layer's journal.
+func checkpointForDisableDemote(id string, source Checkpoint, generation uint64, currentConfigHash string) Checkpoint {
+	return Checkpoint{
+		OperationID:       id,
+		OwnerID:           id,
+		DurablePhase:      DurableInactive,
+		Phase:             PhaseDisableCompleted,
+		BeforeHash:        "",
+		AfterHash:         currentConfigHash,
+		PreviousPresent:   false,
+		PreviousValue:     "",
+		AppliedValue:      source.PreviousValue,
+		BackupID:          source.BackupID,
+		GatewayInstance:   source.GatewayInstance,
+		GatewayAddress:    source.GatewayAddress,
+		CaptureGeneration: generation,
+		IntegrationActive: false,
+		IntegrationTarget: TargetGateway,
+		OriginalPresent:   source.OriginalPresent,
 	}
 }
 

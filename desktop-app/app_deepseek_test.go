@@ -108,13 +108,13 @@ func TestLoadDeepSeekSettingsGatewayNotRunning(t *testing.T) {
 func TestLoadDeepSeekSettingsStaleSessionCleared(t *testing.T) {
 	cfg := writeCaptureAnthropicConfig(t, t.TempDir())
 	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  cfg,
 		EmitEvents:  noopEmit,
 		NewDeepSeek: func(_, _ string) deepSeekController { return &scriptedDeepSeek{snapshot: deepSeekProSnapshot()} },
-	})
+	}))
 	defer app.shutdown(context.Background())
 
 	if !app.StartGateway(StartGatewayRequest{}).OK {
@@ -171,7 +171,7 @@ func TestDeepSeekFactoryRecreatesPerOperation(t *testing.T) {
 	var mu sync.Mutex
 	var calls []factoryCall
 
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: newIdentity,
 		ConfigPath:  cfg,
@@ -182,7 +182,7 @@ func TestDeepSeekFactoryRecreatesPerOperation(t *testing.T) {
 			mu.Unlock()
 			return &scriptedDeepSeek{snapshot: deepSeekProSnapshot()}
 		},
-	})
+	}))
 	defer app.shutdown(context.Background())
 
 	if !app.StartGateway(StartGatewayRequest{}).OK {
@@ -329,7 +329,7 @@ func TestSaveDeepSeekSettingsWithoutPersistedStore(t *testing.T) {
 func TestSaveDeepSeekSettingsSuccess(t *testing.T) {
 	cfg := writeCaptureAnthropicConfig(t, t.TempDir())
 	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  cfg,
@@ -338,7 +338,7 @@ func TestSaveDeepSeekSettingsSuccess(t *testing.T) {
 		// The Live derivation fetches /config/effective over HTTP; inject a
 		// scripted derivation so the unit test does not need a live gateway.
 		DeriveCodex: scriptedDeriver(config.Config{}, nil),
-	})
+	}))
 	defer app.shutdown(context.Background())
 	if !app.StartGateway(StartGatewayRequest{}).OK {
 		t.Fatal("StartGateway() not ok")
@@ -362,7 +362,7 @@ func TestSaveDeepSeekSettingsSuccess(t *testing.T) {
 func TestSaveDeepSeekSettingsSessionRefreshTotalFailure(t *testing.T) {
 	cfg := writeCaptureAnthropicConfig(t, t.TempDir())
 	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  cfg,
@@ -371,7 +371,7 @@ func TestSaveDeepSeekSettingsSessionRefreshTotalFailure(t *testing.T) {
 		// The save succeeds against the (fake) gateway, but the live effective
 		// config fetch fails: derivation must surface partial success, not OK.
 		DeriveCodex: scriptedDeriver(config.Config{}, errors.New("effective fetch failed")),
-	})
+	}))
 	defer app.shutdown(context.Background())
 	if !app.StartGateway(StartGatewayRequest{}).OK {
 		t.Fatal("StartGateway() not ok")
@@ -432,14 +432,14 @@ func TestSaveDeepSeekSettingsConfigValidRecoversOnSubsequentSave(t *testing.T) {
 			return config.Config{}, nil
 		}
 	}
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  cfg,
 		EmitEvents:  noopEmit,
 		NewDeepSeek: func(_, _ string) deepSeekController { return &scriptedDeepSeek{snapshot: deepSeekProSnapshot()} },
 		DeriveCodex: failThenSucceed(),
-	})
+	}))
 	defer app.shutdown(context.Background())
 	if !app.StartGateway(StartGatewayRequest{}).OK {
 		t.Fatal("StartGateway() not ok")
@@ -462,7 +462,7 @@ func TestSaveDeepSeekSettingsConfigValidRecoversOnSubsequentSave(t *testing.T) {
 func TestSaveDeepSeekSettingsMutationError(t *testing.T) {
 	cfg := writeCaptureAnthropicConfig(t, t.TempDir())
 	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  cfg,
@@ -473,7 +473,7 @@ func TestSaveDeepSeekSettingsMutationError(t *testing.T) {
 				saveErr:  &deepseek.ServiceError{Kind: deepseek.ServiceErrorKindSaveRejected, Message: "rejected", MutationStarted: true},
 			}
 		},
-	})
+	}))
 	defer app.shutdown(context.Background())
 	if !app.StartGateway(StartGatewayRequest{}).OK {
 		t.Fatal("StartGateway() not ok")
@@ -542,13 +542,13 @@ func TestDeepSeekErrorMapping(t *testing.T) {
 func TestDesktopEnvelopeAndNoSecretInSnapshot(t *testing.T) {
 	cfg := writeCaptureAnthropicConfig(t, t.TempDir())
 	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  cfg,
 		EmitEvents:  noopEmit,
 		NewDeepSeek: func(_, _ string) deepSeekController { return &scriptedDeepSeek{snapshot: deepSeekProSnapshot()} },
-	})
+	}))
 	defer app.shutdown(context.Background())
 	if !app.StartGateway(StartGatewayRequest{}).OK {
 		t.Fatal("StartGateway() not ok")
@@ -590,7 +590,7 @@ func TestDesktopEnvelopeAndNoSecretInSnapshot(t *testing.T) {
 func TestDeepSeekConnectionSuccess(t *testing.T) {
 	cfg := writeCaptureAnthropicConfig(t, t.TempDir())
 	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  cfg,
@@ -601,7 +601,7 @@ func TestDeepSeekConnectionSuccess(t *testing.T) {
 				Model: "claude-sonnet-20241022", Duration: "120ms",
 			}}
 		},
-	})
+	}))
 	defer app.shutdown(context.Background())
 	if !app.StartGateway(StartGatewayRequest{}).OK {
 		t.Fatal("StartGateway() not ok")
@@ -675,7 +675,7 @@ func TestDeepSeekConnectionGatewayNotRunning(t *testing.T) {
 func TestDeepSeekConnectionTransportError(t *testing.T) {
 	cfg := writeCaptureAnthropicConfig(t, t.TempDir())
 	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  cfg,
@@ -683,7 +683,7 @@ func TestDeepSeekConnectionTransportError(t *testing.T) {
 		NewDeepSeek: func(_, _ string) deepSeekController {
 			return &scriptedDeepSeek{testErr: errors.New("management api unreachable")}
 		},
-	})
+	}))
 	defer app.shutdown(context.Background())
 	if !app.StartGateway(StartGatewayRequest{}).OK {
 		t.Fatal("StartGateway() not ok")

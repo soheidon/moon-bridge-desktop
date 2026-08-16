@@ -283,7 +283,7 @@ func TestGatewayStartupUsesPersistedResolverState(t *testing.T) {
 	}
 	closeStore()
 
-	app := NewApp(AppOptions{ConfigPath: configPath, EmitEvents: noopEmit})
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{ConfigPath: configPath, EmitEvents: noopEmit}))
 	defer app.shutdown(context.Background())
 	if result := app.StartGateway(StartGatewayRequest{}); !result.OK {
 		t.Fatalf("StartGateway() = %#v, want success", result)
@@ -425,7 +425,7 @@ func TestSQLiteDBPathResolutionReusesGatewayResolution(t *testing.T) {
 func TestLoadRoutingProfilesSuccessAndSecretFree(t *testing.T) {
 	cfg := writeCaptureAnthropicConfig(t, t.TempDir())
 	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  cfg,
@@ -433,7 +433,7 @@ func TestLoadRoutingProfilesSuccessAndSecretFree(t *testing.T) {
 		NewRoutingProfile: func(_, _ string) routingProfileController {
 			return &scriptedRoutingProfile{snapshot: routingProfileSnapshot()}
 		},
-	})
+	}))
 	defer app.shutdown(context.Background())
 	if !app.StartGateway(StartGatewayRequest{}).OK {
 		t.Fatal("StartGateway() not ok")
@@ -496,7 +496,7 @@ func TestRoutingProfileFactoryRecreatesPerOperation(t *testing.T) {
 	var mu sync.Mutex
 	var calls []factoryCall
 
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: newIdentity,
 		ConfigPath:  cfg,
@@ -507,7 +507,7 @@ func TestRoutingProfileFactoryRecreatesPerOperation(t *testing.T) {
 			mu.Unlock()
 			return &scriptedRoutingProfile{snapshot: routingProfileSnapshot()}
 		},
-	})
+	}))
 	defer app.shutdown(context.Background())
 	if !app.StartGateway(StartGatewayRequest{}).OK {
 		t.Fatal("StartGateway() not ok")
@@ -567,7 +567,7 @@ func TestActivateRoutingSlotSuccess(t *testing.T) {
 	cfg := writeCaptureAnthropicConfig(t, t.TempDir())
 	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
 	ctrl := &scriptedRoutingProfile{snapshot: routingProfileSnapshot()}
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  cfg,
@@ -576,7 +576,7 @@ func TestActivateRoutingSlotSuccess(t *testing.T) {
 			return ctrl
 		},
 		DeriveCodex: scriptedDeriver(config.Config{}, nil),
-	})
+	}))
 	defer app.shutdown(context.Background())
 	if !app.StartGateway(StartGatewayRequest{}).OK {
 		t.Fatal("StartGateway() not ok")
@@ -601,7 +601,7 @@ func TestActivateRoutingSlotSessionRefreshTotalFailure(t *testing.T) {
 	cfg := writeCaptureAnthropicConfig(t, t.TempDir())
 	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
 	ctrl := &scriptedRoutingProfile{snapshot: routingProfileSnapshot()}
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  cfg,
@@ -610,7 +610,7 @@ func TestActivateRoutingSlotSessionRefreshTotalFailure(t *testing.T) {
 			return ctrl
 		},
 		DeriveCodex: scriptedDeriver(config.Config{}, errors.New("effective fetch failed")),
-	})
+	}))
 	defer app.shutdown(context.Background())
 	if !app.StartGateway(StartGatewayRequest{}).OK {
 		t.Fatal("StartGateway() not ok")
@@ -676,7 +676,7 @@ func TestSaveRoutingProfileSuccess(t *testing.T) {
 	cfg := writeCaptureAnthropicConfig(t, t.TempDir())
 	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
 	ctrl := &scriptedRoutingProfile{snapshot: routingProfileSnapshot()}
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  cfg,
@@ -685,7 +685,7 @@ func TestSaveRoutingProfileSuccess(t *testing.T) {
 			return ctrl
 		},
 		DeriveCodex: scriptedDeriver(config.Config{}, nil),
-	})
+	}))
 	defer app.shutdown(context.Background())
 	if !app.StartGateway(StartGatewayRequest{}).OK {
 		t.Fatal("StartGateway() not ok")
@@ -710,7 +710,7 @@ func TestSaveRoutingProfileMutationError(t *testing.T) {
 		snapshot: routingProfileSnapshot(),
 		saveErr:  &routingprofile.ServiceError{Kind: routingprofile.KindSaveRejected, Message: "rejected", MutationStarted: true},
 	}
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  cfg,
@@ -718,7 +718,7 @@ func TestSaveRoutingProfileMutationError(t *testing.T) {
 		NewRoutingProfile: func(_, _ string) routingProfileController {
 			return ctrl
 		},
-	})
+	}))
 	defer app.shutdown(context.Background())
 	if !app.StartGateway(StartGatewayRequest{}).OK {
 		t.Fatal("StartGateway() not ok")
@@ -924,9 +924,9 @@ func TestSaveRoutingProfileStoppedThenRestartReady(t *testing.T) {
 
 	// Stopped save writes the canonical shape and closes its store.
 	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service: svc, NewIdentity: fixedIdentity("inst-1", "token-1"), ConfigPath: configPath, EmitEvents: noopEmit,
-	})
+	}))
 	if res := app.SaveRoutingProfile(validRoutingProfileInput()); !res.OK || res.Error != nil {
 		app.shutdown(context.Background())
 		t.Fatalf("SaveRoutingProfile() = %#v, want ok", res)
@@ -934,7 +934,7 @@ func TestSaveRoutingProfileStoppedThenRestartReady(t *testing.T) {
 	app.shutdown(context.Background())
 
 	// Fresh app starts a real gateway and re-reads the persisted store.
-	app2 := NewApp(AppOptions{ConfigPath: configPath, EmitEvents: noopEmit})
+	app2 := NewApp(scopedGatewayIntegration(t, AppOptions{ConfigPath: configPath, EmitEvents: noopEmit}))
 	defer app2.shutdown(context.Background())
 	if result := app2.StartGateway(StartGatewayRequest{}); !result.OK {
 		t.Fatalf("StartGateway() = %#v, want success", result)
@@ -1011,7 +1011,7 @@ func TestGatewayStartupMigratesLegacyRoutingProfileTable(t *testing.T) {
 	}
 	closeStore()
 
-	app := NewApp(AppOptions{ConfigPath: configPath, EmitEvents: noopEmit})
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{ConfigPath: configPath, EmitEvents: noopEmit}))
 	defer app.shutdown(context.Background())
 	if result := app.StartGateway(StartGatewayRequest{}); !result.OK {
 		t.Fatalf("StartGateway() = %#v, want success", result)
@@ -1094,7 +1094,7 @@ func TestActivateProfileCallsServiceMethod(t *testing.T) {
 	cfg := writeCaptureAnthropicConfig(t, t.TempDir())
 	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
 	ctrl := &scriptedRoutingProfile{snapshot: routingProfileSnapshot()}
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  cfg,
@@ -1103,7 +1103,7 @@ func TestActivateProfileCallsServiceMethod(t *testing.T) {
 			return ctrl
 		},
 		DeriveCodex: scriptedDeriver(config.Config{}, nil),
-	})
+	}))
 	defer app.shutdown(context.Background())
 	if !app.StartGateway(StartGatewayRequest{}).OK {
 		t.Fatal("StartGateway() not ok")
@@ -1143,7 +1143,7 @@ func TestActivateProfileMutationErrorNoRefresh(t *testing.T) {
 		activateErr: &routingprofile.ServiceError{Kind: routingprofile.KindSaveRejected, Message: "rejected", MutationStarted: true},
 	}
 	var refreshCount int
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  cfg,
@@ -1155,7 +1155,7 @@ func TestActivateProfileMutationErrorNoRefresh(t *testing.T) {
 		RoutingProfileRefresh: func(cfg config.Config) {
 			refreshCount++
 		},
-	})
+	}))
 	defer app.shutdown(context.Background())
 	if !app.StartGateway(StartGatewayRequest{}).OK {
 		t.Fatal("StartGateway() not ok")
@@ -1174,7 +1174,7 @@ func TestSaveRoutingProfileDoesNotChangeActiveProfile(t *testing.T) {
 	cfg := writeCaptureAnthropicConfig(t, t.TempDir())
 	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
 	ctrl := &scriptedRoutingProfile{snapshot: routingProfileSnapshot()}
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  cfg,
@@ -1183,7 +1183,7 @@ func TestSaveRoutingProfileDoesNotChangeActiveProfile(t *testing.T) {
 			return ctrl
 		},
 		DeriveCodex: scriptedDeriver(config.Config{}, nil),
-	})
+	}))
 	defer app.shutdown(context.Background())
 	if !app.StartGateway(StartGatewayRequest{}).OK {
 		t.Fatal("StartGateway() not ok")
@@ -1203,7 +1203,7 @@ func TestSaveAndActivateTriggerRefresh(t *testing.T) {
 	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
 	ctrl := &scriptedRoutingProfile{snapshot: routingProfileSnapshot()}
 	var refreshCount int
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  cfg,
@@ -1215,7 +1215,7 @@ func TestSaveAndActivateTriggerRefresh(t *testing.T) {
 		RoutingProfileRefresh: func(cfg config.Config) {
 			refreshCount++
 		},
-	})
+	}))
 	defer app.shutdown(context.Background())
 	if !app.StartGateway(StartGatewayRequest{}).OK {
 		t.Fatal("StartGateway() not ok")
@@ -1258,7 +1258,7 @@ func TestSaveRoutingProfileRefreshReceivesPostMutationConfig(t *testing.T) {
 	}, deepseek.ProviderID)
 
 	var capturedConfig config.Config
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  cfg,
@@ -1272,7 +1272,7 @@ func TestSaveRoutingProfileRefreshReceivesPostMutationConfig(t *testing.T) {
 		RoutingProfileRefresh: func(cfg config.Config) {
 			capturedConfig = cfg
 		},
-	})
+	}))
 	defer app.shutdown(context.Background())
 	if !app.StartGateway(StartGatewayRequest{}).OK {
 		t.Fatal("StartGateway() not ok")
@@ -1328,7 +1328,7 @@ func TestActivateProfileRefreshReceivesPostMutationConfig(t *testing.T) {
 	}, profileB)
 
 	var capturedConfig config.Config
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  cfg,
@@ -1342,7 +1342,7 @@ func TestActivateProfileRefreshReceivesPostMutationConfig(t *testing.T) {
 		RoutingProfileRefresh: func(cfg config.Config) {
 			capturedConfig = cfg
 		},
-	})
+	}))
 	defer app.shutdown(context.Background())
 	if !app.StartGateway(StartGatewayRequest{}).OK {
 		t.Fatal("StartGateway() not ok")

@@ -109,10 +109,12 @@ func TestRealTrafficBindingLifecycle(t *testing.T) {
 	if _, err := app.ensureTrafficTransaction(); err != nil {
 		t.Fatalf("ensureTrafficTransaction() error = %v (recoveryHome=%q configHome=%q)", err, app.recoveryHome, filepath.Dir(codexPath))
 	}
-	if state, err := store.Load(context.Background()); err != nil {
+	state, err := store.Load(context.Background())
+	if err != nil {
 		t.Fatalf("initial recovery Load() error = %v", err)
-	} else if state != nil {
-		t.Fatalf("initial recovery state = %#v, want absent", state)
+	}
+	if state == nil || state.IntegrationTarget != recovery.TargetGateway || !state.IntegrationActive {
+		t.Fatalf("initial recovery state = %#v, want gateway integration active", state)
 	}
 	if unresolved, err := (trafficRecoveryWriter{store: store, configHome: codexHome, backupDir: backupDir}).HasUnresolved(context.Background()); err != nil || unresolved {
 		t.Fatalf("initial recovery unresolved = %v, error=%v, want false", unresolved, err)

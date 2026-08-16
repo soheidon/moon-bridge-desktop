@@ -79,6 +79,12 @@ Content-Type: text/event-stream
 
 ただし最新観測ではPOST + SSEが使用されているため、Codex DesktopのResponses通信は単一transportに固定されているとはみなさない。HTTP/SSEとWebSocketの双方を互換対象とし、選択条件は未確定とする。
 
+### 4.4 GET /responses ポーリング（確認済み 2026-08-16）
+
+実機でCodex Desktopが `/responses` へGETを繰り返すことを観測した。Moon Bridge Gatewayはこれに
+405 Method Not Allowed（"方法不允许"）を返すが、続くPOST /responsesは正常に処理され、upstream応答まで
+返る。このGETは推論要求ではなく、POST経路を妨げないため現行実装では許容される。
+
 ## 5. Request Content-Encoding
 
 ### 5.1 zstd

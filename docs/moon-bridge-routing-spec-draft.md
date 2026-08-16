@@ -506,6 +506,31 @@ stream response
 Codex Desktop
 ```
 
+上記はCapture Proxyを経由する経路の確認である。
+
+### 19.1 Gateway単独経路（Traffic Analysis OFF）— 確認済み（2026-08-16）
+
+三状態モデルのS1（Gateway ON / Traffic Analysis OFF）が実機で成立した。
+
+```text
+Codex Desktop
+   │ openai_base_url = http://127.0.0.1:38440
+   ▼
+Moon Bridge Gateway :38440
+   ▼
+routing profile slot
+   ▼
+DeepSeek upstream
+   ▼
+stream response
+   ▼
+Codex Desktop
+```
+
+Gateway process start・routing resolver・`:38440` listen・`gatewayintegration.Enable` が全て成功し、
+routing profile の picker model（gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna）が upstream model
+（deepseek-v4-pro / deepseek-v4-flash）へ解決され、実通信が DeepSeek まで到達した。
+
 ## 20. 禁止fallback
 
 Traffic exact mappingでは次を導入しない。

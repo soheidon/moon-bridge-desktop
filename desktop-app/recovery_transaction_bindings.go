@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"moonbridge/internal/service/codexconfig"
+	"moonbridge/internal/service/gatewayintegration"
 	"moonbridge/internal/service/recovery"
 	"moonbridge/internal/service/routingswitch"
 	"moonbridge/internal/service/trafficanalysis"
@@ -187,7 +188,11 @@ func (a *App) restoreRecovery(ctx context.Context, input RestoreRecoveryInput) (
 			return nil, errRecoveryConflict
 		}
 	}
-	if current.ConfigHash == state.ConfigHashBeforeApply {
+	// Fully restored: the current config already matches the true original
+	// upstream (Gateway layer evidence, or the legacy Previous value). With the
+	// three-state model the inner layer's BeforeHash is the gateway URL, so the
+	// "already restored" test compares values, not the BeforeHash.
+	if sameRestoreTarget(current, state) {
 		if err := a.cleanupRecoveryBackup(state); err != nil {
 			return nil, unsafeAtKind("noop_cleanup_backup", err)
 		}
@@ -202,14 +207,11 @@ func (a *App) restoreRecovery(ctx context.Context, input RestoreRecoveryInput) (
 		}
 		return a.desktopSnapshot(ctx)
 	}
-	if current.ConfigHash != state.ConfigHashAfterApply && !input.ConfirmConflict {
-		return nil, errRecoveryConflict
-	}
 	var desired *string
-	if state.PreviousOpenaiBaseURLPresent {
+	if original, present := state.OriginalBaseURL(); present {
 		value := ""
-		if state.PreviousOpenaiBaseURL != nil {
-			value = *state.PreviousOpenaiBaseURL
+		if original != nil {
+			value = *original
 		}
 		desired = &value
 	}
@@ -227,7 +229,7 @@ func (a *App) restoreRecovery(ctx context.Context, input RestoreRecoveryInput) (
 	if verified.ConfigHash != prepared.AfterHash {
 		return nil, unsafeAt("verify_root_url_hash_mismatch")
 	}
-	if !samePreviousURL(verified, state) {
+	if !sameRestoreTarget(verified, state) {
 		return nil, unsafeAt("verify_root_url_previous_mismatch")
 	}
 	if err := a.cleanupRecoveryBackup(state); err != nil {
@@ -338,6 +340,12 @@ func safeError(err error) string {
 		return "recovery_unknown_phase"
 	case errors.Is(err, errRecoveryStateChanged):
 		return "recovery_state_changed"
+	case errors.Is(err, gatewayintegration.ErrAlreadyIntegrated):
+		return "already_integrated"
+	case errors.Is(err, gatewayintegration.ErrFailClosed):
+		return "fail_closed"
+	case errors.Is(err, gatewayintegration.ErrDisableConflict):
+		return "disable_conflict"
 	}
 	return "internal_error"
 }
@@ -358,14 +366,15 @@ func (a *App) validateRecoveryConfigProfile(ctx context.Context, state *recovery
 	return nil
 }
 
-func samePreviousURL(current codexconfig.RootURLSnapshot, state *recovery.State) bool {
-	if current.Present != state.PreviousOpenaiBaseURLPresent {
+func sameRestoreTarget(current codexconfig.RootURLSnapshot, state *recovery.State) bool {
+	original, present := state.OriginalBaseURL()
+	if current.Present != present {
 		return false
 	}
 	if !current.Present {
 		return true
 	}
-	return state.PreviousOpenaiBaseURL != nil && current.Value == *state.PreviousOpenaiBaseURL
+	return original != nil && current.Value == *original
 }
 
 func (a *App) markRecoveryRestored(ctx context.Context, expected *recovery.State) error {
@@ -374,6 +383,12 @@ func (a *App) markRecoveryRestored(ctx context.Context, expected *recovery.State
 			return errRecoveryStateChanged
 		}
 		current.IntegrationActive = false
+		current.IntegrationTarget = recovery.TargetOriginal
+		current.OriginalOpenaiBaseURL = nil
+		current.OriginalOpenaiBaseURLPresent = false
+		current.PreviousOpenaiBaseURL = nil
+		current.PreviousOpenaiBaseURLPresent = false
+		current.AppliedOpenaiBaseURL = ""
 		current.Phase = recovery.PhaseReconciledRestored
 		current.CleanupPending = nil
 		status := string(recovery.StatusAlreadyRestored)
@@ -400,6 +415,9 @@ func sameRecoveryState(a, b *recovery.State) bool {
 	}
 	return a.SchemaVersion == b.SchemaVersion && a.IntegrationActive == b.IntegrationActive &&
 		a.Phase == b.Phase && a.OperationID == b.OperationID &&
+		a.IntegrationTarget == b.IntegrationTarget &&
+		a.OriginalOpenaiBaseURLPresent == b.OriginalOpenaiBaseURLPresent &&
+		stringValue(a.OriginalOpenaiBaseURL) == stringValue(b.OriginalOpenaiBaseURL) &&
 		a.ConfigHashBeforeApply == b.ConfigHashBeforeApply && a.ConfigHashAfterApply == b.ConfigHashAfterApply &&
 		stringValue(a.BackupPath) == stringValue(b.BackupPath) &&
 		cleanupPendingEqual(a.CleanupPending, b.CleanupPending) &&

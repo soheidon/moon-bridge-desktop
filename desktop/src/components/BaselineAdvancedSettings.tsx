@@ -19,15 +19,15 @@ function optionsFor(options: { value: string; label: string }[], current: string
   return [{ value: current, label: current || "（未設定）" }, ...options];
 }
 
-// Baseline is the global, profile-independent reference route. It is observable
-// (editable + persistable) but never drives runtime slot resolution, so the
-// locked → editing → saved flow is deliberately explicit: editing alone changes
-// nothing at runtime; only a successful save persists the edited values.
+// Rarely-touched global safety reference; collapsed behind an accordion by
+// default. 編集 unlocks Provider / 上流モデル (Mode stays fixed Normal).
 export function BaselineAdvancedSettings({ routing }: { routing: Routing }) {
   const baseline = routing.routing?.baseline;
+  const [expanded, setExpanded] = useState(false);
   const [stage, setStage] = useState<"locked" | "editing">("locked");
   const [provider, setProvider] = useState(baseline?.providerId ?? "deepseek");
   const [upstreamModel, setUpstreamModel] = useState(baseline?.upstreamModel ?? "deepseek-v4-flash");
+  const locked = stage === "locked";
 
   function unlock() {
     setProvider(baseline?.providerId ?? "deepseek");
@@ -51,57 +51,62 @@ export function BaselineAdvancedSettings({ routing }: { routing: Routing }) {
     if (ok) setStage("locked");
   }
 
+  const contentId = "baseline-content";
+
   return (
     <section className="baseline-advanced-settings" aria-labelledby="baseline-advanced-title">
-      <h3 id="baseline-advanced-title">Baseline（詳細設定）</h3>
-      <p className="deepseek-hint">内部の安全基準ルート。通常のルーティングには使用されません。</p>
-
-      {stage === "locked" ? (
-        <div className="baseline-summary-row">
-          <span className="baseline-row-label">Baseline</span>
-          <span className="up-mono">{baseline ? `${baseline.providerLabel} / ${baseline.upstreamModel} / Normal` : "未設定"}</span>
-          <button type="button" className="btn btn-secondary btn-small" onClick={unlock}>編集</button>
-        </div>
-      ) : (
-        <div className="baseline-edit" role="group" aria-label="Baseline設定">
-          <div className="baseline-edit-row">
-            <label className="baseline-field">
-              <span className="baseline-field-label">プロバイダ</span>
-              <select
-                aria-label="Baseline プロバイダ"
-                value={provider}
-                onChange={(event) => setProvider(event.target.value)}
-                disabled={routing.saving}
+      <button
+        type="button"
+        className="baseline-summary"
+        aria-expanded={expanded}
+        aria-controls={contentId}
+        onClick={() => setExpanded((current) => !current)}
+      >
+        <span className="baseline-summary-chevron" aria-hidden="true">{expanded ? "▾" : "▸"}</span>
+        <span id="baseline-advanced-title" className="baseline-heading">Baseline（詳細設定）</span>
+      </button>
+      {expanded && (
+        <div id={contentId} className="baseline-row" role="group" aria-label="Baseline設定">
+          <select
+            className="baseline-select baseline-select-provider"
+            aria-label="Baseline プロバイダ"
+            value={provider}
+            onChange={(event) => setProvider(event.target.value)}
+            disabled={locked || routing.saving}
+          >
+            {optionsFor(PROVIDER_OPTIONS, provider).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+          </select>
+          <select
+            className="baseline-select baseline-select-model"
+            aria-label="Baseline 上流モデル"
+            value={upstreamModel}
+            onChange={(event) => setUpstreamModel(event.target.value)}
+            disabled={locked || routing.saving}
+          >
+            {optionsFor(MODEL_OPTIONS, upstreamModel).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+          </select>
+          <span className="routing-editor-mode-label">モード:</span>
+          <select className="baseline-select baseline-select-mode" aria-label="Baseline モード" value="normal" disabled>
+            <option value="normal">Normal</option>
+          </select>
+          {locked ? (
+            <button type="button" className="btn btn-secondary btn-small" disabled={routing.saving} onClick={unlock}>編集</button>
+          ) : (
+            <>
+              <button
+                type="button"
+                className="btn btn-primary btn-small"
+                disabled={routing.saving || provider.trim() === "" || upstreamModel.trim() === ""}
+                onClick={() => void save()}
               >
-                {optionsFor(PROVIDER_OPTIONS, provider).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-              </select>
-            </label>
-            <label className="baseline-field">
-              <span className="baseline-field-label">上流モデル</span>
-              <select
-                aria-label="Baseline 上流モデル"
-                value={upstreamModel}
-                onChange={(event) => setUpstreamModel(event.target.value)}
-                disabled={routing.saving}
-              >
-                {optionsFor(MODEL_OPTIONS, upstreamModel).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-              </select>
-            </label>
-            <span className="baseline-mode-label">モード: Normal（固定）</span>
-          </div>
-          <div className="baseline-edit-actions">
-            <button
-              type="button"
-              className="btn btn-primary btn-small"
-              disabled={routing.saving || provider.trim() === "" || upstreamModel.trim() === ""}
-              onClick={() => void save()}
-            >
-              保存
-            </button>
-            <button type="button" className="btn btn-secondary btn-small" disabled={routing.saving} onClick={cancel}>キャンセル</button>
-            {routing.saving && <span className="deepseek-hint">保存中…</span>}
-            {routing.error && <span className="error-text">{routing.error}</span>}
-          </div>
+                保存
+              </button>
+              <button type="button" className="btn btn-secondary btn-small" disabled={routing.saving} onClick={cancel}>キャンセル</button>
+            </>
+          )}
+          {routing.saving && <span className="deepseek-hint">保存中…</span>}
+          {routing.error && <span className="error-text">{routing.error}</span>}
+          <span className="baseline-note">内部の安全基準ルート。通常のルーティングには使用されません。</span>
         </div>
       )}
     </section>

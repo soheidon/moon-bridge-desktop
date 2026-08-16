@@ -73,12 +73,12 @@ func TestRealGatewayDeepSeekSavePersistsToSQLite(t *testing.T) {
 	configPath, dbPath := integrationConfig(t, "server-tok")
 	svc := gateway.NewService(gateway.ServiceOptions{Errors: os.Stderr})
 	newIdentity, _ := sequenceIdentity()
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: newIdentity,
 		ConfigPath:  configPath,
 		EmitEvents:  noopEmit,
-	})
+	}))
 	defer app.shutdown(context.Background())
 
 	start := app.StartGateway(StartGatewayRequest{})
@@ -186,12 +186,12 @@ func TestRealGatewayClearDeepSeekKeyWhileStopped(t *testing.T) {
 	t.Setenv("DEEPSEEK_API_KEY", "")
 	configPath, _ := integrationConfig(t, "server-tok")
 	svc := gateway.NewService(gateway.ServiceOptions{Errors: os.Stderr})
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  configPath,
 		EmitEvents:  noopEmit,
-	})
+	}))
 	defer app.shutdown(context.Background())
 
 	if !app.StartGateway(StartGatewayRequest{}).OK {
@@ -253,12 +253,12 @@ func TestRealGatewayClearDeepSeekKeyStoppedProviderMissing(t *testing.T) {
 	t.Setenv("DEEPSEEK_API_KEY", "")
 	configPath, _ := integrationConfig(t, "server-tok")
 	svc := gateway.NewService(gateway.ServiceOptions{Errors: os.Stderr})
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  configPath,
 		EmitEvents:  noopEmit,
-	})
+	}))
 	defer app.shutdown(context.Background())
 
 	if !app.StartGateway(StartGatewayRequest{}).OK {
@@ -283,12 +283,12 @@ func TestRealGatewayClearDeepSeekKeyStoppedProviderMissing(t *testing.T) {
 func TestRealGatewayLoadWithoutSave(t *testing.T) {
 	configPath, _ := integrationConfig(t, "server-tok")
 	svc := gateway.NewService(gateway.ServiceOptions{Errors: os.Stderr})
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  configPath,
 		EmitEvents:  noopEmit,
-	})
+	}))
 	defer app.shutdown(context.Background())
 	if !app.StartGateway(StartGatewayRequest{}).OK {
 		t.Fatal("StartGateway() not ok")

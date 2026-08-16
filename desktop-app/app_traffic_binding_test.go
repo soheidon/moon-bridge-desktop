@@ -221,7 +221,11 @@ func TestTrafficAnalysisObservationsBindingSafeEmpty(t *testing.T) {
 }
 
 func TestRecoveryBindingsReturnSafeStructuredErrorsWhenUnavailable(t *testing.T) {
-	app := NewApp(AppOptions{})
+	// Scoped to an empty temp profile so the assertions don't depend on the
+	// developer's real config.toml / recovery state (which a prior smoke test
+	// may have left a record in). With an empty store, restore hits the
+	// "load_state" unavailable path and discard requires explicit confirmation.
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{}))
 	for name, result := range map[string]DesktopCommandResult{
 		"restore": app.RestoreRecovery(RestoreRecoveryInput{}),
 		"discard": app.DiscardRecovery(DiscardRecoveryInput{}),

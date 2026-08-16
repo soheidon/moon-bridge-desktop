@@ -416,7 +416,15 @@ func (r trafficRecoveryWriter) Checkpoint(ctx context.Context, cp traffictransac
 		}
 		current.SchemaVersion = recovery.SchemaVersion
 		current.Phase = phase
-		current.IntegrationActive = cp.IntegrationActive
+		current.IntegrationTarget = recovery.IntegrationTarget(cp.IntegrationTarget)
+		switch cp.IntegrationTarget {
+		case traffictransaction.TargetGateway, traffictransaction.TargetAnalysis:
+			current.IntegrationActive = true
+		case traffictransaction.TargetOriginal:
+			current.IntegrationActive = false
+		default:
+			current.IntegrationActive = cp.IntegrationActive
+		}
 		current.OperationID = cp.OperationID
 		current.ConfigPath = "config.toml"
 		current.CodexHomeFingerprint = fp
@@ -457,6 +465,13 @@ func (r trafficRecoveryWriter) Checkpoint(ctx context.Context, cp traffictransac
 		log.Printf("traffic checkpoint failed: stage=%q checkpoint_phase=%q recovery_phase=%q cause=%q field=%q",
 			"recovery_checkpoint", cp.Phase, recoveryPhaseForCheckpoint(cp), f.Cause, f.Field)
 		return err
+	}
+	if cp.Phase == traffictransaction.PhaseDisableCompleted {
+		// S2→S1 demote: Codex is back on the gateway URL, so the recovery record
+		// must land on gateway. Logging the actual target here makes the demote
+		// (always gateway after the Plan 9-21 fix) observable in the desktop log
+		// without exposing the URL or any secret.
+		log.Printf("traffic demote: recovery_target=%q original_present=%t", cp.IntegrationTarget, cp.OriginalPresent)
 	}
 	return nil
 }
@@ -549,6 +564,11 @@ func checkpointFromRecovery(st *recovery.State) traffictransaction.Checkpoint {
 	if st.ReconciliationStatus != nil {
 		reconciliationStatus = *st.ReconciliationStatus
 	}
+	// The traffic (analysis) layer is active only when the persisted target is
+	// analysis. A gateway-only redirect (S1) leaves State.IntegrationActive true
+	// for recovery purposes but is NOT active for the traffic transaction's
+	// ownership preconditions, so it is derived from the target, not the raw flag.
+	trafficActive := st.Target() == recovery.TargetAnalysis
 	durable := traffictransaction.DurableInactive
 	phase := traffictransaction.Phase(st.Phase)
 	switch st.Phase {
@@ -557,7 +577,7 @@ func checkpointFromRecovery(st *recovery.State) traffictransaction.Checkpoint {
 		// Recovery v2 names the durable state integration_applied, while the
 		// in-process transaction uses config_committed for the same checkpoint.
 		// Preserve that distinction when validating the final Enable state.
-		if st.IntegrationActive {
+		if trafficActive {
 			phase = traffictransaction.PhaseConfigCommitted
 		}
 	case recovery.PhaseRecovered:
@@ -574,7 +594,9 @@ func checkpointFromRecovery(st *recovery.State) traffictransaction.Checkpoint {
 		// generation. A reloaded record is evidence-only and never used to
 		// guess ownership, so generation remains zero here.
 		CaptureGeneration: 0,
-		IntegrationActive: st.IntegrationActive, RelayActive: st.RelayActiveLastKnown,
+		IntegrationActive: trafficActive, RelayActive: st.RelayActiveLastKnown,
+		IntegrationTarget: traffictransaction.IntegrationTarget(st.Target()),
+		OriginalPresent:   st.OriginalOpenaiBaseURLPresent,
 		CaptureState:                 st.CaptureStateLastKnown,
 		UnsavedObservationsMayRemain: st.UnsavedObservationsMayRemain,
 		UnsavedDiscardConfirmed:      st.UnsavedDiscardConfirmed,

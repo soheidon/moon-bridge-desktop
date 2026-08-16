@@ -80,7 +80,7 @@ func newCodexApp(t *testing.T, codex codexController) *App {
 	t.Helper()
 	cfg := writeCaptureAnthropicConfig(t, t.TempDir())
 	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
-	return NewApp(AppOptions{
+	return NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  cfg,
@@ -89,7 +89,7 @@ func newCodexApp(t *testing.T, codex codexController) *App {
 		// Launch now derives codex config from the live effective store over
 		// HTTP; inject a scripted derivation so the unit test needs no gateway.
 		DeriveCodex: scriptedDeriver(config.Config{}, nil),
-	})
+	}))
 }
 
 func TestLaunchCodexGatewayNotRunning(t *testing.T) {
@@ -278,13 +278,13 @@ func TestShutdownStopsCodexWithShutdownReason(t *testing.T) {
 	svc := newScriptedController(gateway.State{Status: gateway.StatusStopped})
 	cfg := writeCaptureAnthropicConfig(t, t.TempDir())
 	codex := &scriptedCodex{}
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  cfg,
 		EmitEvents:  noopEmit,
 		Codex:       codex,
-	})
+	}))
 	if !app.StartGateway(StartGatewayRequest{}).OK {
 		t.Fatal("StartGateway() not ok")
 	}
@@ -416,7 +416,7 @@ func TestShutdownInterruptsInflightCodexLaunch(t *testing.T) {
 			return codexlauncher.State{}, context.Canceled
 		},
 	}
-	app := NewApp(AppOptions{
+	app := NewApp(scopedGatewayIntegration(t, AppOptions{
 		Service:     svc,
 		NewIdentity: fixedIdentity("inst-1", "token-1"),
 		ConfigPath:  cfg,
@@ -426,7 +426,7 @@ func TestShutdownInterruptsInflightCodexLaunch(t *testing.T) {
 		// derivation; inject a scripted deriver so the HTTP effective fetch does
 		// not block before the codex launchFn is reached.
 		DeriveCodex: scriptedDeriver(config.Config{}, nil),
-	})
+	}))
 	if !app.StartGateway(StartGatewayRequest{}).OK {
 		t.Fatal("StartGateway() not ok")
 	}

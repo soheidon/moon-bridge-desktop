@@ -23,7 +23,6 @@ export function AppPages({ page, snapshot, gateway, deepseek, routing, traffic }
   if (page === "settings") {
     return (
       <main className="settings-page">
-        <div className="settings-header"><h2 className="settings-header-title">設定</h2></div>
         <section className="settings-block provider-settings-block" aria-labelledby="api-keys-title">
           <div className="settings-block-header">
             <h2 id="api-keys-title">APIキー</h2>

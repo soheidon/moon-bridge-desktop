@@ -118,37 +118,51 @@ func (c classification) PhasePtr() *Phase {
 }
 
 // classifyCur classifies the current config hash against the persisted recovery
-// state, mirroring the Rust classify_recovery_after_startup. It never rewrites
-// the codex config, never boots gateway/capture, and never auto-restores; the
-// caller records only the classification into the recovery-state JSON.
+// state. It never rewrites the codex config, never boots gateway/capture, and
+// never auto-restores; the caller records only the classification into the
+// recovery-state JSON.
 //
-//   - applied: current hash == configHashAfterApply (capture-applied candidate)
-//   - original: current hash == configHashBeforeApply (reverted)
-//   - neither:  external change during an active integration → conflict
+// The three-state model (original / gateway / analysis) decides the meaning of
+// the persisted before/after hashes: the gateway layer's "before" is the true
+// original upstream, while the analysis layer's "before" is the gateway URL
+// (still an integrated state that requires a full restore to original).
 func (s *Store) classifyCur(cur *State, curHash string) classification {
 	if !IsKnownPhase(cur.Phase) {
 		return classification{Status: StatusPendingRestore, Phase: PhaseReconciliationReq,
 			Detail: "Recovery phase is not supported; explicit recovery handling is required"}
 	}
+	target := cur.Target()
 	applied := cur.ConfigHashAfterApply != "" && curHash == cur.ConfigHashAfterApply
-	original := cur.ConfigHashBeforeApply != "" && curHash == cur.ConfigHashBeforeApply
+	before := cur.ConfigHashBeforeApply != "" && curHash == cur.ConfigHashBeforeApply
 
 	switch {
-	case applied && (cur.IntegrationActive || cur.Phase == PhasePrepared || cur.Phase == PhaseCaptureStarted):
+	case applied:
+		// The config is at the applied value regardless of the recorded target.
+		// A legacy record with IntegrationActive=false but a matching applied
+		// hash (crash between config write and flag write) is still integrated.
 		return classification{Status: StatusPendingRestore, Phase: PhaseReconciliationReq,
-			Detail: "Codex設定はCapture用の適用値です。自動再適用は行わず、復元確認が必要です"}
-	case original && cur.IntegrationActive:
+			Detail: "Codex設定は統合先の適用値です。自動再適用は行わず、復元確認が必要です"}
+	case before && target == TargetGateway:
+		// The gateway layer's before value is the true original upstream.
 		return classification{Status: StatusAlreadyRestored, Phase: PhaseReconciledRestored,
 			Detail: "Codex設定は元の接続先へ戻されています"}
-	case cur.IntegrationActive:
-		// active integration but current config is neither applied nor original
-		// → externally changed → conflict (no auto-restore).
+	case before && target == TargetAnalysis && !cur.OriginalOpenaiBaseURLPresent:
+		// A legacy (pre-Gateway) record's before value is the original upstream.
+		return classification{Status: StatusAlreadyRestored, Phase: PhaseReconciledRestored,
+			Detail: "Codex設定は元の接続先へ戻されています"}
+	case before && target == TargetAnalysis:
+		// The analysis layer's before value is the gateway URL, still integrated.
+		return classification{Status: StatusPendingRestore, Phase: PhaseReconciliationReq,
+			Detail: "Codex設定はGateway向けのままです。復元確認が必要です"}
+	case before:
+		// target == original: the before value is the original upstream.
+		return classification{Status: StatusAlreadyRestored, Phase: PhaseReconciledRestored,
+			Detail: "Codex設定は元の接続先へ戻されています"}
+	case target != TargetOriginal:
+		// Active integration but current config is neither applied nor the
+		// layer's before value → externally changed → conflict (no auto-restore).
 		return classification{Status: StatusConfigConflict, Phase: PhaseReconciliationConf,
 			Detail: "外部変更が検出されました。自動復元しません"}
-	case applied:
-		// not integration-active but still capture-applied → pending manual restore.
-		return classification{Status: StatusPendingRestore, Phase: PhaseReconciliationReq,
-			Detail: "Codex設定はCapture用の適用値です。復元確認が必要です"}
 	default:
 		return classification{Status: StatusInactive, Phase: PhaseInactive, Detail: ""}
 	}
