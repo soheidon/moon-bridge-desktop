@@ -42,7 +42,7 @@ describe("Header navigation", () => {
 
   it("places the version info to the left of the Codex Traffic Analysis tab", () => {
     const markup = headerMarkup("dashboard");
-    const versionIndex = markup.indexOf("v0.4.0");
+    const versionIndex = markup.indexOf("v0.5.0");
     const tabIndex = markup.indexOf("Codex Traffic Analysis</button>");
     expect(versionIndex).toBeGreaterThanOrEqual(0);
     expect(versionIndex).toBeLessThan(tabIndex);
