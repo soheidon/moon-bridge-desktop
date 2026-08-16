@@ -107,7 +107,7 @@ If WebView2 Runtime is not already installed, the installer may require an inter
 
 The v0.5.0 installer is not digitally signed. Windows may display an **Unknown publisher** or Microsoft Defender SmartScreen warning.
 
-The production executable and its application-level routing start/stop smoke were completed for the Plan 7 release work. This did not include installer install/uninstall smoke testing, which remains outstanding.
+The production executable, its application-level routing start/stop smoke, and installer install/uninstall smoke testing were all completed for the Plan 7 release work.
 
 ## Basic Usage
 
@@ -163,7 +163,6 @@ Version 0.5.0 supports DeepSeek V4 as its external model API.
 ## Limitations
 
 * The Windows installer is not digitally signed.
-* Installer install/uninstall smoke testing remains outstanding; the completed application-level smoke does not validate installer behavior.
 
 ## Verification
 
