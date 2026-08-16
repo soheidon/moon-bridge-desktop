@@ -10,6 +10,20 @@ import (
 const CaptureListenAddress = "127.0.0.1:38441"
 const captureURL = "http://" + CaptureListenAddress
 
+// FrontDoorAddress is the stable local endpoint Codex's openai_base_url points
+// at for the whole time Moon Bridge runs. Its listener is never stopped on
+// Gateway/Traffic toggles; only its forwarding target changes (S0→S1→S2).
+const FrontDoorAddress = "127.0.0.1:38440"
+
+// GatewayBackendAddress is the internal listener of the Gateway body (DeepSeek
+// routing). Codex never connects here directly; the front door forwards to it.
+const GatewayBackendAddress = "127.0.0.1:38442"
+
+// frontDoorURL and gatewayBackendURL are the SetUpstream targets the transaction
+// service uses when switching the front door between layers.
+const frontDoorURL = "http://" + FrontDoorAddress
+const gatewayBackendURL = "http://" + GatewayBackendAddress
+
 type Operation string
 
 const (
@@ -182,6 +196,11 @@ type Dependencies struct {
 	Recovery RecoveryWriter
 	IDs      IDGenerator
 	Events   EventSink
+	// SetFrontDoorUpstream switches the stable front-door relay's forwarding
+	// target. It is the transaction boundary for the S1↔S2 switch: the target is
+	// validated atomically and the current upstream is preserved on failure. The
+	// desktop binding wires it to the App-owned front-door CaptureProxy.
+	SetFrontDoorUpstream func(base string) error
 }
 
 type Snapshot struct {
@@ -211,6 +230,7 @@ const (
 	CauseConfigConflict  FailureCause = "config_conflict"
 	CauseConfigSave      FailureCause = "config_save"
 	CauseConfigVerify    FailureCause = "config_verify"
+	CauseFrontDoorSwitch FailureCause = "front_door_switch"
 	CauseFinalValidation FailureCause = "final_validation"
 	CauseStaleOwner      FailureCause = "stale_owner"
 	CauseBackout         FailureCause = "backout"
@@ -315,6 +335,8 @@ func errorKindForCause(cause FailureCause) ErrorKind {
 		return KindConfigSaveFailed
 	case CauseConfigVerify:
 		return KindConfigVerifyFailed
+	case CauseFrontDoorSwitch:
+		return KindFrontDoorSwitch
 	case CauseFinalValidation:
 		return KindRecoveryRequired
 	case CauseStaleOwner:

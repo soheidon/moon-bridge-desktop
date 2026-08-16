@@ -186,6 +186,24 @@ func (f *fakeBackup) Remove(context.Context, BackupRef) error {
 	return nil
 }
 
+type fakeFrontDoor struct {
+	mu    sync.Mutex
+	last  string
+	calls int
+	err   error
+}
+
+func (f *fakeFrontDoor) switchUpstream(base string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	if f.err != nil {
+		return f.err
+	}
+	f.last = base
+	return nil
+}
+
 type fakeRecovery struct {
 	cleanup             *CleanupPending
 	cleanupErr          error
@@ -389,7 +407,7 @@ func (f *fakeTraffic) StartCapture(opts trafficanalysis.StartOptions) (traffican
 	f.state.CaptureState = "capturing"
 	f.state.Generation = 1
 	f.state.GatewayInstanceID = "gw-1"
-	f.state.GatewayAddress = "127.0.0.1:38440"
+	f.state.GatewayAddress = "127.0.0.1:38442"
 	f.state.ListeningAddress = CaptureListenAddress
 	return f.state, nil
 }
@@ -504,25 +522,27 @@ func (f *fakeTraffic) CloseCapture(context.Context) (trafficanalysis.State, erro
 }
 
 func newFixture() (*Service, *fakeTraffic, *fakeConfig, *fakeBackup, *fakeRecovery) {
-	service, traffic, cfg, backup, recovery, _ := newFixtureWithGateway()
+	service, traffic, cfg, backup, recovery, _, _ := newFixtureWithGateway()
 	return service, traffic, cfg, backup, recovery
 }
 
-func newFixtureWithGateway() (*Service, *fakeTraffic, *fakeConfig, *fakeBackup, *fakeRecovery, *fakeGateway) {
-	gw := &fakeGateway{snapshot: GatewaySnapshot{Running: true, InstanceID: "gw-1", Address: "127.0.0.1:38440", DefaultModelAlias: "moonbridge", RoutingAvailable: true}}
+func newFixtureWithGateway() (*Service, *fakeTraffic, *fakeConfig, *fakeBackup, *fakeRecovery, *fakeGateway, *fakeFrontDoor) {
+	gw := &fakeGateway{snapshot: GatewaySnapshot{Running: true, InstanceID: "gw-1", Address: "127.0.0.1:38442", DefaultModelAlias: "moonbridge", RoutingAvailable: true}}
 	traffic := &fakeTraffic{state: trafficanalysis.State{Mode: trafficanalysis.ModeIdle, CaptureState: "stopped"}}
 	cfg := &fakeConfig{beforeHash: "before", afterHash: "after", currentHash: "before", present: true, value: "https://api.openai.com"}
 	backup := &fakeBackup{}
 	recovery := &fakeRecovery{}
+	frontDoor := &fakeFrontDoor{}
 	service := New(Dependencies{
 		Gateway: gw, Traffic: traffic, Config: cfg, Backup: backup, Recovery: recovery, IDs: fakeIDs{value: "tx-1"},
+		SetFrontDoorUpstream: frontDoor.switchUpstream,
 	})
-	return service, traffic, cfg, backup, recovery, gw
+	return service, traffic, cfg, backup, recovery, gw, frontDoor
 }
 
 func newEnabledFixture(t *testing.T) (*Service, *fakeTraffic, *fakeConfig, *fakeRecovery) {
 	t.Helper()
-	service, traffic, cfg, _, recovery, _ := newFixtureWithGateway()
+	service, traffic, cfg, _, recovery, _, _ := newFixtureWithGateway()
 	service.ids = &sequenceIDs{values: []string{"enable-1", "disable-1", "finish-1", "finish-2"}}
 	if _, err := service.Enable(context.Background()); err != nil {
 		t.Fatalf("Enable fixture: %v", err)
@@ -552,52 +572,9 @@ func TestClassifyFailureIsPureAndDistinguishesUncertainCheckpoint(t *testing.T) 
 	}
 }
 
-func TestEnableBackupFailureHasNoMutationOrSecretLeakage(t *testing.T) {
-	stages := []string{
-		"root open", "root reparse verification", "root identity verification",
-		"root ACL application", "root ACL verification", "file create",
-		"file reparse verification", "file identity verification", "file ACL application",
-		"file ACL verification", "write", "sync", "close", "failure cleanup",
-	}
-	for _, stage := range stages {
-		t.Run(stage, func(t *testing.T) {
-			service, traffic, cfg, backup, recovery, gateway := newFixtureWithGateway()
-			backup.err = errors.New("backup_cleanup_failed")
-			cfgBefore := *cfg
-			beforeExists, beforeSize, beforeHash := backup.unrelatedFingerprint()
-			_, err := service.Enable(context.Background())
-			requireKind(t, err, KindBackupFailed)
-			if strings.Contains(err.Error(), "secret-sentinel") || strings.Contains(err.Error(), "config.toml") || strings.Contains(err.Error(), "backup-1") {
-				t.Fatalf("unsafe backup error: %v", err)
-			}
-			if strings.Contains(err.Error(), cfgBefore.value) {
-				t.Fatalf("config value leaked into backup error: %v", err)
-			}
-			if cfg.commitCalls != 0 || cfg.value != cfgBefore.value || cfg.currentHash != cfgBefore.currentHash || cfg.present != cfgBefore.present {
-				t.Fatalf("config mutated: commits=%d value=%q hash=%q present=%v", cfg.commitCalls, cfg.value, cfg.currentHash, cfg.present)
-			}
-			if len(recovery.checkpoints) != 0 || recovery.cleanup != nil {
-				t.Fatalf("recovery mutated: checkpoints=%d cleanup=%#v", len(recovery.checkpoints), recovery.cleanup)
-			}
-			if traffic.startCalls != 0 || traffic.claimCalls != 0 || traffic.closeCalls != 0 || traffic.releaseCalls != 0 {
-				t.Fatalf("capture mutated: start=%d claim=%d close=%d release=%d", traffic.startCalls, traffic.claimCalls, traffic.closeCalls, traffic.releaseCalls)
-			}
-			if gateway.calls != 1 {
-				t.Fatalf("gateway calls=%d, want status snapshot only", gateway.calls)
-			}
-			if backup.created != 1 || backup.removed != 0 {
-				t.Fatalf("backup calls=%d/%d", backup.created, backup.removed)
-			}
-			afterExists, afterSize, afterHash := backup.unrelatedFingerprint()
-			if beforeExists != afterExists || beforeSize != afterSize || beforeHash != afterHash {
-				t.Fatalf("unrelated backup changed")
-			}
-		})
-	}
-}
 
-func TestEnableStartsClaimsCommitsAndCheckpoints(t *testing.T) {
-	service, traffic, cfg, backup, recovery := newFixture()
+func TestEnableStartsClaimsSwitchesAndCheckpoints(t *testing.T) {
+	service, traffic, _, _, recovery, _, frontDoor := newFixtureWithGateway()
 	got, err := service.Enable(context.Background())
 	if err != nil {
 		t.Fatalf("Enable() error = %v", err)
@@ -605,19 +582,22 @@ func TestEnableStartsClaimsCommitsAndCheckpoints(t *testing.T) {
 	if got.Phase != PhaseCompleted || !got.IntegrationActive || got.TrafficMode != trafficanalysis.ModeDesktop {
 		t.Fatalf("result = %#v", got)
 	}
-	if traffic.startCalls != 1 || traffic.claimCalls != 1 || traffic.lastOwner != "tx-1" || cfg.commitCalls != 1 {
-		t.Fatalf("calls start/claim/commit/owner = %d/%d/%d/%q", traffic.startCalls, traffic.claimCalls, cfg.commitCalls, traffic.lastOwner)
+	if traffic.startCalls != 1 || traffic.claimCalls != 1 || traffic.lastOwner != "tx-1" {
+		t.Fatalf("calls start/claim/owner = %d/%d/%q", traffic.startCalls, traffic.claimCalls, traffic.lastOwner)
 	}
-	if traffic.lastStart.ListenAddr != CaptureListenAddress || traffic.lastStart.UpstreamBase != "http://127.0.0.1:38440" {
+	if traffic.lastStart.ListenAddr != CaptureListenAddress || traffic.lastStart.UpstreamBase != "http://127.0.0.1:38442" {
 		t.Fatalf("start options = %#v", traffic.lastStart)
 	}
-	if backup.created != 1 || backup.removed != 1 || len(recovery.checkpoints) != 3 || recovery.checkpoints[0].Phase != PhasePrepared || recovery.checkpoints[2].IntegrationActive != true {
-		t.Fatalf("backup/checkpoints = %d/%#v", backup.created, recovery.checkpoints)
+	if frontDoor.calls != 1 || frontDoor.last != captureURL {
+		t.Fatalf("front door switch = calls %d last %q, want 1/%q", frontDoor.calls, frontDoor.last, captureURL)
+	}
+	if len(recovery.checkpoints) != 3 || recovery.checkpoints[0].Phase != PhasePrepared || recovery.checkpoints[2].IntegrationActive != true {
+		t.Fatalf("checkpoints = %#v", recovery.checkpoints)
 	}
 }
 
 func TestEnableRebindsGatewayBeforeStartCapture(t *testing.T) {
-	service, traffic, _, _, _, gw := newFixtureWithGateway()
+	service, traffic, _, _, _, gw, _ := newFixtureWithGateway()
 	if _, err := service.Enable(context.Background()); err != nil {
 		t.Fatalf("Enable() error = %v", err)
 	}
@@ -645,11 +625,8 @@ func TestSuccessfulEnableDisableEmitsSafeLifecycleEventsInOrder(t *testing.T) {
 	}
 
 	want := []EventCode{
-		EventBackupCreated,
 		EventRouteApplied,
 		EventAnalysisStarted,
-		EventBackupRemoved,
-		EventRouteRestored,
 		EventAnalysisStopped,
 	}
 	if len(events) != len(want) {
@@ -668,16 +645,17 @@ func TestSuccessfulEnableDisableEmitsSafeLifecycleEventsInOrder(t *testing.T) {
 	}
 }
 
-func TestEnableRegistersExactModelMappingBeforeConfigCommit(t *testing.T) {
-	service, traffic, cfg, _, _ := newFixture()
+func TestEnableRegistersExactModelMapping(t *testing.T) {
+	service, traffic, _, _, _ := newFixture()
 	if _, err := service.Enable(context.Background()); err != nil {
 		t.Fatalf("Enable() error = %v", err)
 	}
-	if traffic.mappingSetCalls != 1 || !traffic.mappingPresent || traffic.mappingSource != "gpt-test" || traffic.mappingTarget != "moonbridge" {
+	// The model mapping source comes from the gateway's default model alias in
+	// the front-door model (the Codex config routing identity is no longer read),
+	// so the source is registered empty (lazily bound later) and the target is
+	// the gateway's alias.
+	if traffic.mappingSetCalls != 1 || !traffic.mappingPresent || traffic.mappingSource != "" || traffic.mappingTarget != "moonbridge" {
 		t.Fatalf("mapping registration = calls %d present %v source %q target %q", traffic.mappingSetCalls, traffic.mappingPresent, traffic.mappingSource, traffic.mappingTarget)
-	}
-	if cfg.commitCalls != 1 {
-		t.Fatalf("config commit calls = %d, want 1", cfg.commitCalls)
 	}
 }
 
@@ -694,39 +672,11 @@ func TestEnableMappingRegistrationFailureLeavesConfigUnchanged(t *testing.T) {
 	}
 }
 
-func TestEnableAllowsEmptyRoutingModel(t *testing.T) {
-	service, traffic, cfg, _, _ := newFixture()
-	cfg.routingEmpty = true
-	if _, err := service.Enable(context.Background()); err != nil {
-		t.Fatalf("Enable() with empty routing model error = %v", err)
-	}
-	// The mapping is still registered (source pending); the empty model no longer
-	// fails the transaction because the source is lazily bound later.
-	if traffic.mappingSetCalls != 1 || !traffic.mappingPresent || traffic.mappingSource != "" || traffic.mappingTarget != "moonbridge" {
-		t.Fatalf("mapping registration = calls %d present %v source %q target %q", traffic.mappingSetCalls, traffic.mappingPresent, traffic.mappingSource, traffic.mappingTarget)
-	}
-	if cfg.commitCalls != 1 {
-		t.Fatalf("config commit calls = %d, want 1", cfg.commitCalls)
-	}
-}
 
-func TestEnableRejectsNonOpenAIRoutingIdentityBeforeMutation(t *testing.T) {
-	service, traffic, cfg, _, _ := newFixture()
-	cfg.routing = codexconfig.RoutingIdentitySnapshot{
-		Model:         "gpt-test",
-		ModelProvider: "anthropic",
-		ConfigHash:    cfg.currentHash,
-	}
-	_, err := service.Enable(context.Background())
-	requireKind(t, err, KindConfigReadFailed)
-	if traffic.startCalls != 0 || cfg.commitCalls != 0 {
-		t.Fatalf("invalid routing identity mutated traffic/config: start=%d commit=%d", traffic.startCalls, cfg.commitCalls)
-	}
-}
 
 func TestEnableAdoptsExistingCaptureWithoutStarting(t *testing.T) {
 	service, traffic, _, _, _ := newFixture()
-	traffic.state = trafficanalysis.State{Mode: trafficanalysis.ModeCaptureOnly, CaptureState: "capturing", Generation: 7, GatewayInstanceID: "gw-1", GatewayAddress: "127.0.0.1:38440", ListeningAddress: CaptureListenAddress, ObservationCount: 3}
+	traffic.state = trafficanalysis.State{Mode: trafficanalysis.ModeCaptureOnly, CaptureState: "capturing", Generation: 7, GatewayInstanceID: "gw-1", GatewayAddress: "127.0.0.1:38442", ListeningAddress: CaptureListenAddress, ObservationCount: 3}
 	got, err := service.Enable(context.Background())
 	if err != nil {
 		t.Fatalf("Enable() error = %v", err)
@@ -749,62 +699,26 @@ func TestEnableClaimFailureDoesNotWriteAndBacksOutNewCapture(t *testing.T) {
 	}
 }
 
-func TestEnableConfigFailureReleasesAndClosesOnlyNewCapture(t *testing.T) {
-	service, traffic, cfg, _, _ := newFixture()
-	cfg.commitErr = errors.New("write failed")
-	cfg.commitErrOnce = true
-	cfg.commitErrAfterWrite = true
-	_, err := service.Enable(context.Background())
-	requireKind(t, err, KindConfigSaveFailed)
-	if traffic.releaseCalls != 1 || traffic.closeCalls != 1 || traffic.mappingClearCalls != 1 || traffic.mappingPresent || traffic.state.Mode != trafficanalysis.ModeIdle {
-		t.Fatalf("new capture backout = release %d close %d mapping clear %d present %v state %#v", traffic.releaseCalls, traffic.closeCalls, traffic.mappingClearCalls, traffic.mappingPresent, traffic.state)
-	}
-
-	service, traffic, cfg, _, _ = newFixture()
-	traffic.state = trafficanalysis.State{Mode: trafficanalysis.ModeCaptureOnly, CaptureState: "capturing", Generation: 9, GatewayInstanceID: "gw-1", GatewayAddress: "127.0.0.1:38440", ListeningAddress: CaptureListenAddress}
-	cfg.commitErr = errors.New("write failed")
-	cfg.commitErrOnce = true
-	cfg.commitErrAfterWrite = true
-	_, err = service.Enable(context.Background())
-	requireKind(t, err, KindConfigSaveFailed)
-	if traffic.startCalls != 0 || traffic.releaseCalls != 1 || traffic.closeCalls != 0 || traffic.state.Mode != trafficanalysis.ModeCaptureOnly {
-		t.Fatalf("adopted capture backout = start %d release %d close %d state %#v", traffic.startCalls, traffic.releaseCalls, traffic.closeCalls, traffic.state)
-	}
-}
 
 func TestEnableIntegrationCheckpointFailureRequiresRecoveryAndDoesNotGuess(t *testing.T) {
-	service, traffic, cfg, _, recovery := newFixture()
+	service, traffic, _, _, recovery := newFixture()
 	recovery.failPhase = PhaseConfigCommitted
 	_, err := service.Enable(context.Background())
 	requireKind(t, err, KindCheckpointFailed)
-	if traffic.state.Mode != trafficanalysis.ModeIdle || traffic.closeCalls != 1 || traffic.releaseCalls != 1 || cfg.commitCalls != 2 {
-		t.Fatalf("backout state/calls = %#v/%d/%d/%d", traffic.state, traffic.closeCalls, traffic.releaseCalls, cfg.commitCalls)
+	if traffic.state.Mode != trafficanalysis.ModeIdle || traffic.closeCalls != 1 || traffic.releaseCalls != 1 {
+		t.Fatalf("backout state/calls = %#v/%d/%d", traffic.state, traffic.closeCalls, traffic.releaseCalls)
 	}
 }
 
-func TestIntegrationCheckpointFailureWithExternalConfigChangeRequiresRecovery(t *testing.T) {
-	service, traffic, cfg, _, recovery := newFixture()
-	recovery.failPhase = PhaseConfigCommitted
-	recovery.onCheckpointFailure = func() {
-		cfg.mu.Lock()
-		cfg.currentHash = "external"
-		cfg.mu.Unlock()
-	}
-	_, err := service.Enable(context.Background())
-	requireKind(t, err, KindRecoveryRequired)
-	if traffic.releaseCalls != 0 || traffic.closeCalls != 0 || traffic.state.Mode != trafficanalysis.ModeDesktop || cfg.commitCalls != 1 {
-		t.Fatalf("external-change backout = release %d close %d state %#v commits %d", traffic.releaseCalls, traffic.closeCalls, traffic.state, cfg.commitCalls)
-	}
-}
 
 func TestIntegrationCheckpointFailureWithStaleOwnerRequiresRecovery(t *testing.T) {
-	service, traffic, cfg, _, recovery := newFixture()
+	service, traffic, _, _, recovery := newFixture()
 	recovery.failPhase = PhaseConfigCommitted
 	traffic.releaseErr = errors.New("stale owner")
 	_, err := service.Enable(context.Background())
 	requireKind(t, err, KindRecoveryRequired)
-	if traffic.lastReleaseOwner != "tx-1" || traffic.releaseCalls != 1 || traffic.closeCalls != 0 || cfg.commitCalls != 2 {
-		t.Fatalf("stale-owner backout = owner %q release %d close %d commits %d", traffic.lastReleaseOwner, traffic.releaseCalls, traffic.closeCalls, cfg.commitCalls)
+	if traffic.lastReleaseOwner != "tx-1" || traffic.releaseCalls != 1 || traffic.closeCalls != 0 {
+		t.Fatalf("stale-owner backout = owner %q release %d close %d", traffic.lastReleaseOwner, traffic.releaseCalls, traffic.closeCalls)
 	}
 }
 
@@ -816,7 +730,7 @@ func TestAdoptionWithPublicOperationDoesNotReachConfigOrClaim(t *testing.T) {
 		Operation:         trafficanalysis.OperationStarting,
 		Generation:        7,
 		GatewayInstanceID: "gw-1",
-		GatewayAddress:    "127.0.0.1:38440",
+		GatewayAddress:    "127.0.0.1:38442",
 		ListeningAddress:  CaptureListenAddress,
 	}
 	_, err := service.Enable(context.Background())
@@ -827,7 +741,7 @@ func TestAdoptionWithPublicOperationDoesNotReachConfigOrClaim(t *testing.T) {
 }
 
 func TestGatewayEndRunAfterPreparedBacksOutWithoutStarting(t *testing.T) {
-	service, traffic, cfg, _, _, gw := newFixtureWithGateway()
+	service, traffic, cfg, _, _, gw, _ := newFixtureWithGateway()
 	err := enableWithGatewayLoss(service, gw, 2)
 	requireKind(t, err, KindGatewayNotRunning)
 	if traffic.startCalls != 0 || traffic.claimCalls != 0 || cfg.commitCalls != 0 || traffic.closeCalls != 0 {
@@ -836,7 +750,7 @@ func TestGatewayEndRunAfterPreparedBacksOutWithoutStarting(t *testing.T) {
 }
 
 func TestGatewayEndRunAfterStartClosesOnlyNewCapture(t *testing.T) {
-	service, traffic, cfg, _, _, gw := newFixtureWithGateway()
+	service, traffic, cfg, _, _, gw, _ := newFixtureWithGateway()
 	err := enableWithGatewayLoss(service, gw, 3)
 	requireKind(t, err, KindGatewayNotRunning)
 	if traffic.startCalls != 1 || traffic.claimCalls != 0 || cfg.commitCalls != 0 || traffic.closeCalls != 1 {
@@ -845,7 +759,7 @@ func TestGatewayEndRunAfterStartClosesOnlyNewCapture(t *testing.T) {
 }
 
 func TestGatewayEndRunAfterClaimRestoresOwnershipBeforeClose(t *testing.T) {
-	service, traffic, cfg, _, _, gw := newFixtureWithGateway()
+	service, traffic, cfg, _, _, gw, _ := newFixtureWithGateway()
 	err := enableWithGatewayLoss(service, gw, 4)
 	requireKind(t, err, KindGatewayNotRunning)
 	if traffic.startCalls != 1 || traffic.claimCalls != 1 || cfg.commitCalls != 0 || traffic.releaseCalls != 1 || traffic.closeCalls != 1 || traffic.lastReleaseOwner != "tx-1" {
@@ -853,21 +767,21 @@ func TestGatewayEndRunAfterClaimRestoresOwnershipBeforeClose(t *testing.T) {
 	}
 }
 
-func TestGatewayEndRunAfterConfigWriteRestoresByAfterHash(t *testing.T) {
-	service, traffic, cfg, _, _, gw := newFixtureWithGateway()
+func TestGatewayEndRunAfterFrontDoorSwitchBacksOutToGateway(t *testing.T) {
+	service, traffic, _, _, _, gw, _ := newFixtureWithGateway()
 	err := enableWithGatewayLoss(service, gw, 6)
 	requireKind(t, err, KindGatewayNotRunning)
-	if traffic.releaseCalls != 1 || traffic.closeCalls != 1 || cfg.commitCalls != 2 {
-		t.Fatalf("config-write gateway loss backout: release=%d close=%d commits=%d", traffic.releaseCalls, traffic.closeCalls, cfg.commitCalls)
+	if traffic.releaseCalls != 1 || traffic.closeCalls != 1 {
+		t.Fatalf("front-door-switch gateway loss backout: release=%d close=%d", traffic.releaseCalls, traffic.closeCalls)
 	}
 }
 
 func TestGatewayEndRunAfterIntegrationCheckpointRestoresBeforeReturning(t *testing.T) {
-	service, traffic, cfg, _, _, gw := newFixtureWithGateway()
+	service, traffic, _, _, _, gw, _ := newFixtureWithGateway()
 	err := enableWithGatewayLoss(service, gw, 7)
 	requireKind(t, err, KindGatewayNotRunning)
-	if traffic.releaseCalls != 1 || traffic.closeCalls != 1 || cfg.commitCalls != 2 {
-		t.Fatalf("post-checkpoint gateway loss backout: release=%d close=%d commits=%d", traffic.releaseCalls, traffic.closeCalls, cfg.commitCalls)
+	if traffic.releaseCalls != 1 || traffic.closeCalls != 1 {
+		t.Fatalf("post-checkpoint gateway loss backout: release=%d close=%d", traffic.releaseCalls, traffic.closeCalls)
 	}
 }
 
@@ -915,7 +829,7 @@ func TestOperationSlotIsGeneralAndStaleReleaseCannotClearNewOwner(t *testing.T) 
 }
 
 func TestOperationSlotIsReleasedByDeferredPanicPath(t *testing.T) {
-	service, _, _, _, _, gateway := newFixtureWithGateway()
+	service, _, _, _, _, gateway, _ := newFixtureWithGateway()
 	gateway.panicOnCall = 1
 	func() {
 		defer func() {
@@ -961,12 +875,12 @@ func TestFailureClassifierMatrixCoversEnableBackoutStages(t *testing.T) {
 }
 
 func TestFinalJournalMismatchBacksOutWithoutSuccess(t *testing.T) {
-	service, traffic, cfg, _, recovery := newFixture()
+	service, traffic, _, _, recovery := newFixture()
 	recovery.currentOverride = &Checkpoint{Phase: PhaseCaptureStarted, IntegrationActive: false, OperationID: "other"}
 	_, err := service.Enable(context.Background())
 	requireKind(t, err, KindRecoveryRequired)
-	if traffic.releaseCalls != 1 || traffic.closeCalls != 1 || cfg.commitCalls != 2 {
-		t.Fatalf("final journal mismatch backout: release=%d close=%d commits=%d", traffic.releaseCalls, traffic.closeCalls, cfg.commitCalls)
+	if traffic.releaseCalls != 1 || traffic.closeCalls != 1 {
+		t.Fatalf("final journal mismatch backout: release=%d close=%d", traffic.releaseCalls, traffic.closeCalls)
 	}
 }
 
@@ -998,18 +912,6 @@ func TestIntegrationCheckpointFailureWithCloseFailureRequiresRecovery(t *testing
 	}
 }
 
-func TestBackoutRecoveryCheckpointFailureRequiresRecovery(t *testing.T) {
-	service, traffic, cfg, _, recovery := newFixture()
-	cfg.commitErr = errors.New("write uncertain")
-	cfg.commitErrOnce = true
-	cfg.commitErrAfterWrite = true
-	recovery.failPhase = PhaseAborted
-	_, err := service.Enable(context.Background())
-	requireKind(t, err, KindRecoveryRequired)
-	if traffic.releaseCalls != 1 || traffic.closeCalls != 1 || cfg.commitCalls != 2 {
-		t.Fatalf("aborted checkpoint failure recovery = release %d close %d commits %d", traffic.releaseCalls, traffic.closeCalls, cfg.commitCalls)
-	}
-}
 
 func TestFinalAtomicOwnerMismatchEntersRecoveryWithoutChangingReplacement(t *testing.T) {
 	service, traffic, _, _, recovery := newFixture()
@@ -1030,7 +932,7 @@ func TestFinalAtomicOwnerMismatchEntersRecoveryWithoutChangingReplacement(t *tes
 
 func TestSafeResultAndErrorsDoNotExposeTransactionOrLowerLevelData(t *testing.T) {
 	result := Snapshot{Operation: OperationEnable, Phase: PhaseCompleted, TrafficMode: trafficanalysis.ModeDesktop}
-	err := mapConfigError(errors.New("SENTINEL_TOKEN / secret-url / C:\\private\\config"), KindConfigSaveFailed)
+	err := safeError(KindConfigSaveFailed, "config could not be written", true)
 	resultJSON, _ := json.Marshal(result)
 	errJSON, _ := json.Marshal(err)
 	for _, data := range []string{string(resultJSON), string(errJSON)} {
@@ -1071,8 +973,8 @@ func TestEnableIsSingleFlight(t *testing.T) {
 	}
 }
 
-func TestDisableSuccessPausesRestoresAndReleasesWithoutClosing(t *testing.T) {
-	service, traffic, cfg, recovery := newEnabledFixture(t)
+func TestDisableSuccessPausesReleasesAndDemotesWithoutClosing(t *testing.T) {
+	service, traffic, _, recovery := newEnabledFixture(t)
 	beforeGeneration := traffic.state.Generation
 	_, err := service.Disable(context.Background())
 	if err != nil {
@@ -1081,8 +983,8 @@ func TestDisableSuccessPausesRestoresAndReleasesWithoutClosing(t *testing.T) {
 	if traffic.pauseCalls != 1 || traffic.releaseCalls != 1 || traffic.closeCalls != 0 || !traffic.mappingPresent || traffic.lastReleaseOwner != "enable-1" || traffic.lastOwner != "" || traffic.state.Mode != trafficanalysis.ModeCaptureOnly || traffic.state.CaptureState != "passthrough" || traffic.state.Generation != beforeGeneration {
 		t.Fatalf("disable traffic state/calls = %#v pause=%d release=%d close=%d", traffic.state, traffic.pauseCalls, traffic.releaseCalls, traffic.closeCalls)
 	}
-	if cfg.commitCalls != 2 || !cfg.present || cfg.value != "https://api.openai.com" || len(recovery.checkpoints) == 0 || recovery.checkpoints[len(recovery.checkpoints)-1].DurablePhase != DurableInactive || recovery.checkpoints[len(recovery.checkpoints)-1].OperationID != "disable-1" {
-		t.Fatalf("disable config/recovery = present=%v value=%q commits=%d checkpoints=%#v", cfg.present, cfg.value, cfg.commitCalls, recovery.checkpoints)
+	if len(recovery.checkpoints) == 0 || recovery.checkpoints[len(recovery.checkpoints)-1].DurablePhase != DurableInactive || recovery.checkpoints[len(recovery.checkpoints)-1].OperationID != "disable-1" || recovery.checkpoints[len(recovery.checkpoints)-1].IntegrationTarget != TargetGateway {
+		t.Fatalf("disable recovery demote = %#v", recovery.checkpoints)
 	}
 }
 
@@ -1101,164 +1003,19 @@ func TestDisablePreviousKeyAbsentDeletesOnlyManagedKey(t *testing.T) {
 	}
 }
 
-func TestDisablePreservesUnrelatedConfigRevisionForBothPreviousRouteStates(t *testing.T) {
-	tests := []struct {
-		name            string
-		previousPresent bool
-		previousValue   string
-	}{
-		{name: "previous route absent", previousPresent: false},
-		{name: "previous custom route", previousPresent: true, previousValue: "https://example.invalid"},
-	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			service, traffic, cfg, _, recovery := newFixture()
-			service.ids = &sequenceIDs{values: []string{"enable-1", "disable-1"}}
-			cfg.present = tt.previousPresent
-			cfg.value = tt.previousValue
-			var events []Event
-			service.deps.Events = func(event Event) { events = append(events, event) }
 
-			if _, err := service.Enable(context.Background()); err != nil {
-				t.Fatalf("Enable() error = %v", err)
-			}
-			cfg.mu.Lock()
-			cfg.currentHash = "unrelated-change"
-			cfg.mu.Unlock()
-			if _, err := service.Disable(context.Background()); err != nil {
-				t.Fatalf("Disable() error = %v", err)
-			}
-
-			cfg.mu.Lock()
-			gotPresent, gotValue, commits := cfg.present, cfg.value, cfg.commitCalls
-			cfg.mu.Unlock()
-			if gotPresent != tt.previousPresent || gotValue != tt.previousValue {
-				t.Fatalf("restored route = present %v value %q, want present %v value %q", gotPresent, gotValue, tt.previousPresent, tt.previousValue)
-			}
-			if commits != 2 {
-				t.Fatalf("config commit calls = %d, want 2", commits)
-			}
-			if traffic.releaseCalls != 1 || traffic.closeCalls != 0 || traffic.state.Mode != trafficanalysis.ModeCaptureOnly || traffic.state.CaptureState != "passthrough" {
-				t.Fatalf("traffic state/calls = %#v release=%d close=%d", traffic.state, traffic.releaseCalls, traffic.closeCalls)
-			}
-			if len(recovery.checkpoints) == 0 || recovery.checkpoints[len(recovery.checkpoints)-1].DurablePhase != DurableInactive {
-				t.Fatalf("final recovery checkpoint = %#v", recovery.checkpoints)
-			}
-			if len(events) < 2 || events[len(events)-2].Code != EventRouteRestored || events[len(events)-1].Code != EventAnalysisStopped {
-				t.Fatalf("final events = %#v", events)
-			}
-		})
-	}
-}
-
-func TestDisableManagedRouteAndCASConflictsAreSafeAndUnchanged(t *testing.T) {
-	tests := []struct {
-		name  string
-		setup func(*fakeConfig)
-	}{
-		{
-			name: "managed route conflict",
-			setup: func(cfg *fakeConfig) {
-				cfg.value = "https://external.invalid"
-				cfg.currentHash = "external-route"
-			},
-		},
-		{
-			name: "read-to-commit CAS conflict",
-			setup: func(cfg *fakeConfig) {
-				cfg.prepareErr = &codexconfig.Error{Kind: codexconfig.KindConflict, Message: "conflict"}
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			service, traffic, cfg, _, recovery := newFixture()
-			service.ids = &sequenceIDs{values: []string{"enable-1", "disable-1"}}
-			var events []Event
-			service.deps.Events = func(event Event) { events = append(events, event) }
-			if _, err := service.Enable(context.Background()); err != nil {
-				t.Fatalf("Enable() error = %v", err)
-			}
-			cfg.mu.Lock()
-			tt.setup(cfg)
-			cfg.mu.Unlock()
-
-			_, err := service.Disable(context.Background())
-			requireKind(t, err, KindRestoreConflict)
-			cfg.mu.Lock()
-			commits := cfg.commitCalls
-			cfg.mu.Unlock()
-			if commits != 1 || traffic.releaseCalls != 0 || traffic.closeCalls != 0 || traffic.state.Mode != trafficanalysis.ModeDesktop || traffic.state.CaptureState != "passthrough" {
-				t.Fatalf("conflict side effects = commits %d release %d close %d state %#v", commits, traffic.releaseCalls, traffic.closeCalls, traffic.state)
-			}
-			recovery.mu.Lock()
-			last := recovery.checkpoints[len(recovery.checkpoints)-1]
-			recovery.mu.Unlock()
-			if last.DurablePhase != DurableReconciliationRequired || last.ReconciliationStatus != ReconciliationStatusConfigConflict || !last.IntegrationActive {
-				t.Fatalf("conflict checkpoint = %#v", last)
-			}
-			for _, event := range events {
-				if event.Code == EventRouteRestored || event.Code == EventAnalysisStopped {
-					t.Fatalf("success event emitted after conflict: %#v", event)
-				}
-			}
-		})
-	}
-}
-
-func TestDisablePauseFailureDoesNotWriteOrRelease(t *testing.T) {
-	service, traffic, cfg, _ := newEnabledFixture(t)
+func TestDisablePauseFailureDoesNotRelease(t *testing.T) {
+	service, traffic, _, _ := newEnabledFixture(t)
 	traffic.pauseErr = errors.New("pause failed")
 	_, err := service.Disable(context.Background())
 	requireKind(t, err, KindRecoveryRequired)
-	if traffic.pauseCalls != 1 || traffic.releaseCalls != 0 || traffic.closeCalls != 0 || cfg.commitCalls != 1 || traffic.state.Mode != trafficanalysis.ModeDesktop {
-		t.Fatalf("pause failure side effects = pause %d release %d close %d commits %d mode %q", traffic.pauseCalls, traffic.releaseCalls, traffic.closeCalls, cfg.commitCalls, traffic.state.Mode)
+	if traffic.pauseCalls != 1 || traffic.releaseCalls != 0 || traffic.closeCalls != 0 || traffic.state.Mode != trafficanalysis.ModeDesktop {
+		t.Fatalf("pause failure side effects = pause %d release %d close %d mode %q", traffic.pauseCalls, traffic.releaseCalls, traffic.closeCalls, traffic.state.Mode)
 	}
 }
 
-func TestDisableConfigConflictDoesNotWriteOrRelease(t *testing.T) {
-	service, traffic, cfg, recovery := newEnabledFixture(t)
-	cfg.mu.Lock()
-	cfg.currentHash = "external"
-	cfg.value = "https://external.invalid"
-	cfg.mu.Unlock()
-	_, err := service.Disable(context.Background())
-	requireKind(t, err, KindRestoreConflict)
-	if traffic.releaseCalls != 0 || traffic.closeCalls != 0 || cfg.commitCalls != 1 || traffic.state.Mode != trafficanalysis.ModeDesktop {
-		t.Fatalf("config conflict side effects = release %d close %d commits %d mode %q", traffic.releaseCalls, traffic.closeCalls, cfg.commitCalls, traffic.state.Mode)
-	}
-	// The conflict checkpoint must surface the live dead-end to the GUI without
-	// a process restart.
-	recovery.mu.Lock()
-	last := recovery.checkpoints[len(recovery.checkpoints)-1]
-	recovery.mu.Unlock()
-	if last.ReconciliationStatus != ReconciliationStatusConfigConflict {
-		t.Fatalf("conflict checkpoint ReconciliationStatus = %q, want %q", last.ReconciliationStatus, ReconciliationStatusConfigConflict)
-	}
-	if last.DurablePhase != DurableReconciliationRequired || !last.IntegrationActive {
-		t.Fatalf("conflict checkpoint = durable %q active %t, want reconciliation_required/true", last.DurablePhase, last.IntegrationActive)
-	}
-}
 
-func TestDisableRestoreWriteOrVerifyFailureKeepsOwnership(t *testing.T) {
-	service, traffic, cfg, _ := newEnabledFixture(t)
-	cfg.commitErr = errors.New("restore write failed")
-	_, err := service.Disable(context.Background())
-	requireKind(t, err, KindRecoveryRequired)
-	if traffic.releaseCalls != 0 || traffic.state.Mode != trafficanalysis.ModeDesktop {
-		t.Fatalf("restore write failure released ownership: release %d mode %q", traffic.releaseCalls, traffic.state.Mode)
-	}
-
-	service, traffic, cfg, _ = newEnabledFixture(t)
-	cfg.restoreVerifyMismatch = true
-	_, err = service.Disable(context.Background())
-	requireKind(t, err, KindRecoveryRequired)
-	if traffic.releaseCalls != 0 || traffic.state.Mode != trafficanalysis.ModeDesktop {
-		t.Fatalf("restore verify failure released ownership: release %d mode %q", traffic.releaseCalls, traffic.state.Mode)
-	}
-}
 
 func TestDisableRestoreCheckpointFailureDoesNotRelease(t *testing.T) {
 	service, traffic, _, recovery := newEnabledFixture(t)
@@ -1293,7 +1050,7 @@ func TestDisableRejectsAfterProcessOwnerIsUnavailable(t *testing.T) {
 }
 
 func TestDisableOperationSlotConflictsWithFutureOperations(t *testing.T) {
-	service, _, _, _, _, _ := newFixtureWithGateway()
+	service, _, _, _, _, _, _ := newFixtureWithGateway()
 	if err := service.reserveOperation("restore-1", OperationRestore); err != nil {
 		t.Fatalf("reserve restore: %v", err)
 	}
@@ -1305,8 +1062,12 @@ func TestDisableOperationSlotConflictsWithFutureOperations(t *testing.T) {
 	service.releaseOperation("restore-1")
 }
 
-func TestDisableDoesNotWriteBeforePauseCompletes(t *testing.T) {
-	service, traffic, cfg, _ := newEnabledFixture(t)
+func TestDisableSwitchesFrontDoorBackToGatewayBeforePause(t *testing.T) {
+	service, traffic, _, _, _, _, frontDoor := newFixtureWithGateway()
+	service.ids = &sequenceIDs{values: []string{"enable-1", "disable-1", "finish-1", "finish-2"}}
+	if _, err := service.Enable(context.Background()); err != nil {
+		t.Fatalf("Enable fixture: %v", err)
+	}
 	traffic.pauseEntered = make(chan struct{})
 	traffic.pauseRelease = make(chan struct{})
 	traffic.blockPause = true
@@ -1321,8 +1082,10 @@ func TestDisableDoesNotWriteBeforePauseCompletes(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Disable did not reach PauseDesktopExpected")
 	}
-	if cfg.commitCalls != 1 {
-		t.Fatalf("config was written before pause completed: commits=%d", cfg.commitCalls)
+	// The front door must point back at the gateway backend before the capture is
+	// paused, so Codex never points at a paused capture relay.
+	if frontDoor.last != gatewayBackendURL {
+		t.Fatalf("front door = %q, want %q before pause", frontDoor.last, gatewayBackendURL)
 	}
 	close(traffic.pauseRelease)
 	if err := <-done; err != nil {
@@ -1330,8 +1093,8 @@ func TestDisableDoesNotWriteBeforePauseCompletes(t *testing.T) {
 	}
 }
 
-func TestDisableRejectsGatewayChangeAfterPauseBeforeRestore(t *testing.T) {
-	service, traffic, cfg, _ := newEnabledFixture(t)
+func TestDisableRejectsGatewayChangeAfterPause(t *testing.T) {
+	service, traffic, _, _ := newEnabledFixture(t)
 	traffic.onPauseComplete = func() {
 		traffic.mu.Lock()
 		traffic.state.Mode = trafficanalysis.ModeCaptureOnly
@@ -1339,13 +1102,13 @@ func TestDisableRejectsGatewayChangeAfterPauseBeforeRestore(t *testing.T) {
 	}
 	_, err := service.Disable(context.Background())
 	requireKind(t, err, KindRecoveryRequired)
-	if cfg.commitCalls != 1 || traffic.releaseCalls != 0 || traffic.state.Mode != trafficanalysis.ModeCaptureOnly {
-		t.Fatalf("pause boundary was not revalidated: commits=%d release=%d mode=%q", cfg.commitCalls, traffic.releaseCalls, traffic.state.Mode)
+	if traffic.releaseCalls != 0 || traffic.state.Mode != trafficanalysis.ModeCaptureOnly {
+		t.Fatalf("pause boundary was not revalidated: release=%d mode=%q", traffic.releaseCalls, traffic.state.Mode)
 	}
 }
 
-func TestDisableRevalidatesAfterRestoreBeforeRelease(t *testing.T) {
-	service, traffic, cfg, recovery := newEnabledFixture(t)
+func TestDisableRevalidatesAfterSwitchBeforeRelease(t *testing.T) {
+	service, traffic, _, recovery := newEnabledFixture(t)
 	recovery.onCheckpointSuccess = func(cp Checkpoint) {
 		if cp.Phase == PhaseConfigRestored {
 			traffic.mu.Lock()
@@ -1355,13 +1118,13 @@ func TestDisableRevalidatesAfterRestoreBeforeRelease(t *testing.T) {
 	}
 	_, err := service.Disable(context.Background())
 	requireKind(t, err, KindRecoveryRequired)
-	if cfg.commitCalls != 2 || traffic.releaseCalls != 0 || traffic.state.Mode != trafficanalysis.ModeCaptureOnly {
-		t.Fatalf("restore boundary was not revalidated: commits=%d release=%d mode=%q", cfg.commitCalls, traffic.releaseCalls, traffic.state.Mode)
+	if traffic.releaseCalls != 0 || traffic.state.Mode != trafficanalysis.ModeCaptureOnly {
+		t.Fatalf("switch boundary was not revalidated: release=%d mode=%q", traffic.releaseCalls, traffic.state.Mode)
 	}
 }
 
 func TestDisableRejectsGatewayChangeAfterReleaseBeforeInactive(t *testing.T) {
-	service, traffic, cfg, recovery := newEnabledFixture(t)
+	service, traffic, _, recovery := newEnabledFixture(t)
 	traffic.onReleaseComplete = func() {
 		traffic.mu.Lock()
 		traffic.state.CaptureState = "stopped"
@@ -1370,18 +1133,18 @@ func TestDisableRejectsGatewayChangeAfterReleaseBeforeInactive(t *testing.T) {
 	}
 	_, err := service.Disable(context.Background())
 	requireKind(t, err, KindRecoveryRequired)
-	if cfg.commitCalls != 2 || traffic.releaseCalls != 1 || len(recovery.checkpoints) == 0 || recovery.checkpoints[len(recovery.checkpoints)-1].DurablePhase != DurableReconciliationRequired {
-		t.Fatalf("release boundary was not classified as recovery: commits=%d release=%d journal=%#v", cfg.commitCalls, traffic.releaseCalls, recovery.checkpoints[len(recovery.checkpoints)-1])
+	if traffic.releaseCalls != 1 || len(recovery.checkpoints) == 0 || recovery.checkpoints[len(recovery.checkpoints)-1].DurablePhase != DurableReconciliationRequired {
+		t.Fatalf("release boundary was not classified as recovery: release=%d journal=%#v", traffic.releaseCalls, recovery.checkpoints[len(recovery.checkpoints)-1])
 	}
 }
 
 func TestDisableInactiveCheckpointFailureDoesNotReapplyOrReclaim(t *testing.T) {
-	service, traffic, cfg, recovery := newEnabledFixture(t)
+	service, traffic, _, recovery := newEnabledFixture(t)
 	recovery.failPhase = PhaseDisableCompleted
 	_, err := service.Disable(context.Background())
 	requireKind(t, err, KindRecoveryRequired)
-	if cfg.commitCalls != 2 || traffic.claimCalls != 1 || traffic.releaseCalls != 1 || traffic.closeCalls != 0 || traffic.state.Mode != trafficanalysis.ModeCaptureOnly || traffic.lastOwner != "" {
-		t.Fatalf("inactive checkpoint failure changed state: commits=%d claims=%d releases=%d closes=%d mode=%q owner=%q", cfg.commitCalls, traffic.claimCalls, traffic.releaseCalls, traffic.closeCalls, traffic.state.Mode, traffic.lastOwner)
+	if traffic.claimCalls != 1 || traffic.releaseCalls != 1 || traffic.closeCalls != 0 || traffic.state.Mode != trafficanalysis.ModeCaptureOnly || traffic.lastOwner != "" {
+		t.Fatalf("inactive checkpoint failure changed state: claims=%d releases=%d closes=%d mode=%q owner=%q", traffic.claimCalls, traffic.releaseCalls, traffic.closeCalls, traffic.state.Mode, traffic.lastOwner)
 	}
 	if recovery.checkpoints[len(recovery.checkpoints)-1].DurablePhase != DurableReconciliationRequired {
 		t.Fatalf("inactive checkpoint failure did not retain recovery evidence: %#v", recovery.checkpoints[len(recovery.checkpoints)-1])
@@ -1389,15 +1152,15 @@ func TestDisableInactiveCheckpointFailureDoesNotReapplyOrReclaim(t *testing.T) {
 }
 
 func TestDisableAcceptsAlreadyPausedDesktopCapture(t *testing.T) {
-	service, traffic, cfg, recovery := newEnabledFixture(t)
+	service, traffic, _, recovery := newEnabledFixture(t)
 	traffic.mu.Lock()
 	traffic.state.CaptureState = "passthrough"
 	traffic.mu.Unlock()
 	if _, err := service.Disable(context.Background()); err != nil {
 		t.Fatalf("Disable() from passthrough error = %v", err)
 	}
-	if traffic.pauseCalls != 1 || traffic.releaseCalls != 1 || cfg.commitCalls != 2 || recovery.checkpoints[len(recovery.checkpoints)-1].DurablePhase != DurableInactive {
-		t.Fatalf("passthrough disable calls/state = pause %d release %d commits %d journal=%#v", traffic.pauseCalls, traffic.releaseCalls, cfg.commitCalls, recovery.checkpoints[len(recovery.checkpoints)-1])
+	if traffic.pauseCalls != 1 || traffic.releaseCalls != 1 || recovery.checkpoints[len(recovery.checkpoints)-1].DurablePhase != DurableInactive {
+		t.Fatalf("passthrough disable calls/state = pause %d release %d journal=%#v", traffic.pauseCalls, traffic.releaseCalls, recovery.checkpoints[len(recovery.checkpoints)-1])
 	}
 }
 
@@ -1433,7 +1196,7 @@ func TestFinishRejectsActiveIntegrationAndDesktopOwnership(t *testing.T) {
 	service, traffic, cfg, _ := newEnabledFixture(t)
 	_, err := service.Finish(context.Background(), false)
 	requireKind(t, err, KindFinishPrecondition)
-	if traffic.closeCalls != 0 || cfg.commitCalls != 1 || traffic.state.Mode != trafficanalysis.ModeDesktop {
+	if traffic.closeCalls != 0 || cfg.commitCalls != 0 || traffic.state.Mode != trafficanalysis.ModeDesktop {
 		t.Fatalf("active finish changed state: close=%d commits=%d mode=%q", traffic.closeCalls, cfg.commitCalls, traffic.state.Mode)
 	}
 }

@@ -90,6 +90,59 @@ func TestRunServerSeedsEmptyConfigStoreBeforeServingConfigGraph(t *testing.T) {
 	}
 }
 
+func TestRunTransformPreservesCallerListenAddrOverPersistedConfig(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "moonbridge.db")
+
+	// Seed the SQLite ConfigStore with a persisted server addr that differs from
+	// the caller's next-run override. This reproduces the desktop front-door bug:
+	// the persisted snapshot still records the old seed address while the caller
+	// pins a new runtime listen address.
+	staleAddr := freeLoopbackAddr(t)
+	seedCfg := firstRunSQLiteConfig(t, staleAddr, dbPath)
+	seedCtx, seedCancel := context.WithCancel(context.Background())
+	seedErrCh := make(chan error, 1)
+	go func() { seedErrCh <- RunServer(seedCtx, seedCfg, io.Discard) }()
+	waitForConfigGraph(t, "http://"+staleAddr+"/api/v1/config/graph")
+	seedCancel()
+	if err := <-seedErrCh; err != nil {
+		t.Fatalf("seed RunServer: %v", err)
+	}
+
+	// Re-run on the same DB with a fresh caller Addr. The persisted stale addr
+	// must not clobber the runtime override, so the effective bind address (the
+	// value OnListening receives and gateway.Service records into State.Addr)
+	// is the caller's fresh addr, not the persisted stale one.
+	freshAddr := freeLoopbackAddr(t)
+	for freshAddr == staleAddr {
+		freshAddr = freeLoopbackAddr(t)
+	}
+	freshCfg := firstRunSQLiteConfig(t, freshAddr, dbPath)
+	boundCh := make(chan string, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- RunServerWithOptions(ctx, freshCfg, io.Discard, RunOptions{
+			OnListening: func(addr string) error {
+				boundCh <- addr
+				return nil
+			},
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-errCh
+	})
+
+	select {
+	case got := <-boundCh:
+		if got != freshAddr {
+			t.Fatalf("bound addr = %q, want %q (persisted stale %q must not win)", got, freshAddr, staleAddr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("OnListening was not called")
+	}
+}
+
 func TestPersistedConfigWithExtensionReplacesFileSeed(t *testing.T) {
 	enabled := true
 	tests := []struct {

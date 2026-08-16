@@ -162,6 +162,13 @@ func RunServerWithOptions(ctx context.Context, cfg config.Config, errors io.Writ
 }
 
 func runTransform(ctx context.Context, cfg config.Config, errors io.Writer, options RunOptions) error {
+	// listenAddr is the caller's runtime listen address. It must survive the
+	// persisted-config replacement below: the SQLite ConfigStore snapshots the
+	// old seed Addr (:38440) and would otherwise clobber a caller override
+	// (the desktop front-door model moves the gateway backend to :38442).
+	// An empty caller Addr is left untouched so a caller that did not pin a
+	// listen address keeps the previous resolution rules.
+	listenAddr := cfg.Addr
 	var rt *runtime.Runtime
 	routingConfigSource := "file_seed"
 
@@ -315,6 +322,12 @@ func runTransform(ctx context.Context, cfg config.Config, errors io.Writer, opti
 					"providers", len(dbCfg.ProviderDefs),
 					"routes", len(dbCfg.Routes))
 				cfg = *dbCfg
+				// A caller-supplied listen address is a runtime override and wins
+				// over the persisted snapshot; an empty caller Addr keeps the
+				// persisted value (no change for callers that never pin one).
+				if listenAddr != "" {
+					cfg.Addr = listenAddr
+				}
 				routingConfigSource = "persisted_store"
 				if sqlStore, ok := cs.(*store.SQLiteConfigStore); ok {
 					migrationIssues = sqlStore.LastMigrationIssues()

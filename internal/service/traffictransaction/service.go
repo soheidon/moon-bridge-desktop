@@ -10,7 +10,6 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
-	"moonbridge/internal/service/codexconfig"
 	"moonbridge/internal/service/trafficanalysis"
 )
 
@@ -108,8 +107,11 @@ func (s *Service) OwnerID() string {
 	return s.ownerID
 }
 
-// Enable executes only the Desktop enable transaction. Disable, Recovery,
-// Wails binding, and startup reconciliation are separate later boundaries.
+// Enable executes only the Desktop enable transaction. In the front-door model
+// it starts the capture relay on :38441 (upstream = the running gateway backend
+// :38442), claims desktop ownership, and switches the stable front door to
+// :38441. Codex config is never touched here: it stays at the front door
+// :38440 for the whole time Moon Bridge runs.
 func (s *Service) Enable(ctx context.Context) (Snapshot, error) {
 	if err := ctx.Err(); err != nil {
 		return Snapshot{}, err
@@ -122,11 +124,6 @@ func (s *Service) Enable(ctx context.Context) (Snapshot, error) {
 		return Snapshot{}, err
 	}
 	defer s.releaseOperation(txID)
-	if pending, err := s.deps.Recovery.GetCleanupPending(ctx); err != nil {
-		return Snapshot{}, safeError(KindRecoveryRequired, "cleanup state is unavailable", true)
-	} else if pending != nil {
-		return Snapshot{}, safeError(KindTransactionInProgress, "backup cleanup is pending", false)
-	}
 
 	gw, err := s.deps.Gateway.Snapshot(ctx)
 	if err != nil {
@@ -178,39 +175,12 @@ func (s *Service) Enable(ctx context.Context) (Snapshot, error) {
 		return Snapshot{}, safeError(KindCaptureNotActive, "capture is not in an enableable state", false)
 	}
 
-	before, err := s.deps.Config.ReadRootURL(ctx)
-	if err != nil {
-		return Snapshot{}, safeError(KindConfigReadFailed, "codex configuration could not be read", true)
-	}
-	routingModel := ""
-	if gw.RoutingAvailable {
-		routing, routingErr := s.deps.Config.ReadRoutingIdentity(ctx)
-		if routingErr != nil || routing.ConfigHash != before.ConfigHash || (routing.ModelProvider != "" && routing.ModelProvider != "openai") {
-			return Snapshot{}, safeError(KindConfigReadFailed, "codex model routing identity could not be read", true)
-		}
-		if gw.DefaultModelAlias == "" {
-			return Snapshot{}, safeError(KindConfigReadFailed, "gateway default route is unavailable", true)
-		}
-		routingModel = routing.Model
-	}
-	prepared, err := s.deps.Config.PrepareRootURLChange(ctx, stringPtr(captureURL), before.ConfigHash)
-	if err != nil {
-		return Snapshot{}, mapConfigError(err, KindPrepareFailed)
-	}
-	backup, err := s.createBackup(ctx)
-	if err != nil {
-		s.emitEvent(EventBackupCreateFailed, EventSeverityError)
-		return Snapshot{}, safeError(KindBackupFailed, "codex configuration backup failed", true)
-	}
-	s.emitEvent(EventBackupCreated, EventSeverityInfo)
-
 	state := FailureState{Phase: PhasePrepared, AdoptedCapture: adopted}
-	if err := s.deps.Recovery.Checkpoint(ctx, checkpointFor(txID, PhasePrepared, prepared, backup, gw, traffic.Generation, false)); err != nil {
-		s.bestEffortRemove(ctx, backup)
+	if err := s.deps.Recovery.Checkpoint(ctx, checkpointFor(txID, PhasePrepared, gw, traffic.Generation, false)); err != nil {
 		return Snapshot{}, safeError(KindCheckpointFailed, "prepared recovery checkpoint failed", true)
 	}
 	if err := s.verifyGateway(ctx, gw); err != nil {
-		return s.backout(ctx, txID, prepared, backup, gw, traffic, state, CauseGatewayLost, safeError(KindGatewayNotRunning, "gateway changed after preparation", true))
+		return s.backout(ctx, txID, gw, traffic, state, CauseGatewayLost, safeError(KindGatewayNotRunning, "gateway changed after preparation", true))
 	}
 
 	if started {
@@ -221,7 +191,7 @@ func (s *Service) Enable(ctx context.Context) (Snapshot, error) {
 		if _, err := s.deps.Traffic.BindGatewayRun(gw.InstanceID, gw.Address); err != nil {
 			primary := safeError(KindCaptureStartFailed, "capture start failed", true)
 			primary.Stage = captureStartFailureStage(err)
-			return s.backout(ctx, txID, prepared, backup, gw, traffic, state, CauseCaptureStart, primary)
+			return s.backout(ctx, txID, gw, traffic, state, CauseCaptureStart, primary)
 		}
 		traffic, err = s.deps.Traffic.StartCapture(trafficanalysis.StartOptions{
 			UpstreamBase: upstream,
@@ -230,106 +200,91 @@ func (s *Service) Enable(ctx context.Context) (Snapshot, error) {
 		if err != nil {
 			primary := safeError(KindCaptureStartFailed, "capture start failed", true)
 			primary.Stage = captureStartFailureStage(err)
-			return s.backout(ctx, txID, prepared, backup, gw, traffic, state, CauseCaptureStart, primary)
+			return s.backout(ctx, txID, gw, traffic, state, CauseCaptureStart, primary)
 		}
 		state.StartedCapture = true
 		state.Phase = PhaseCaptureStarted
 		if !captureMatches(traffic, gw) {
-			return s.backout(ctx, txID, prepared, backup, gw, traffic, state, CauseValidation, safeError(KindGatewayMismatch, "capture identity or listener changed during start", false))
+			return s.backout(ctx, txID, gw, traffic, state, CauseValidation, safeError(KindGatewayMismatch, "capture identity or listener changed during start", false))
 		}
 	} else {
 		validated, validationErr := s.deps.Traffic.ValidateCaptureExpected(traffic.Generation, gw.InstanceID, gw.Address)
 		if validationErr != nil {
-			return s.backout(ctx, txID, prepared, backup, gw, traffic, state, CauseAdoption, safeError(KindCaptureNotActive, "existing capture is not adoptable", false))
+			return s.backout(ctx, txID, gw, traffic, state, CauseAdoption, safeError(KindCaptureNotActive, "existing capture is not adoptable", false))
 		}
 		traffic = validated
 		if !captureMatches(traffic, gw) {
-			return s.backout(ctx, txID, prepared, backup, gw, traffic, state, CauseValidation, safeError(KindGatewayMismatch, "adopted capture identity or listener changed", false))
+			return s.backout(ctx, txID, gw, traffic, state, CauseValidation, safeError(KindGatewayMismatch, "adopted capture identity or listener changed", false))
 		}
 		state.Phase = PhaseCaptureAdopted
 	}
 	if err := s.verifyGateway(ctx, gw); err != nil {
-		return s.backout(ctx, txID, prepared, backup, gw, traffic, state, CauseGatewayLost, safeError(KindGatewayNotRunning, "gateway changed after capture start", true))
+		return s.backout(ctx, txID, gw, traffic, state, CauseGatewayLost, safeError(KindGatewayNotRunning, "gateway changed after capture start", true))
 	}
 
 	if traffic.Generation == 0 {
-		return s.backout(ctx, txID, prepared, backup, gw, traffic, state, CauseValidation, safeError(KindCaptureNotActive, "capture generation is invalid", false))
+		return s.backout(ctx, txID, gw, traffic, state, CauseValidation, safeError(KindCaptureNotActive, "capture generation is invalid", false))
 	}
 	claimed, err := s.deps.Traffic.ClaimDesktopExpected(traffic.Generation, gw.InstanceID, gw.Address, txID)
 	if err != nil {
-		return s.backout(ctx, txID, prepared, backup, gw, traffic, state, CauseOwnershipClaim, safeError(KindOwnershipClaimFailed, "desktop capture ownership claim failed", true))
+		return s.backout(ctx, txID, gw, traffic, state, CauseOwnershipClaim, safeError(KindOwnershipClaimFailed, "desktop capture ownership claim failed", true))
 	}
 	state.OwnershipClaimed = true
 	state.Phase = PhaseOwnershipClaimed
 	if claimed.Mode != trafficanalysis.ModeDesktop || claimed.Generation != traffic.Generation || !captureIdentityMatches(claimed, gw) ||
 		claimed.ObservationCount != traffic.ObservationCount {
-		return s.backout(ctx, txID, prepared, backup, gw, claimed, state, CauseOwnershipClaim, safeError(KindGatewayMismatch, "capture changed during ownership claim", false))
+		return s.backout(ctx, txID, gw, claimed, state, CauseOwnershipClaim, safeError(KindGatewayMismatch, "capture changed during ownership claim", false))
 	}
 	if err := s.verifyGateway(ctx, gw); err != nil {
-		return s.backout(ctx, txID, prepared, backup, gw, claimed, state, CauseGatewayLost, safeError(KindGatewayNotRunning, "gateway changed after ownership claim", true))
+		return s.backout(ctx, txID, gw, claimed, state, CauseGatewayLost, safeError(KindGatewayNotRunning, "gateway changed after ownership claim", true))
 	}
 
 	state.Phase = PhaseCaptureStarted
-	if err := s.deps.Recovery.Checkpoint(ctx, checkpointFor(txID, PhaseCaptureStarted, prepared, backup, gw, claimed.Generation, false)); err != nil {
-		return s.backout(ctx, txID, prepared, backup, gw, claimed, state, CauseCheckpoint, safeError(KindCheckpointFailed, "capture recovery checkpoint failed", true))
+	if err := s.deps.Recovery.Checkpoint(ctx, checkpointFor(txID, PhaseCaptureStarted, gw, claimed.Generation, false)); err != nil {
+		return s.backout(ctx, txID, gw, claimed, state, CauseCheckpoint, safeError(KindCheckpointFailed, "capture recovery checkpoint failed", true))
 	}
 	if err := s.verifyGateway(ctx, gw); err != nil {
-		return s.backout(ctx, txID, prepared, backup, gw, claimed, state, CauseGatewayLost, safeError(KindGatewayNotRunning, "gateway changed before configuration write", true))
+		return s.backout(ctx, txID, gw, claimed, state, CauseGatewayLost, safeError(KindGatewayNotRunning, "gateway changed before the front-door switch", true))
 	}
 	if gw.RoutingAvailable {
-		// Registers the mapping with source pending; the observed first real
-		// POST /responses model is lazily bound by the Service (routingModel is
-		// now informational only and not used as the source).
-		if err := s.deps.Traffic.SetDesktopModelMappingExpected(claimed.Generation, gw.InstanceID, gw.Address, txID, routingModel, gw.DefaultModelAlias); err != nil {
-			return s.backout(ctx, txID, prepared, backup, gw, claimed, state, CauseOwnershipClaim, safeError(KindOwnershipClaimFailed, "desktop model mapping registration failed", true))
+		if gw.DefaultModelAlias == "" {
+			return s.backout(ctx, txID, gw, claimed, state, CauseValidation, safeError(KindConfigReadFailed, "gateway default route is unavailable", true))
+		}
+		if err := s.deps.Traffic.SetDesktopModelMappingExpected(claimed.Generation, gw.InstanceID, gw.Address, txID, "", gw.DefaultModelAlias); err != nil {
+			return s.backout(ctx, txID, gw, claimed, state, CauseOwnershipClaim, safeError(KindOwnershipClaimFailed, "desktop model mapping registration failed", true))
 		}
 		state.ModelMappingClaimed = true
 	}
 
-	if err := s.deps.Config.CommitPreparedRootURLChange(ctx, prepared); err != nil {
-		cause := CauseConfigSave
-		if isConfigConflict(err) {
-			cause = CauseConfigConflict
-		} else {
-			// A non-conflict error may occur after the atomic replacement. Treat
-			// that outcome as write-uncertain and attempt expected-after restore;
-			// the restore itself will require Recovery if the expected hash is no
-			// longer present.
-			state.ConfigCommitted = true
-			state.Phase = PhaseConfigCommitted
-		}
-		return s.backout(ctx, txID, prepared, backup, gw, claimed, state, cause, mapConfigError(err, KindConfigSaveFailed))
+	// The front-door switch is the transaction boundary. Capture is started and
+	// owned, so switching the stable endpoint from :38442 to :38441 is safe. On
+	// failure the current upstream (:38442) is preserved and the just-claimed
+	// capture is torn down by backout (fail-closed).
+	if err := s.switchFrontDoor(ctx, captureURL); err != nil {
+		return s.backout(ctx, txID, gw, claimed, state, CauseFrontDoorSwitch, safeError(KindFrontDoorSwitch, "front door switch failed", true))
 	}
 	state.ConfigCommitted = true
 	state.Phase = PhaseConfigCommitted
-	verified, err := s.deps.Config.ReadRootURL(ctx)
-	if err != nil || !verified.Present || verified.Value != captureURL || verified.ConfigHash != prepared.AfterHash {
-		return s.backout(ctx, txID, prepared, backup, gw, claimed, state, CauseConfigVerify, safeError(KindConfigVerifyFailed, "codex configuration verification failed", true))
-	}
 	s.emitEvent(EventRouteApplied, EventSeverityInfo)
 	if err := s.verifyGateway(ctx, gw); err != nil {
-		return s.backout(ctx, txID, prepared, backup, gw, claimed, state, CauseGatewayLost, safeError(KindGatewayNotRunning, "gateway changed after configuration write", true))
+		return s.backout(ctx, txID, gw, claimed, state, CauseGatewayLost, safeError(KindGatewayNotRunning, "gateway changed after the front-door switch", true))
 	}
 
-	if err := s.deps.Recovery.Checkpoint(ctx, checkpointFor(txID, PhaseConfigCommitted, prepared, backup, gw, claimed.Generation, true)); err != nil {
-		return s.backout(ctx, txID, prepared, backup, gw, claimed, state, CauseCheckpoint, safeError(KindCheckpointFailed, "integration checkpoint failed", true))
+	if err := s.deps.Recovery.Checkpoint(ctx, checkpointFor(txID, PhaseConfigCommitted, gw, claimed.Generation, true)); err != nil {
+		return s.backout(ctx, txID, gw, claimed, state, CauseCheckpoint, safeError(KindCheckpointFailed, "integration checkpoint failed", true))
 	}
 
 	final := s.deps.Traffic.Status()
 	if err := s.verifyGateway(ctx, gw); err != nil {
-		return s.backout(ctx, txID, prepared, backup, gw, final, state, CauseGatewayLost, safeError(KindGatewayNotRunning, "gateway changed after integration checkpoint", true))
+		return s.backout(ctx, txID, gw, final, state, CauseGatewayLost, safeError(KindGatewayNotRunning, "gateway changed after integration checkpoint", true))
 	}
 	journal, journalErr := s.deps.Recovery.Current(ctx)
-	if journalErr != nil || journal.Phase != PhaseConfigCommitted || !journal.IntegrationActive || journal.OperationID != txID || journal.AfterHash != prepared.AfterHash || journal.BeforeHash != prepared.BeforeHash {
-		return s.backout(ctx, txID, prepared, backup, gw, final, state, CauseFinalValidation, safeError(KindRecoveryRequired, "durable integration state could not be verified", true))
-	}
-	currentConfig, configErr := s.deps.Config.ReadRootURL(ctx)
-	if configErr != nil || !currentConfig.Present || currentConfig.Value != captureURL || currentConfig.ConfigHash != prepared.AfterHash {
-		return s.backout(ctx, txID, prepared, backup, gw, final, state, CauseFinalValidation, safeError(KindRecoveryRequired, "final configuration state could not be verified", true))
+	if journalErr != nil || journal.Phase != PhaseConfigCommitted || !journal.IntegrationActive || journal.OperationID != txID {
+		return s.backout(ctx, txID, gw, final, state, CauseFinalValidation, safeError(KindRecoveryRequired, "durable integration state could not be verified", true))
 	}
 	validatedFinal, trafficValidationErr := s.deps.Traffic.ValidateDesktopIntegrationExpected(claimed.Generation, gw.InstanceID, gw.Address, txID, CaptureListenAddress)
 	if trafficValidationErr != nil {
-		return s.backout(ctx, txID, prepared, backup, gw, final, state, CauseFinalValidation, safeError(KindRecoveryRequired, "final traffic ownership could not be verified", true))
+		return s.backout(ctx, txID, gw, final, state, CauseFinalValidation, safeError(KindRecoveryRequired, "final traffic ownership could not be verified", true))
 	}
 	s.mu.Lock()
 	s.ownerID = txID
@@ -337,33 +292,15 @@ func (s *Service) Enable(ctx context.Context) (Snapshot, error) {
 	s.lastGeneration = validatedFinal.Generation
 	s.mu.Unlock()
 	s.emitEvent(EventAnalysisStarted, EventSeveritySuccess)
-	var cleanupPending *CleanupPending
-	cleanupPending = &CleanupPending{TransactionID: txID, BackupID: backup.ID, RouteMutationResult: "applied", Status: "pending"}
-	if err := s.deps.Recovery.SetCleanupPending(ctx, *cleanupPending); err != nil {
-		cleanupPending.Status = "persistence_failed"
-		s.emitEvent(EventRecoveryRequired, EventSeverityError)
-		return Snapshot{Operation: OperationEnable, Phase: PhaseCompleted, IntegrationActive: true, CleanupPending: cleanupPending}, safeError(KindRecoveryRequired, "backup cleanup state could not be persisted", true)
-	}
-	if err := s.deps.Backup.Remove(ctx, backup); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		cleanupPending.Status = "delete_failed"
-		s.emitEvent(EventCleanupPending, EventSeverityWarning)
-		return Snapshot{Operation: OperationEnable, Phase: PhaseCompleted, IntegrationActive: true, CleanupPending: cleanupPending}, err
-	}
-	if err := s.deps.Recovery.ClearCleanupPending(ctx, txID, backup.ID); err != nil {
-		cleanupPending.Status = "clear_failed"
-		s.emitEvent(EventCleanupPending, EventSeverityWarning)
-		return Snapshot{Operation: OperationEnable, Phase: PhaseCompleted, IntegrationActive: true, CleanupPending: cleanupPending}, err
-	}
-	cleanupPending = nil
-	s.emitEvent(EventBackupRemoved, EventSeverityInfo)
-	snapshot := snapshotFrom(validatedFinal, gw, PhaseCompleted, true)
-	snapshot.CleanupPending = cleanupPending
-	return snapshot, nil
+	return snapshotFrom(validatedFinal, gw, PhaseCompleted, true), nil
 }
 
-// Disable stops Desktop ownership and restores only the managed Codex root
-// URL. It deliberately leaves the Capture relay alive; Finish belongs to a
-// later boundary.
+// Disable demotes Desktop ownership back to capture-only passthrough (S2 → S1).
+// In the front-door model it switches the stable front door away from the
+// capture relay (:38441) back to the gateway backend (:38442) before pausing
+// capture, so the front door never points at a paused capture. Codex config is
+// never touched here. It deliberately leaves the Capture relay alive; Finish
+// belongs to a later boundary.
 func (s *Service) Disable(ctx context.Context) (Snapshot, error) {
 	if err := ctx.Err(); err != nil {
 		return Snapshot{}, err
@@ -425,6 +362,13 @@ func (s *Service) Disable(ctx context.Context) (Snapshot, error) {
 		return s.disableRecovery(ctx, txID, ownerID, journal, traffic.Generation, true)
 	}
 
+	// Switch the front door away from the capture relay (:38441) back to the
+	// gateway backend (:38442) BEFORE pausing capture. On failure the front door
+	// stays on :38441 and the current upstream is preserved (fail-closed).
+	if err := s.switchFrontDoor(ctx, gatewayBackendURL); err != nil {
+		return s.disableRecovery(ctx, txID, ownerID, journal, traffic.Generation, true)
+	}
+
 	paused, err := s.deps.Traffic.PauseDesktopExpected(ctx, traffic.Generation, journal.GatewayInstance, journal.GatewayAddress, ownerID)
 	if err != nil || paused.Mode != trafficanalysis.ModeDesktop || paused.CaptureState != "passthrough" || paused.Generation != traffic.Generation ||
 		paused.ListeningAddress != CaptureListenAddress || paused.ObservationCount != traffic.ObservationCount {
@@ -434,42 +378,14 @@ func (s *Service) Disable(ctx context.Context) (Snapshot, error) {
 		return s.disableRecovery(ctx, txID, ownerID, journal, traffic.Generation, true)
 	}
 
-	current, err := s.deps.Config.ReadRootURL(ctx)
-	if err != nil {
-		return s.disableRestoreFailure(ctx, txID, ownerID, journal, traffic.Generation, true)
-	}
-	if !matchesAppliedRootURL(current, journal) {
-		return s.disableRestoreConflict(ctx, txID, ownerID, journal, traffic.Generation)
-	}
-
-	var desired *string
-	if journal.PreviousPresent {
-		desired = stringPtr(journal.PreviousValue)
-	}
-	restore, err := s.deps.Config.PrepareRootURLChange(ctx, desired, current.ConfigHash)
-	if err != nil {
-		if isConfigConflict(err) {
-			return s.disableRestoreConflict(ctx, txID, ownerID, journal, traffic.Generation)
-		}
-		return s.disableRestoreFailure(ctx, txID, ownerID, journal, traffic.Generation, true)
-	}
-	if err := s.deps.Config.CommitPreparedRootURLChange(ctx, restore); err != nil {
-		if isConfigConflict(err) {
-			return s.disableRestoreConflict(ctx, txID, ownerID, journal, traffic.Generation)
-		}
-		return s.disableRestoreFailure(ctx, txID, ownerID, journal, traffic.Generation, true)
-	}
-	verified, err := s.deps.Config.ReadRootURL(ctx)
-	if err != nil || !matchesPreviousRootURL(verified, journal) {
-		return s.disableRestoreFailure(ctx, txID, ownerID, journal, traffic.Generation, true)
-	}
-	s.emitEvent(EventRouteRestored, EventSeverityInfo)
-
+	// This checkpoint previously recorded the Codex config restore; that restore
+	// is gone in the front-door model, so it now records the completed
+	// front-door switch + capture pause before ownership release.
 	if err := s.deps.Recovery.Checkpoint(ctx, checkpointForDisable(txID, ownerID, PhaseConfigRestored, DurableRecovered, journal, traffic.Generation, false)); err != nil {
-		return s.disableRestoreFailure(ctx, txID, ownerID, journal, traffic.Generation, false)
+		return s.disableRecovery(ctx, txID, ownerID, journal, traffic.Generation, false)
 	}
 	if _, err := s.deps.Traffic.ValidateDesktopPassthroughExpected(traffic.Generation, journal.GatewayInstance, journal.GatewayAddress, ownerID, CaptureListenAddress); err != nil {
-		return s.disableRestoreFailure(ctx, txID, ownerID, journal, traffic.Generation, false)
+		return s.disableRecovery(ctx, txID, ownerID, journal, traffic.Generation, false)
 	}
 
 	released, err := s.deps.Traffic.ReleaseDesktopExpected(traffic.Generation, ownerID)
@@ -486,12 +402,8 @@ func (s *Service) Disable(ctx context.Context) (Snapshot, error) {
 	if err != nil || final.Mode != trafficanalysis.ModeCaptureOnly || final.CaptureState != "passthrough" || final.Generation != traffic.Generation {
 		return s.disableRecovery(ctx, txID, ownerID, journal, traffic.Generation, false)
 	}
-	finalConfig, err := s.deps.Config.ReadRootURL(ctx)
-	if err != nil || !matchesPreviousRootURL(finalConfig, journal) {
-		return s.disableRecovery(ctx, txID, ownerID, journal, traffic.Generation, false)
-	}
 
-	if err := s.deps.Recovery.Checkpoint(ctx, checkpointForDisableDemote(txID, journal, final.Generation, finalConfig.ConfigHash)); err != nil {
+	if err := s.deps.Recovery.Checkpoint(ctx, checkpointForDisableDemote(txID, journal, final.Generation)); err != nil {
 		return s.disableRecovery(ctx, txID, ownerID, journal, traffic.Generation, false)
 	}
 	finalJournal, err := s.deps.Recovery.Current(ctx)
@@ -546,13 +458,6 @@ func (s *Service) Finish(ctx context.Context, discardUnsaved bool) (Snapshot, er
 	}
 	if _, err := s.deps.Traffic.ValidateCaptureOnlyExpected(traffic.Generation, journal.GatewayInstance, journal.GatewayAddress, CaptureListenAddress); err != nil {
 		return Snapshot{}, safeError(KindFinishPrecondition, "capture relay is not finishable", true)
-	}
-	config, err := s.deps.Config.ReadRootURL(ctx)
-	// The relay is finishable when the config is at either the demoted applied
-	// value (gateway URL, or the original for a legacy record) or the restored
-	// previous value (a fully restored legacy record with no key present).
-	if err != nil || (!matchesPreviousRootURL(config, journal) && !matchesAppliedRootURL(config, journal)) {
-		return Snapshot{}, safeError(KindFinishPrecondition, "restored configuration evidence is unavailable", true)
 	}
 	if journal.UnsavedObservationsMayRemain && !discardUnsaved {
 		return Snapshot{}, finishConfirmationError()
@@ -631,71 +536,42 @@ func (s *Service) disableRecovery(ctx context.Context, txID, ownerID string, jou
 	return Snapshot{}, safeError(KindRecoveryRequired, "traffic disable requires recovery", true)
 }
 
-func (s *Service) disableRestoreConflict(ctx context.Context, txID, ownerID string, journal Checkpoint, generation uint64) (Snapshot, error) {
-	cp := checkpointForDisable(txID, ownerID, PhaseDisableStarted, DurableReconciliationRequired, journal, generation, true)
-	cp.ReconciliationStatus = ReconciliationStatusConfigConflict
-	_ = s.deps.Recovery.Checkpoint(ctx, cp)
-	s.emitEvent(EventRestoreFailed, EventSeverityError)
-	return Snapshot{}, safeError(KindRestoreConflict, "codex configuration changed after integration", false)
-}
-
-func (s *Service) disableRestoreFailure(ctx context.Context, txID, ownerID string, journal Checkpoint, generation uint64, integrationActive bool) (Snapshot, error) {
-	s.emitEvent(EventRestoreFailed, EventSeverityError)
-	return s.disableRecovery(ctx, txID, ownerID, journal, generation, integrationActive)
-}
-
-func (s *Service) backout(ctx context.Context, txID string, prepared *codexconfig.PreparedRootURLChange, backup BackupRef, gw GatewaySnapshot, traffic trafficanalysis.State, state FailureState, cause FailureCause, primary *Error) (Snapshot, error) {
+func (s *Service) backout(ctx context.Context, txID string, gw GatewaySnapshot, traffic trafficanalysis.State, state FailureState, cause FailureCause, primary *Error) (Snapshot, error) {
 	plan := ClassifyFailure(state, cause)
 	if plan.RecoveryRequired {
-		return s.requireRecovery(ctx, txID, prepared, backup, gw, traffic.Generation)
+		return s.requireRecovery(ctx, txID, gw, traffic.Generation)
 	}
 	if plan.RestoreConfig {
-		var desired *string
-		if prepared.PreviousPresent {
-			desired = stringPtr(prepared.PreviousValue)
-		}
-		restore, err := s.deps.Config.PrepareRootURLChange(ctx, desired, prepared.AfterHash)
-		if err != nil {
-			return s.requireRecovery(ctx, txID, prepared, backup, gw, traffic.Generation)
-		}
-		if err := s.deps.Config.CommitPreparedRootURLChange(ctx, restore); err != nil {
-			return s.requireRecovery(ctx, txID, prepared, backup, gw, traffic.Generation)
+		// The front door was switched to the capture relay (:38441) before the
+		// failure; switch it back to the gateway backend (:38442) so Codex never
+		// keeps pointing at a capture that is about to be torn down.
+		if err := s.switchFrontDoor(ctx, gatewayBackendURL); err != nil {
+			return s.requireRecovery(ctx, txID, gw, traffic.Generation)
 		}
 	}
 	if state.ModelMappingClaimed {
 		if err := s.deps.Traffic.ClearDesktopModelMappingExpected(traffic.Generation, gw.InstanceID, gw.Address, txID); err != nil {
-			return s.requireRecovery(ctx, txID, prepared, backup, gw, traffic.Generation)
+			return s.requireRecovery(ctx, txID, gw, traffic.Generation)
 		}
 	}
 	if plan.ReleaseOwnership {
 		if _, err := s.deps.Traffic.ReleaseDesktopExpected(traffic.Generation, txID); err != nil {
-			return s.requireRecovery(ctx, txID, prepared, backup, gw, traffic.Generation)
+			return s.requireRecovery(ctx, txID, gw, traffic.Generation)
 		}
 	}
 	if plan.CloseNewCapture {
 		if _, err := s.deps.Traffic.CloseCapture(ctx); err != nil {
-			return s.requireRecovery(ctx, txID, prepared, backup, gw, traffic.Generation)
+			return s.requireRecovery(ctx, txID, gw, traffic.Generation)
 		}
 	}
-	if err := s.deps.Recovery.Checkpoint(ctx, checkpointFor(txID, PhaseAborted, prepared, backup, gw, traffic.Generation, false)); err != nil {
-		return s.requireRecovery(ctx, txID, prepared, backup, gw, traffic.Generation)
-	}
-	if err := s.deps.Backup.Remove(ctx, backup); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		pending := &CleanupPending{
-			TransactionID: txID, BackupID: backup.ID,
-			RouteMutationResult: "unchanged", Status: "delete_failed",
-		}
-		if pendingErr := s.deps.Recovery.SetCleanupPending(ctx, *pending); pendingErr != nil {
-			return Snapshot{}, primary
-		}
-		s.emitEvent(EventCleanupPending, EventSeverityWarning)
-		return Snapshot{Operation: OperationEnable, Phase: PhaseAborted, CleanupPending: pending}, primary
+	if err := s.deps.Recovery.Checkpoint(ctx, checkpointFor(txID, PhaseAborted, gw, traffic.Generation, false)); err != nil {
+		return s.requireRecovery(ctx, txID, gw, traffic.Generation)
 	}
 	return Snapshot{}, primary
 }
 
-func (s *Service) requireRecovery(ctx context.Context, txID string, prepared *codexconfig.PreparedRootURLChange, backup BackupRef, gw GatewaySnapshot, generation uint64) (Snapshot, error) {
-	_ = s.deps.Recovery.Checkpoint(ctx, checkpointFor(txID, PhaseRecoveryRequired, prepared, backup, gw, generation, true))
+func (s *Service) requireRecovery(ctx context.Context, txID string, gw GatewaySnapshot, generation uint64) (Snapshot, error) {
+	_ = s.deps.Recovery.Checkpoint(ctx, checkpointFor(txID, PhaseRecoveryRequired, gw, generation, true))
 	s.emitEvent(EventRecoveryRequired, EventSeverityError)
 	return Snapshot{}, safeError(KindRecoveryRequired, "transaction backout is uncertain; recovery is required", true)
 }
@@ -726,8 +602,16 @@ func (s *Service) verifyGateway(ctx context.Context, expected GatewaySnapshot) e
 	return nil
 }
 
-func (s *Service) bestEffortRemove(ctx context.Context, backup BackupRef) {
-	_ = s.deps.Backup.Remove(ctx, backup)
+// switchFrontDoor atomically swaps the stable front-door relay's forwarding
+// target. It is the transaction boundary for the S1↔S2 switch: SetUpstream
+// validates the target and swaps only on success, preserving the current
+// upstream on failure. A nil SetFrontDoorUpstream means the binding did not
+// wire the front-door relay, which is a hard precondition failure.
+func (s *Service) switchFrontDoor(_ context.Context, base string) error {
+	if s.deps.SetFrontDoorUpstream == nil {
+		return safeError(KindFrontDoorSwitch, "front door relay is unavailable", true)
+	}
+	return s.deps.SetFrontDoorUpstream(base)
 }
 
 // captureStartFailureStage returns a fixed, secret-free classification of a
@@ -745,20 +629,6 @@ func captureStartFailureStage(err error) string {
 	return ""
 }
 
-func (s *Service) createBackup(ctx context.Context) (BackupRef, error) {
-	protected := make([]string, 0, 2)
-	if journal, err := s.deps.Recovery.Current(ctx); err == nil && journal.BackupID != "" {
-		protected = append(protected, journal.BackupID)
-	}
-	if pending, err := s.deps.Recovery.GetCleanupPending(ctx); err == nil && pending != nil && pending.BackupID != "" {
-		protected = append(protected, pending.BackupID)
-	}
-	if manager, ok := s.deps.Backup.(ProtectedBackupManager); ok {
-		return manager.CreateProtected(ctx, protected)
-	}
-	return s.deps.Backup.Create(ctx)
-}
-
 func snapshotFrom(st trafficanalysis.State, gw GatewaySnapshot, phase Phase, integration bool) Snapshot {
 	return Snapshot{
 		Operation:         OperationEnable,
@@ -771,18 +641,19 @@ func snapshotFrom(st trafficanalysis.State, gw GatewaySnapshot, phase Phase, int
 	}
 }
 
-func checkpointFor(id string, phase Phase, prepared *codexconfig.PreparedRootURLChange, backup BackupRef, gw GatewaySnapshot, generation uint64, active bool) Checkpoint {
+// checkpointFor builds a traffic-layer checkpoint. In the front-door model the
+// Codex config is always at the stable front door (:38440), so AppliedValue is
+// the front-door URL and the config hash/previous fields are empty (they belong
+// to the outer Gateway layer, which owns the config). IntegrationTarget stays
+// TargetAnalysis as the marker that the traffic (analysis) layer owns the
+// front-door relay (S2); the config value itself never becomes :38441.
+func checkpointFor(id string, phase Phase, gw GatewaySnapshot, generation uint64, active bool) Checkpoint {
 	return Checkpoint{
 		OperationID:       id,
 		OwnerID:           id,
 		DurablePhase:      durablePhaseFor(phase),
 		Phase:             phase,
-		BeforeHash:        prepared.BeforeHash,
-		AfterHash:         prepared.AfterHash,
-		PreviousPresent:   prepared.PreviousPresent,
-		PreviousValue:     prepared.PreviousValue,
-		AppliedValue:      prepared.Value,
-		BackupID:          backup.ID,
+		AppliedValue:      frontDoorURL,
 		GatewayInstance:   gw.InstanceID,
 		GatewayAddress:    gw.Address,
 		CaptureGeneration: generation,
@@ -819,28 +690,19 @@ func checkpointForDisable(id, owner string, phase Phase, durable DurablePhase, s
 	}
 }
 
-// checkpointForDisableDemote builds the final Disable checkpoint. The analysis
-// layer has fully restored Codex to the gateway URL, so the recovery record
-// must demote from analysis back to gateway while preserving the Gateway layer's
-// original-upstream evidence (the writer retains OriginalOpenaiBaseURL). The
-// demote target is always gateway: OriginalPresent only governs whether the
-// later S1→S0 gateway Disable deletes the key or restores a recorded value, and
-// must not decide the S2→S1 state target (doing so would leave the config at
-// :38440 with a recovery record that claims no integration — an orphan). The
-// applied value is the now-current gateway URL (source.PreviousValue), and
-// BeforeHash is empty because the true original hash belongs to the outer
-// Gateway layer and is not recoverable from this layer's journal.
-func checkpointForDisableDemote(id string, source Checkpoint, generation uint64, currentConfigHash string) Checkpoint {
+// checkpointForDisableDemote builds the final Disable checkpoint. The traffic
+// layer has switched the front door back to the gateway backend and paused the
+// capture, so the recovery record demotes from analysis back to gateway while
+// preserving the Gateway layer's original-upstream evidence. The applied value
+// stays the front-door URL (the Codex config never moves), and the hash fields
+// stay empty so the writer preserves the outer Gateway layer's hashes.
+func checkpointForDisableDemote(id string, source Checkpoint, generation uint64) Checkpoint {
 	return Checkpoint{
 		OperationID:       id,
 		OwnerID:           id,
 		DurablePhase:      DurableInactive,
 		Phase:             PhaseDisableCompleted,
-		BeforeHash:        "",
-		AfterHash:         currentConfigHash,
-		PreviousPresent:   false,
-		PreviousValue:     "",
-		AppliedValue:      source.PreviousValue,
+		AppliedValue:      frontDoorURL,
 		BackupID:          source.BackupID,
 		GatewayInstance:   source.GatewayInstance,
 		GatewayAddress:    source.GatewayAddress,
@@ -851,19 +713,6 @@ func checkpointForDisableDemote(id string, source Checkpoint, generation uint64,
 	}
 }
 
-func stringPtr(s string) *string { return &s }
-
-func matchesPreviousRootURL(snapshot codexconfig.RootURLSnapshot, journal Checkpoint) bool {
-	if snapshot.Present != journal.PreviousPresent {
-		return false
-	}
-	return !journal.PreviousPresent || snapshot.Value == journal.PreviousValue
-}
-
-func matchesAppliedRootURL(snapshot codexconfig.RootURLSnapshot, journal Checkpoint) bool {
-	return snapshot.Present && snapshot.Value == journal.AppliedValue
-}
-
 func captureMatches(st trafficanalysis.State, gw GatewaySnapshot) bool {
 	return st.Mode == trafficanalysis.ModeCaptureOnly && st.CaptureState == "capturing" && captureIdentityMatches(st, gw)
 }
@@ -872,25 +721,6 @@ func captureIdentityMatches(st trafficanalysis.State, gw GatewaySnapshot) bool {
 	return st.CaptureState == "capturing" &&
 		st.GatewayInstanceID == gw.InstanceID && st.GatewayAddress == gw.Address &&
 		st.ListeningAddress == CaptureListenAddress
-}
-
-func mapConfigError(err error, fallback ErrorKind) *Error {
-	if e, ok := err.(*codexconfig.Error); ok {
-		switch e.Kind {
-		case codexconfig.KindConflict:
-			return safeError(KindConfigConflict, "codex configuration changed during transaction", false)
-		case codexconfig.KindVerifyFailed:
-			return safeError(KindConfigVerifyFailed, "codex configuration verification failed", true)
-		case codexconfig.KindValidationFailed, codexconfig.KindEditUnsupported, codexconfig.KindParseFailed:
-			return safeError(KindConfigEditFailed, "codex configuration edit was rejected", false)
-		}
-	}
-	return safeError(fallback, "configuration operation failed", true)
-}
-
-func isConfigConflict(err error) bool {
-	e, ok := err.(*codexconfig.Error)
-	return ok && e.Kind == codexconfig.KindConflict
 }
 
 func validateCaptureURL(value string) bool {

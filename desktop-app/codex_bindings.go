@@ -7,6 +7,7 @@ import (
 	"moonbridge/internal/config"
 	"moonbridge/internal/service/codexlauncher"
 	"moonbridge/internal/service/deepseek"
+	"moonbridge/internal/service/traffictransaction"
 )
 
 const (
@@ -132,11 +133,14 @@ func (a *App) codexLaunchOptions(cfg *config.Config, session *gatewaySession, re
 		CodexHome:        resolveCodexHome(),
 		ProjectDirectory: req.ProjectDirectory,
 		ModelAlias:       deepseek.RouteID,
-		BaseURL:          "http://" + session.Address + "/v1",
-		AuthToken:        session.ServerToken,
-		ProviderCfg:      config.ProviderFromGlobalConfig(cfg),
-		PluginCfg:        config.PluginFromGlobalConfig(cfg),
-		ServerCfg:        serverCfg,
+		// Codex must point at the stable front door (:38440), not the gateway
+		// backend (:38442) — otherwise a running Codex would hit a dead listener
+		// the moment the gateway backend stops.
+		BaseURL:     "http://" + traffictransaction.FrontDoorAddress + "/v1",
+		AuthToken:   session.ServerToken,
+		ProviderCfg: config.ProviderFromGlobalConfig(cfg),
+		PluginCfg:   config.PluginFromGlobalConfig(cfg),
+		ServerCfg:   serverCfg,
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -138,10 +139,17 @@ func (s *Store) classifyCur(cur *State, curHash string) classification {
 	switch {
 	case applied:
 		// The config is at the applied value regardless of the recorded target.
-		// A legacy record with IntegrationActive=false but a matching applied
-		// hash (crash between config write and flag write) is still integrated.
+		if normalizedBaseURL(cur.AppliedOpenaiBaseURL) == FrontDoorBaseURL {
+			// The applied value is the stable front door (:38440): a healthy
+			// integrated state. The caller reopens the front door rather than
+			// restoring the config (never auto-restored here).
+			return classification{Status: StatusIntegrated, Phase: PhaseIntegrationApplied,
+				Detail: "Codex設定はstable front doorに統合済みです"}
+		}
+		// A legacy record whose applied value is the old capture listener (:38441):
+		// the config still points at a dead listener, so recovery is required.
 		return classification{Status: StatusPendingRestore, Phase: PhaseReconciliationReq,
-			Detail: "Codex設定は統合先の適用値です。自動再適用は行わず、復元確認が必要です"}
+			Detail: "Codex設定は旧capture向けのままです。復元確認が必要です"}
 	case before && target == TargetGateway:
 		// The gateway layer's before value is the true original upstream.
 		return classification{Status: StatusAlreadyRestored, Phase: PhaseReconciledRestored,
@@ -240,3 +248,9 @@ func nowString() string {
 }
 
 func strPtr(s string) *string { return &s }
+
+// normalizedBaseURL trims trailing slashes so a recorded applied value with an
+// incidental trailing slash still matches the canonical front-door URL.
+func normalizedBaseURL(u string) string {
+	return strings.TrimRight(u, "/")
+}

@@ -183,7 +183,8 @@ type App struct {
 	exitState        exitState
 	svc              gatewayController
 	traffic          *trafficanalysis.Service
-	configuredPath   string // AppOptions で指定された Start 候補
+	frontDoor        *trafficanalysis.CaptureProxy // stable :38440 relay (passthrough)
+	configuredPath   string                       // AppOptions で指定された Start 候補
 	activeConfigPath string // 最後に成功した Start の path（snapshot にのみ表示）
 	newIdentity      func() (string, string)
 	emitEvents       func(name string, payload any)
@@ -352,10 +353,22 @@ func (a *App) startup(ctx context.Context) {
 			a.startupErr = err
 		} else if a.recovery != nil {
 			reconcileCtx, cancel := context.WithTimeout(a.appCtx, 10*time.Second)
-			_, a.startupErr = a.recovery.ReconcileStartup(reconcileCtx, func(path string) ([]byte, error) {
+			var res *recovery.Result
+			res, a.startupErr = a.recovery.ReconcileStartup(reconcileCtx, func(path string) ([]byte, error) {
 				return os.ReadFile(path)
 			})
 			cancel()
+			// After a crash/restart with Codex still integrated (config at :38440),
+			// bring the stable front door back up so a running Codex is not left
+			// pointing at a dead listener. It reopens in passthrough(original) —
+			// the Gateway-OFF equivalent — until the user turns the Gateway on. The
+			// reconcile result is the central determination of that coherent
+			// integrated state (not a second, independent recovery read).
+			if a.startupErr == nil && res != nil && res.Status == recovery.StatusIntegrated {
+				if err := a.startFrontDoor(); err != nil {
+					a.startupErr = err
+				}
+			}
 		}
 		a.lifecycleMu.Lock()
 		a.lifecycle = lifecycleStarted
@@ -418,13 +431,18 @@ func (a *App) shutdown(context.Context) {
 	codexCancel()
 	a.codexMu.Unlock()
 
-	// Restore the original upstream before stopping the gateway. Best effort:
-	// a failed restore is retained as recovery evidence for the next boot.
-	_ = a.disableGatewayIntegration()
-
+	// Stop the gateway backend (:38442) and the front door (:38440) first, then
+	// restore the config to the original upstream last. That ordering avoids a
+	// window where the config is original but a listener still serves traffic.
 	gwStopCtx, gwCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	_ = a.svc.Stop(gwStopCtx) // cleanup continues even after traffic failure
 	gwCancel()
+
+	a.stopFrontDoor()
+
+	// Restore the original upstream last. Best effort: a failed restore is
+	// retained as recovery evidence for the next boot.
+	_ = a.disableGatewayIntegration()
 
 	a.clearSession()
 	a.emitStatus()
@@ -520,6 +538,9 @@ func (a *App) startGatewayLocked(requestPath string) GatewayCommandResult {
 	if err != nil {
 		return a.fail("gateway.start", "loading_config", "gateway_config_load_failed", "unable to load config", false, err)
 	}
+	// The gateway body moves to its internal backend address (:38442); Codex's
+	// stable front door (:38440) is owned by the App and never collides with it.
+	cfg.Addr = traffictransaction.GatewayBackendAddress
 	instanceID, token := a.newIdentity()
 	// Wire the routing profile refresh callback so that binding-layer mutations
 	// (SaveRoutingProfile, ActivateProfile) can trigger a live resolver swap
@@ -561,12 +582,26 @@ func (a *App) startGatewayLocked(requestPath string) GatewayCommandResult {
 	// The session is built only after Start succeeds: the address materializes
 	// with the successful run, and the control token must be this run's.
 	st := a.svc.Status()
-	// Redirect Codex to this run's gateway address (S0 → S1). A failure here is
-	// classified so the gateway is stopped only when the config is unchanged or
-	// rolled back; a fail-closed or already-integrated outcome keeps it running.
-	if err := a.integrateGateway("http://" + st.Addr); err != nil {
-		return a.gatewayIntegrationError("gateway.start", err)
+	// Start the stable front-door relay (:38440) if it is not already running. It
+	// stays alive for the whole MBD lifetime; only its forwarding target changes.
+	if err := a.startFrontDoor(); err != nil {
+		return a.stopAndFailGatewayStart("front_door", "gateway_front_door_start_failed", "front door relay could not be started", err)
 	}
+	// Redirect Codex's openai_base_url to the front door once (S-1 → integrated).
+	// After that the config stays at :38440 until shutdown, so a runtime re-ON
+	// skips this step. The integration service is otherwise unchanged.
+	if !a.codexAlreadyIntegrated() {
+		if err := a.integrateGateway("http://" + traffictransaction.FrontDoorAddress); err != nil {
+			return a.gatewayIntegrationError("gateway.start", err)
+		}
+	}
+	// Switch the front door to the freshly started gateway backend (S0 → S1). A
+	// failure leaves the front door on its current target and the gateway backend
+	// is rolled back so Codex never points at a dead listener.
+	if err := a.setFrontDoorUpstream("http://" + traffictransaction.GatewayBackendAddress); err != nil {
+		return a.stopAndFailGatewayStart("front_door", "gateway_front_door_switch_failed", "front door relay could not forward to the gateway", err)
+	}
+	logFrontDoorMode("gateway_on_to_gateway_backend")
 	a.sessionMu.Lock()
 	a.session = &gatewaySession{
 		InstanceID:   st.InstanceID,
@@ -611,12 +646,18 @@ func (a *App) stopGatewayLocked() GatewayCommandResult {
 			return a.fail("gateway.stop", "traffic", "traffic_teardown_failed", "traffic analysis could not be stopped", true, trafficErr)
 		}
 	}
-	// 2. Restore the original upstream (S1 → S0) before the process stops.
-	// disableGatewayIntegration logs its own success/failure diagnostic.
-	if err := a.disableGatewayIntegration(); err != nil {
-		return a.fail("gateway.stop", "integration", "gateway_integration_disable_failed", "gateway integration could not be disabled", true, err)
+	// 2. Switch the front door back to the original upstream (S1 → S0) before the
+	// gateway backend stops. The config stays at :38440; only the front door's
+	// forwarding target changes. disableGatewayIntegration is the shutdown-only
+	// teardown and is intentionally NOT called here. When the front door was never
+	// started (no integration on this run), there is nothing to switch.
+	if a.frontDoor != nil {
+		if err := a.setFrontDoorUpstream(a.originalUpstream()); err != nil {
+			return a.fail("gateway.stop", "front_door", "gateway_front_door_switch_failed", "front door relay could not restore the original upstream", true, err)
+		}
+		logFrontDoorMode("gateway_off_to_original_upstream")
 	}
-	// 3. Stop the gateway process.
+	// 3. Stop the gateway backend process (:38442).
 	stopCtx, cancel := context.WithTimeout(a.appCtx, 10*time.Second)
 	defer cancel()
 	if err := a.svc.Stop(stopCtx); err != nil {
@@ -673,6 +714,97 @@ func (a *App) disableGatewayIntegration() error {
 	report, err := gwInt.DisableWithReport(a.appCtx)
 	logGatewayDisable(err == nil, report, err)
 	return err
+}
+
+// startFrontDoor starts the stable front-door relay on :38440 in passthrough
+// (non-recording) mode if it is not already running. The listener is kept alive
+// for the whole MBD lifetime; only its forwarding target changes.
+func (a *App) startFrontDoor() error {
+	if a.frontDoor != nil {
+		return nil
+	}
+	fd := trafficanalysis.NewCaptureProxy(trafficanalysis.CaptureConfig{
+		ListenAddr:   traffictransaction.FrontDoorAddress,
+		UpstreamBase: a.originalUpstream(),
+	})
+	if err := fd.Start(); err != nil {
+		_ = fd.Close()
+		return err
+	}
+	_ = fd.Pause() // record nothing: the front door is a pure relay
+	a.frontDoor = fd
+	return nil
+}
+
+// stopFrontDoor stops the front-door listener and releases the reference. It is
+// a no-op when the front door was never started.
+func (a *App) stopFrontDoor() {
+	if a.frontDoor == nil {
+		return
+	}
+	_ = a.frontDoor.Close()
+	a.frontDoor = nil
+}
+
+// setFrontDoorUpstream switches the stable front-door relay's forwarding target.
+// It is a nil-safe wrapper so the traffic transaction's injected
+// SetFrontDoorUpstream never panics before the front door is started.
+func (a *App) setFrontDoorUpstream(base string) error {
+	if a.frontDoor == nil {
+		return errors.New("front door relay is not running")
+	}
+	return a.frontDoor.SetUpstream(base)
+}
+
+// codexAlreadyIntegrated reports whether Codex's openai_base_url is actually
+// redirected to the stable front door (config stays at :38440 across the whole
+// MBD lifetime once integrated). It verifies the live config rather than trusting
+// the recovery record alone: a stale record (config manually restored to original,
+// or a torn shutdown) must not be trusted to skip integration.
+func (a *App) codexAlreadyIntegrated() bool {
+	if a.recovery == nil {
+		return false
+	}
+	st, err := a.recovery.Load(a.appCtx)
+	if err != nil || st == nil {
+		return false
+	}
+	if st.Target() == recovery.TargetOriginal {
+		return false
+	}
+	gwInt, err := a.ensureGatewayIntegration()
+	if err != nil {
+		return false
+	}
+	snap, err := gwInt.Current(a.appCtx)
+	if err != nil || !snap.Present {
+		return false
+	}
+	return snap.Value == "http://"+traffictransaction.FrontDoorAddress
+}
+
+// originalUpstream resolves the front door's Gateway-OFF forwarding target: the
+// true original upstream recorded by the Gateway layer when present, otherwise
+// the ChatGPT Codex backend default.
+func (a *App) originalUpstream() string {
+	if a.recovery != nil {
+		if st, err := a.recovery.Load(a.appCtx); err == nil && st != nil {
+			if orig, present := st.OriginalBaseURL(); present && orig != nil && *orig != "" {
+				return *orig
+			}
+		}
+	}
+	return trafficanalysis.DefaultUpstreamBase
+}
+
+// stopAndFailGatewayStart stops the just-started gateway backend and returns a
+// fail result, used when the front-door relay cannot be started or switched.
+func (a *App) stopAndFailGatewayStart(stage, code, message string, err error) GatewayCommandResult {
+	stopCtx, cancel := context.WithTimeout(a.appCtx, 10*time.Second)
+	defer cancel()
+	_ = a.svc.Stop(stopCtx)
+	a.clearSession()
+	return a.fail("gateway.start", stage, code, message, true, err)
 }
 
 // gatewayIntegrationError classifies a failed gateway integration. A fail-closed

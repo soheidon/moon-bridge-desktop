@@ -104,6 +104,45 @@ func TestReconcilePendingRestore(t *testing.T) {
 	}
 }
 
+// TestReconcileIntegratedFrontDoor verifies the front-door model's coherent
+// integrated state (config at :38440 with a matching applied hash) is classified
+// as integrated — not recovery-required — so startup reopens the front door
+// instead of demanding a restore.
+func TestReconcileIntegratedFrontDoor(t *testing.T) {
+	s, dir := testStore(t)
+	if err := s.SetCodexHome(dir); err != nil {
+		t.Fatal(err)
+	}
+	cfg := []byte("openai_base_url = \"http://127.0.0.1:38440\"\n")
+	cfgHash := HashBytes(cfg)
+	seedState(t, s, &State{
+		SchemaVersion:         SchemaVersion,
+		IntegrationActive:     true,
+		Phase:                 PhaseIntegrationApplied,
+		ConfigPath:            "config.toml",
+		CodexHomeFingerprint:  boundHome(t, dir),
+		IntegrationTarget:     TargetGateway,
+		ConfigHashAfterApply:  cfgHash,
+		AppliedOpenaiBaseURL:  "http://127.0.0.1:38440",
+	})
+	res, st := runReconcile(t, s, cfg, nil)
+	if res.Status != StatusIntegrated {
+		t.Fatalf("status = %q, want integrated (detail=%s)", res.Status, res.Detail)
+	}
+	if !res.StatusReconciled {
+		t.Fatal("StatusReconciled should be true")
+	}
+	if st == nil || !st.IntegrationActive {
+		t.Fatal("integration must stay active for the integrated front door")
+	}
+	if res.Phase == nil || *res.Phase != PhaseIntegrationApplied {
+		t.Fatalf("phase = %v, want integration_applied", res.Phase)
+	}
+	if st.ReconciliationStatus == nil || *st.ReconciliationStatus != string(StatusIntegrated) {
+		t.Fatalf("reconciliationStatus not persisted: %+v", st)
+	}
+}
+
 func TestReconcileUnknownPhaseFailsClosedWithoutConfigSideEffect(t *testing.T) {
 	s, dir := testStore(t)
 	if err := s.SetCodexHome(dir); err != nil {

@@ -158,6 +158,14 @@ func New(config ConfigEditor, recovery RecoveryWriter, captureURL string) *Servi
 	return &Service{config: config, recovery: recovery, captureURL: captureURL}
 }
 
+// Current returns the current Codex openai_base_url state (read from config.toml).
+// It is the source of truth for whether Codex is actually integrated at the front
+// door, independent of the recovery record (which may be stale after a torn
+// shutdown or a manual config restore).
+func (s *Service) Current(ctx context.Context) (codexconfig.RootURLSnapshot, error) {
+	return s.config.ReadRootURL(ctx)
+}
+
 func (s *Service) enableError(stage string, current CurrentTarget, rollback string, cause error) error {
 	return &Error{Operation: "enable", Stage: stage, CurrentTarget: current, Rollback: rollback, Err: cause}
 }

@@ -436,8 +436,15 @@ func (r trafficRecoveryWriter) Checkpoint(ctx context.Context, cp traffictransac
 			current.PreviousOpenaiBaseURL = nil
 		}
 		current.AppliedOpenaiBaseURL = cp.AppliedValue
-		current.ConfigHashBeforeApply = cp.BeforeHash
-		current.ConfigHashAfterApply = cp.AfterHash
+		// The traffic layer no longer owns the Codex config in the front-door model,
+		// so its checkpoints carry empty hashes. Preserve the outer Gateway layer's
+		// hashes so startup reconcile can still classify the config as integrated.
+		if cp.BeforeHash != "" {
+			current.ConfigHashBeforeApply = cp.BeforeHash
+		}
+		if cp.AfterHash != "" {
+			current.ConfigHashAfterApply = cp.AfterHash
+		}
 		current.BackupPath = nil
 		if cp.BackupID != "" {
 			path := filepath.Join(r.backupDir, cp.BackupID)
@@ -634,6 +641,23 @@ func (a *App) ensureTrafficTransaction() (*traffictransaction.Service, error) {
 		Recovery: trafficRecoveryWriter{store: store, configHome: configHome, backupDir: backupDir},
 		Events: func(event traffictransaction.Event) {
 			a.safeEmit(trafficEvent, event)
+		},
+		SetFrontDoorUpstream: func(base string) error {
+			// The traffic transaction only ever switches the front door between the
+			// capture relay (traffic on) and the gateway backend (traffic off); it
+			// never targets the original upstream. Switch first, then log only on
+			// success so the recorded mode reflects what actually happened (matches
+			// the Gateway ON/OFF logging, which also logs after the switch).
+			if err := a.setFrontDoorUpstream(base); err != nil {
+				return err
+			}
+			switch base {
+			case "http://" + traffictransaction.CaptureListenAddress:
+				logFrontDoorMode("traffic_on_to_capture_relay")
+			case "http://" + traffictransaction.GatewayBackendAddress:
+				logFrontDoorMode("traffic_off_to_gateway_backend")
+			}
+			return nil
 		},
 	})
 	a.trafficConfigPath = configPath

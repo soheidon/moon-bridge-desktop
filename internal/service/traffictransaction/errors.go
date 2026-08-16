@@ -17,6 +17,7 @@ const (
 	KindConfigVerifyFailed    ErrorKind = "traffic_config_verify_failed"
 	KindConfigConflict        ErrorKind = "traffic_config_conflict"
 	KindCaptureStartFailed    ErrorKind = "traffic_capture_start_failed"
+	KindFrontDoorSwitch       ErrorKind = "traffic_front_door_switch_failed"
 	KindOwnershipClaimFailed  ErrorKind = "traffic_ownership_claim_failed"
 	KindBackoutFailed         ErrorKind = "traffic_transaction_backout_failed"
 	KindTransactionFailed     ErrorKind = "traffic_transaction_failed"

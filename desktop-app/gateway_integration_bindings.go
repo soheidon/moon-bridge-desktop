@@ -115,6 +115,13 @@ func (a *App) ensureGatewayIntegration() (*gatewayintegration.Service, error) {
 	return a.gatewayInt, nil
 }
 
+// logFrontDoorMode writes a single safe diagnostic line for a front-door
+// forwarding-mode change. The mode is a fixed enum; it never logs URLs, config
+// bodies, or secrets.
+func logFrontDoorMode(mode string) {
+	log.Printf("front door forwarding mode: %s", mode)
+}
+
 // logGatewayIntegrationError writes a single safe diagnostic line for a failed
 // Enable/Disable. It never logs URLs, config bodies, or secrets: the stage and
 // current-target are fixed enums, and the kind is derived via safeError.

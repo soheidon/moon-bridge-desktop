@@ -91,6 +91,11 @@ type CaptureProxy struct {
 	closed          chan struct{}
 	observationGate sync.RWMutex
 	recording       atomic.Bool
+	// upstream holds the current forwarding target as a string, swapped
+	// atomically by SetUpstream. It is seeded from config.UpstreamBase and read
+	// by serveHTTP/Status so the relay's target can change without rebinding the
+	// listener (the front-door contract: the stable endpoint never dies).
+	upstream atomic.Value // string
 
 	state               string
 	pauseDone           chan struct{}
@@ -143,8 +148,36 @@ func NewCaptureProxy(config CaptureConfig) *CaptureProxy {
 	// The analyzer is available for network-independent relay tests before the
 	// listener starts; the listener itself is the production readiness boundary.
 	p.recording.Store(true)
+	p.upstream.Store(config.UpstreamBase)
 	go p.consume()
 	return p
+}
+
+// currentUpstream returns the relay's current forwarding target, reading the
+// atomic value seeded at construction and swapped by SetUpstream.
+func (p *CaptureProxy) currentUpstream() string {
+	if v := p.upstream.Load(); v != nil {
+		return v.(string)
+	}
+	return p.config.UpstreamBase
+}
+
+// SetUpstream atomically changes the relay's forwarding target. The new base is
+// validated with the same scheme/loopback rules as per-request composition, and
+// the swap is committed only on success — on any validation error the current
+// upstream is left untouched and an error is returned. It affects only requests
+// that start after the swap; requests already in flight complete on the path
+// they were using. The listener is never touched here.
+func (p *CaptureProxy) SetUpstream(base string) error {
+	upstream, err := url.Parse(base)
+	if err != nil {
+		return errInvalidUpstreamBase
+	}
+	if err := validateUpstreamURL(upstream); err != nil {
+		return err
+	}
+	p.upstream.Store(base)
+	return nil
 }
 
 // captureStartFailure classifies a proxy.Start failure with a fixed, secret-free
@@ -354,7 +387,7 @@ func (p *CaptureProxy) Status() CaptureStatus {
 		InstanceID:                 p.config.InstanceID,
 		State:                      p.state,
 		CaptureAddress:             p.config.ListenAddr,
-		UpstreamHost:               upstreamHost(p.config.UpstreamBase),
+		UpstreamHost:               upstreamHost(p.currentUpstream()),
 		LastSafeError:              p.lastError,
 		ActiveHTTPRequests:         atomic.LoadUint64(&p.activeHTTP),
 		ActiveWebSocketConnections: atomic.LoadUint64(&p.activeWS),
@@ -487,13 +520,14 @@ func (p *CaptureProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		writeCaptureJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 		return
 	}
-	upstream, err := composeUpstreamURL(p.config.UpstreamBase, r)
+	upstreamBase := p.currentUpstream()
+	upstream, err := composeUpstreamURL(upstreamBase, r)
 	if err != nil {
-		logCaptureRequestTarget(r, p.config.UpstreamBase, err)
+		logCaptureRequestTarget(r, upstreamBase, err)
 		http.Error(w, "invalid capture request target", http.StatusBadRequest)
 		return
 	}
-	logCaptureRequestTarget(r, p.config.UpstreamBase, nil)
+	logCaptureRequestTarget(r, upstreamBase, nil)
 	if websocket.IsWebSocketUpgrade(r) {
 		p.serveWebSocket(w, r, upstream)
 		return
@@ -954,26 +988,40 @@ func composeUpstreamURL(base string, request *http.Request) (*url.URL, error) {
 		}
 	}
 	upstream, err := url.Parse(base)
-	if err != nil || upstream.Host == "" {
+	if err != nil {
 		return nil, errInvalidUpstreamBase
 	}
-	switch upstream.Scheme {
-	case "https":
-		// The fixed default upstream (chatgpt.com) and any TLS upstream.
-	case "http":
-		// The desktop flow forwards to the local loopback Gateway only. Allowing
-		// http to any host would turn the capture proxy into an open relay.
-		if !isLoopbackHost(upstream.Hostname()) {
-			return nil, errHTTPUpstreamOutsideLoopback
-		}
-	default:
-		return nil, errUnsupportedUpstreamScheme
+	if err := validateUpstreamURL(upstream); err != nil {
+		return nil, err
 	}
 	baseEscaped := strings.TrimRight(upstream.EscapedPath(), "/")
 	upstream.Path = strings.TrimRight(upstream.Path, "/") + decoded
 	upstream.RawPath = baseEscaped + escaped
 	upstream.RawQuery = request.URL.RawQuery
 	return upstream, nil
+}
+
+// validateUpstreamURL applies the same scheme/loopback rules used by per-request
+// composition. It is shared by SetUpstream (reject an invalid target before any
+// swap) and composeUpstreamURL (reject an invalid per-request target).
+func validateUpstreamURL(upstream *url.URL) error {
+	if upstream == nil || upstream.Host == "" {
+		return errInvalidUpstreamBase
+	}
+	switch upstream.Scheme {
+	case "https":
+		// The fixed default upstream (chatgpt.com) and any TLS upstream.
+		return nil
+	case "http":
+		// The desktop flow forwards to the local loopback Gateway only. Allowing
+		// http to any host would turn the capture proxy into an open relay.
+		if !isLoopbackHost(upstream.Hostname()) {
+			return errHTTPUpstreamOutsideLoopback
+		}
+		return nil
+	default:
+		return errUnsupportedUpstreamScheme
+	}
 }
 
 func isLoopbackHost(host string) bool {

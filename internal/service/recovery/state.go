@@ -43,9 +43,22 @@ type IntegrationTarget string
 
 const (
 	TargetOriginal IntegrationTarget = "original"
+	// TargetGateway means "Codex openai_base_url is integrated at the stable
+	// front door :38440". Gateway ON/OFF now only flips the front door's
+	// forwarding target; the config stays at :38440 until MBD shutdown.
 	TargetGateway  IntegrationTarget = "gateway"
+	// TargetAnalysis is legacy/dead in the front-door model: the config is never
+	// rewritten to the capture listener (:38441) anymore. It is retained so old
+	// records still classify without a schema migration.
 	TargetAnalysis IntegrationTarget = "analysis"
 )
+
+// FrontDoorBaseURL is the stable endpoint Codex's openai_base_url points to once
+// integrated in the front-door model. It mirrors traffictransaction.FrontDoorAddress;
+// recovery keeps a local copy because importing the transaction layer would create
+// an import cycle. New-model records store exactly this value (no trailing slash)
+// in AppliedOpenaiBaseURL.
+const FrontDoorBaseURL = "http://127.0.0.1:38440"
 
 // Target resolves the current integration layer. Records written before the
 // three-state model have no integrationTarget; they are inferred from
@@ -116,6 +129,10 @@ const (
 	StatusConfigUnreadable  ReconciliationStatus = "config_unreadable"
 	StatusConfigPathInvalid ReconciliationStatus = "config_path_invalid"
 	StatusInactive          ReconciliationStatus = "inactive"
+	// StatusIntegrated is a coherent integrated state: the Codex config is at the
+	// stable front door and the record is consistent with it. No recovery is
+	// required; the caller just reopens the front door.
+	StatusIntegrated ReconciliationStatus = "integrated"
 )
 
 // AutoLogRecoveryState mirrors the Rust autoLog sub-object.

@@ -1,6 +1,7 @@
 bin/
 .cache/
 coverage.out
+desktop-app.exe
 *.test
 __pycache__/
 .env
