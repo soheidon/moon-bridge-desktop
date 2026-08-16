@@ -9,7 +9,7 @@ Moon Bridge Desktop does not increase ChatGPT usage limits or convert subscripti
 External models may not behave identically to OpenAI models. The goal is to combine strong planning and review with a practical, separately billed implementation path.
 
 > [!IMPORTANT]
-> Moon Bridge Desktop v0.5.0 is a Technical Preview. The current production-supported provider scope is DeepSeek.
+> The current production-supported provider scope is DeepSeek.
 
 ## Why Moon Bridge Desktop?
 
@@ -47,7 +47,7 @@ Moon Bridge Desktop and Anthro Bridge are independently developed sister project
 
 Both projects are completely independent and can be used separately.
 
-## Current Technical Preview
+## Current Version
 
 Version 0.5.0 implements the DeepSeek V4 routing path. It provides:
 
@@ -160,7 +160,7 @@ API keys, authorization headers, prompts, raw request bodies, and correlation he
 
 Version 0.5.0 supports DeepSeek V4 as its external model API.
 
-## Technical Preview Limitations
+## Limitations
 
 * The Windows installer is not digitally signed.
 * Installer install/uninstall smoke testing remains outstanding; the completed application-level smoke does not validate installer behavior.
@@ -197,7 +197,7 @@ The next development phase will focus on:
 
 The current release is:
 
-[Moon Bridge Desktop v0.5.0 — Technical Preview](https://github.com/soheidon/moon-bridge-desktop/releases/tag/v0.5.0)
+[Moon Bridge Desktop v0.5.0](https://github.com/soheidon/moon-bridge-desktop/releases/tag/v0.5.0)
 
 ## License
 
