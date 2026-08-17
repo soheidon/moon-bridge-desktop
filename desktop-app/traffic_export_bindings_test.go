@@ -108,10 +108,20 @@ func TestTrafficAnalysisExportCopiesAutosave(t *testing.T) {
 	if strings.Contains(content, "Status: completed") {
 		t.Fatalf("export of a live writer must not carry a completed footer: %q", content)
 	}
-	// The reveal ownership guard must accept the canonical exported path.
+	// The reveal ownership guard must accept the canonical exported path. Use a
+	// counting explorer seam so the test proves the reveal reaches it without
+	// shelling out to the real explorer.exe.
+	var revealedViaExplorer bool
+	app.explorerFunc = func(args ...string) error {
+		revealedViaExplorer = true
+		return nil
+	}
 	revealed := app.TrafficAnalysisRevealExport(TrafficRevealRequest{Destination: dst})
 	if !revealed.OK {
 		t.Fatalf("TrafficAnalysisRevealExport() after export = %#v, want success", revealed)
+	}
+	if !revealedViaExplorer {
+		t.Fatal("TrafficAnalysisRevealExport() did not reach the explorer seam")
 	}
 }
 
