@@ -234,7 +234,7 @@ export function TrafficExitDialog({ traffic, payload }: { traffic: TrafficState;
     : kind === "recovery"
       ? "復旧の確認が必要な状態です。終了すると復元処理が完了しない可能性があります。Codex Desktop自体は意図的に強制終了しません。"
       : kind === "gateway"
-        ? "終了するとMoon Bridge Gatewayを停止します。現在接続中のCodexやクライアントの通信は切断されます。"
+        ? "終了するとMoon Bridge Gatewayを停止します。接続中のCodexは、中継を引き継いだまま終了後もそのまま使用できます。"
         : `${traffic.status?.integrationActive ? "終了すると分析を停止し、Codex設定を元に戻した後、Capture Proxyを終了します。" : "終了するとCapture Proxyを終了します。38441番への既存接続は切断される可能性があります。"} Codex Desktop自体は意図的に強制終了しません。`;
   return (
     <div className="modal-backdrop" role="presentation">

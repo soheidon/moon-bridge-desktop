@@ -427,7 +427,7 @@ describe("TrafficExitDialog", () => {
     );
 
     expect(markup).toContain("Gatewayが実行中です");
-    expect(markup).toContain("終了するとMoon Bridge Gatewayを停止します。現在接続中のCodexやクライアントの通信は切断されます。");
+    expect(markup).toContain("終了するとMoon Bridge Gatewayを停止します。接続中のCodexは、中継を引き継いだまま終了後もそのまま使用できます。");
     expect(markup).toContain(">Gatewayを停止して終了</button>");
     expect(markup).toContain(">キャンセル</button>");
     expect(markup).not.toContain("中継を終了してDesktopを閉じる");

@@ -184,8 +184,8 @@ type App struct {
 	svc              gatewayController
 	traffic          *trafficanalysis.Service
 	frontDoor        *trafficanalysis.CaptureProxy // stable :38440 relay (passthrough)
-	configuredPath   string                       // AppOptions で指定された Start 候補
-	activeConfigPath string // 最後に成功した Start の path（snapshot にのみ表示）
+	configuredPath   string                        // AppOptions で指定された Start 候補
+	activeConfigPath string                        // 最後に成功した Start の path（snapshot にのみ表示）
 	newIdentity      func() (string, string)
 	emitEvents       func(name string, payload any)
 	gatewayLogs      *gatewayLogBridge
@@ -198,6 +198,12 @@ type App struct {
 	newRoutingProfile routingProfileFactory
 	deriveCodex       codexConfigDeriver
 	quitDesktop       func(context.Context)
+
+	// Exit handoff relay (Plan 11-4) seams. nil defaults to the real
+	// implementation; tests inject fakes.
+	detectChatGPTCodexAppServer func(context.Context) (uint32, bool, error)
+	spawnHandoffHelper          func(context.Context, string, uint32, string) error
+
 	codexOp           string // current codex operation for progress events（codexMu で保護）
 	trafficTx         *traffictransaction.Service
 	recovery          *recovery.Store
@@ -225,19 +231,21 @@ type App struct {
 }
 
 type AppOptions struct {
-	Service            gatewayController              // nil → gateway.NewService(ServiceOptions{Errors: os.Stderr})
-	NewIdentity        func() (string, string)        // nil → gateway.NewDesktopIdentity
-	ConfigPath         string                         // Start 候補。"" → 既定パス（lazy resolve）
-	EmitEvents         func(name string, payload any) // nil → runtime.EventsEmit（a.ctx 非nil時のみ）
-	Codex              codexController                // nil → codexlauncher.New(Options{Progress: …})
-	CodexConfig        codexConfigController          // nil → codexconfig.New(codexconfig.Options{})
-	NewDeepSeek        deepSeekFactory                // nil → NewHTTPClient ベースの既定 factory
-	NewRoutingProfile  routingProfileFactory          // nil → routingprofile.NewService(NewHTTPClient) の既定 factory
-	DeriveCodex        codexConfigDeriver             // nil → 稼働中 Gateway の effective config から導出
-	Quit               func(context.Context)          // nil → Wails runtime.Quit; test seam only
-	Traffic            *trafficanalysis.Service       // nil → 長寿命 Service を新規生成・所有
-	TrafficTransaction *traffictransaction.Service
-	Recovery           *recovery.Store
+	Service                     gatewayController                                   // nil → gateway.NewService(ServiceOptions{Errors: os.Stderr})
+	NewIdentity                 func() (string, string)                             // nil → gateway.NewDesktopIdentity
+	ConfigPath                  string                                              // Start 候補。"" → 既定パス（lazy resolve）
+	EmitEvents                  func(name string, payload any)                      // nil → runtime.EventsEmit（a.ctx 非nil時のみ）
+	Codex                       codexController                                     // nil → codexlauncher.New(Options{Progress: …})
+	CodexConfig                 codexConfigController                               // nil → codexconfig.New(codexconfig.Options{})
+	NewDeepSeek                 deepSeekFactory                                     // nil → NewHTTPClient ベースの既定 factory
+	NewRoutingProfile           routingProfileFactory                               // nil → routingprofile.NewService(NewHTTPClient) の既定 factory
+	DeriveCodex                 codexConfigDeriver                                  // nil → 稼働中 Gateway の effective config から導出
+	DetectChatGPTCodexAppServer func(context.Context) (uint32, bool, error)         // nil → Windows PowerShell 検出（Plan 11-4）
+	SpawnHandoffHelper          func(context.Context, string, uint32, string) error // nil → detached re-exec relay helper（Plan 11-4）
+	Quit                        func(context.Context)                               // nil → Wails runtime.Quit; test seam only
+	Traffic                     *trafficanalysis.Service                            // nil → 長寿命 Service を新規生成・所有
+	TrafficTransaction          *traffictransaction.Service
+	Recovery                    *recovery.Store
 	// RecoveryHome identifies the Codex profile associated with an injected
 	// Recovery store. It is primarily a test/embedding seam; the normal Wails
 	// path resolves the profile from codexconfig.Service.
@@ -275,31 +283,41 @@ func NewApp(opts AppOptions) *App {
 	if deriveCodex == nil {
 		deriveCodex = deriveCodexLive
 	}
+	detectCodex := opts.DetectChatGPTCodexAppServer
+	if detectCodex == nil {
+		detectCodex = detectChatGPTCodexAppServer
+	}
+	spawnHandoff := opts.SpawnHandoffHelper
+	if spawnHandoff == nil {
+		spawnHandoff = spawnHandoffHelper
+	}
 	traffic := opts.Traffic
 	if traffic == nil {
 		traffic = trafficanalysis.NewService()
 	}
 	appCtx, cancel := context.WithCancel(context.Background())
 	a := &App{
-		appCtx:                appCtx,
-		cancel:                cancel,
-		svc:                   opts.Service,
-		traffic:               traffic,
-		configuredPath:        opts.ConfigPath,
-		newIdentity:           newIdentity,
-		emitEvents:            opts.EmitEvents,
-		trafficTx:             opts.TrafficTransaction,
-		recovery:              opts.Recovery,
-		recoveryHome:          opts.RecoveryHome,
-		trafficBackupDir:      opts.BackupDir,
-		codexConfig:           codexConfig,
-		newDeepSeek:           newDeepSeek,
-		newRoutingProfile:     newRoutingProfile,
-		deriveCodex:           deriveCodex,
-		quitDesktop:           opts.Quit,
-		routingProfileRefresh: opts.RoutingProfileRefresh,
-		routeGate:             routingswitch.NewGate(),
-		transitionGen:         routingswitch.NewGenerator(),
+		appCtx:                      appCtx,
+		cancel:                      cancel,
+		svc:                         opts.Service,
+		traffic:                     traffic,
+		configuredPath:              opts.ConfigPath,
+		newIdentity:                 newIdentity,
+		emitEvents:                  opts.EmitEvents,
+		trafficTx:                   opts.TrafficTransaction,
+		recovery:                    opts.Recovery,
+		recoveryHome:                opts.RecoveryHome,
+		trafficBackupDir:            opts.BackupDir,
+		codexConfig:                 codexConfig,
+		newDeepSeek:                 newDeepSeek,
+		newRoutingProfile:           newRoutingProfile,
+		deriveCodex:                 deriveCodex,
+		detectChatGPTCodexAppServer: detectCodex,
+		spawnHandoffHelper:          spawnHandoff,
+		quitDesktop:                 opts.Quit,
+		routingProfileRefresh:       opts.RoutingProfileRefresh,
+		routeGate:                   routingswitch.NewGate(),
+		transitionGen:               routingswitch.NewGenerator(),
 	}
 	if a.quitDesktop == nil {
 		a.quitDesktop = runtime.Quit
@@ -431,18 +449,30 @@ func (a *App) shutdown(context.Context) {
 	codexCancel()
 	a.codexMu.Unlock()
 
-	// Stop the gateway backend (:38442) and the front door (:38440) first, then
-	// restore the config to the original upstream last. That ordering avoids a
-	// window where the config is original but a listener still serves traffic.
+	// Park the front door (:38440) on the original upstream first so a running
+	// Codex that still targets :38440 falls through to ChatGPT original rather
+	// than a dead listener while the rest of the stack tears down.
+	if a.frontDoor != nil {
+		_ = a.setFrontDoorUpstream(a.originalUpstream())
+		logFrontDoorMode("shutdown_to_original_upstream")
+	}
+
+	// Restore the config to the original upstream next, before the gateway
+	// backend stops. Use a fresh context: a.appCtx was cancelled at the top of
+	// shutdown, and Disable validates ctx.Err() at entry. Best effort: a failed
+	// restore is retained as recovery evidence for the next boot.
+	disableCtx, disableCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	_ = a.disableGatewayIntegration(disableCtx)
+	disableCancel()
+
+	// Stop the gateway backend (:38442), then close the front door last. The
+	// front door is already parked on the original upstream, so no Codex traffic
+	// depends on either listener anymore.
 	gwStopCtx, gwCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	_ = a.svc.Stop(gwStopCtx) // cleanup continues even after traffic failure
 	gwCancel()
 
 	a.stopFrontDoor()
-
-	// Restore the original upstream last. Best effort: a failed restore is
-	// retained as recovery evidence for the next boot.
-	_ = a.disableGatewayIntegration()
 
 	a.clearSession()
 	a.emitStatus()
@@ -706,12 +736,16 @@ func (a *App) integrateGateway(targetURL string) error {
 // disableGatewayIntegration restores the original upstream recorded by the
 // Gateway layer. It is a no-op when nothing is integrated. The Disable outcome
 // is logged so a no-op that hides an orphaned gateway config stays visible.
-func (a *App) disableGatewayIntegration() error {
+//
+// The caller supplies the context: shutdown cancels a.appCtx before reaching
+// this path, and Disable validates ctx.Err() at entry, so the caller must pass
+// a live context for the restore to take effect.
+func (a *App) disableGatewayIntegration(ctx context.Context) error {
 	gwInt, err := a.ensureGatewayIntegration()
 	if err != nil {
 		return err
 	}
-	report, err := gwInt.DisableWithReport(a.appCtx)
+	report, err := gwInt.DisableWithReport(ctx)
 	logGatewayDisable(err == nil, report, err)
 	return err
 }

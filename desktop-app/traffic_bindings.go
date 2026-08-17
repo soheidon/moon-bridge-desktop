@@ -182,6 +182,28 @@ func (a *App) ConfirmExit(input ConfirmExitInput) DesktopCommandResult {
 		a.exitMu.Unlock()
 		return errDesktop("ConfirmExit", "exit", "exit_confirmation_required", "exit confirmation is required", false)
 	}
+	a.exitMu.Unlock()
+
+	// Hand off :38440 to a short-lived relay before committing to exit so a
+	// running Codex keeps working after MBD is gone. Detection runs first and
+	// only when the gateway is running; any failure leaves MBD running.
+	if a.svc.Status().Status == gateway.StatusRunning {
+		detectCtx, detectCancel := context.WithTimeout(a.appCtx, 15*time.Second)
+		pid, found, err := a.detectChatGPTCodexAppServer(detectCtx)
+		detectCancel()
+		if err != nil {
+			log.Printf("ConfirmExit: codex app-server detection failed (handoff unavailable)")
+			return errDesktop("ConfirmExit", "handoff", "handoff_unavailable", "unable to determine the running Codex state", false)
+		}
+		if found {
+			log.Printf("ConfirmExit: handing off front door to relay (pid=%d)", pid)
+			if herr := a.handoffFrontDoor(pid); herr != nil {
+				return errDesktop("ConfirmExit", "handoff", "handoff_failed", "unable to hand off the Codex relay", false)
+			}
+		}
+	}
+
+	a.exitMu.Lock()
 	a.exitState = exitConfirmed
 	a.exitMu.Unlock()
 	if input.DiscardUnsaved {
@@ -602,8 +624,8 @@ func checkpointFromRecovery(st *recovery.State) traffictransaction.Checkpoint {
 		// guess ownership, so generation remains zero here.
 		CaptureGeneration: 0,
 		IntegrationActive: trafficActive, RelayActive: st.RelayActiveLastKnown,
-		IntegrationTarget: traffictransaction.IntegrationTarget(st.Target()),
-		OriginalPresent:   st.OriginalOpenaiBaseURLPresent,
+		IntegrationTarget:            traffictransaction.IntegrationTarget(st.Target()),
+		OriginalPresent:              st.OriginalOpenaiBaseURLPresent,
 		CaptureState:                 st.CaptureStateLastKnown,
 		UnsavedObservationsMayRemain: st.UnsavedObservationsMayRemain,
 		UnsavedDiscardConfirmed:      st.UnsavedDiscardConfirmed,

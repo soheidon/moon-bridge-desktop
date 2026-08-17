@@ -22,6 +22,12 @@ func main() {
 	if os.Getenv("MOONBRIDGE_CTRL_BREAK_HELPER") == "1" {
 		os.Exit(codexlauncher.RunCtrlBreakHelper())
 	}
+	// Exit handoff relay helper: re-execs to relay :38440 → original while a
+	// running Codex app-server stays alive, then self-terminates. Branch before
+	// any Wails / logger / single-instance init.
+	if os.Getenv("MOONBRIDGE_HANDOFF_RELAY") == "1" {
+		os.Exit(runHandoffRelay())
+	}
 	releaseInstance, err := acquireSingleInstance()
 	if errors.Is(err, errSingleInstanceAlreadyRunning) {
 		fmt.Fprintln(os.Stderr, "Moon Bridge Desktop is already running")
